@@ -1,0 +1,40 @@
+services:
+  predictor:
+    build:
+      context: ./services/load-predictor
+    ports:
+      - "50051:50051"
+    networks:
+      - capstone-net
+
+  orchestrator:
+    build:
+      context: ./services/orchestrator
+    ports:
+      - "8082:8082"
+    depends_on:
+      - predictor
+    networks:
+      - capstone-net
+
+  simulator:
+    build:
+      context: ./services/simulator
+    ports:
+      - "8083:8083"
+    depends_on:
+      - orchestrator
+    networks:
+      - capstone-net
+
+  dashboard:
+    build:
+      context: ./services/dashboard
+    ports:
+      - "3000:3000"
+    networks:
+      - capstone-net
+
+networks:
+  capstone-net:
+    driver: bridge
