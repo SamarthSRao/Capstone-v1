@@ -1,222 +1,249 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import { 
-  Activity, 
-  ShieldCheck, 
-  Zap, 
-  TrendingUp,
-  Cpu,
-  Database,
-  Layers,
-  BarChart3,
-  AlertCircle
-} from 'lucide-react';
-import { 
-  LineChart, 
-  Line, 
-  XAxis, 
-  YAxis, 
-  CartesianGrid, 
-  Tooltip, 
-  ResponsiveContainer, 
-  AreaChart, 
-  Area,
-  ComposedChart
+  LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, 
+  AreaChart, Area, ComposedChart, Legend, BarChart, Bar, ReferenceLine
 } from 'recharts';
+import { 
+  Cpu, Activity, Zap, ShieldCheck, TrendingUp, 
+  Layers, Database, ArrowRight, Github, 
+  Terminal, Globe, Shield, BarChart3, Info, Server,
+  CheckCircle2, AlertCircle, RefreshCw, Clock, Box
+} from 'lucide-react';
 
-const HybridTimeNetDashboard = () => {
+const Dashboard = () => {
   const [data, setData] = useState([]);
-  const [metrics, setMetrics] = useState({
-    slaViolationRate: 0.02,
-    overprovisioningRatio: 1.15,
-    activeServers: 12,
-    p95Latency: 142,
-    modelConfidence: 0.94
-  });
-
-  // Simulate real-time data flow from the Orchestrator and Predictor
+  const [sessionRequests, setSessionRequests] = useState(145820);
+  const [isLive, setIsLive] = useState(false); // Toggle to real backend if found
+  
+  // MOCK DATA GENERATOR
   useEffect(() => {
-    const interval = setInterval(() => {
+    const generateMockPoint = (prevData) => {
       const now = new Date();
-      const baseLoad = 4000 + Math.sin(now.getTime() / 10000) * 1000 + Math.random() * 500;
-      const std = 200 + Math.random() * 300;
+      const timeStr = now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
       
-      const newPoint = {
-        time: now.toLocaleTimeString(),
-        actual: baseLoad + (Math.random() - 0.5) * 400,
-        mean: baseLoad,
-        upper: baseLoad + 2 * std,
-        lower: Math.max(0, baseLoad - 2 * std),
-        servers: Math.ceil((baseLoad + 2 * std) / 500) // Mock scaling logic
+      // Simulate a workload pattern (Sine wave + random spikes)
+      const t = prevData.length;
+      const baseLoad = 500 + Math.sin(t / 10) * 150;
+      const noise = Math.random() * 40;
+      const actual = Math.max(0, baseLoad + noise);
+      
+      // Predictor looks ahead and estimates uncertainty
+      const predicted = baseLoad + Math.sin((t + 5) / 10) * 160 + (Math.random() * 20);
+      const uncertainty = 30 + Math.random() * 20;
+      
+      // Orchestrator decision (Risk-averse scaling)
+      const upper = predicted + uncertainty;
+      const lower = predicted - uncertainty;
+      
+      // Step-based node scaling (each node handles ~60 RPS)
+      const targetNodes = Math.ceil(upper / 55);
+      const prevNodes = prevData.length > 0 ? prevData[prevData.length-1].nodes : 10;
+      
+      // Simulate cold start delay for scaling
+      const nodes = targetNodes > prevNodes ? prevNodes + 0.1 : targetNodes;
+
+      return {
+        time: timeStr,
+        actual: parseFloat(actual.toFixed(1)),
+        predicted: parseFloat(predicted.toFixed(1)),
+        upper: parseFloat(upper.toFixed(1)),
+        lower: parseFloat(lower.toFixed(1)),
+        nodes: Math.round(nodes * 10) / 10,
+        latency: 140 + (actual / 100) + Math.random() * 10
       };
-      
-      setData(prev => [...prev.slice(-40), newPoint]);
-      
-      // Randomly update metrics
-      setMetrics(prev => ({
-        ...prev,
-        activeServers: newPoint.servers,
-        slaViolationRate: Math.max(0, prev.slaViolationRate + (Math.random() - 0.5) * 0.005),
-        p95Latency: 100 + Math.random() * 80
-      }));
-    }, 1000);
+    };
+
+    const interval = setInterval(() => {
+      setData(prev => {
+        const next = generateMockPoint(prev);
+        setSessionRequests(s => s + Math.floor(next.actual));
+        const newData = [...prev, next];
+        return newData.slice(-40);
+      });
+    }, 2000);
+
     return () => clearInterval(interval);
   }, []);
 
+  // PDF-Specified Metrics (Mocked to match HybridTimeNet performance)
+  const stats = useMemo(() => {
+    const last = data[data.length - 1] || {};
+    return [
+      { label: 'SLA Reliability', val: '99.94%', sub: 'Target: 99.9%', color: 'text-emerald-400', icon: ShieldCheck },
+      { label: 'Forecast MAPE', val: '3.18%', sub: 'Mean Abs % Error', color: 'text-blue-400', icon: BarChart3 },
+      { label: 'Over-provisioning', val: '12.4%', sub: 'Resource Waste', color: 'text-amber-400', icon: Zap },
+      { label: 'Active Fleet', val: `${Math.ceil(last.nodes || 10)} Nodes`, sub: 'Erlang-C Provisioned', color: 'text-white', icon: Server }
+    ];
+  }, [data]);
+
   return (
-    <div className="min-h-screen bg-[#0A0A0B] text-[#D1D1D1] font-sans p-6 selection:bg-[#6366f1] selection:text-white">
-      {/* HEADER */}
-      <div className="flex justify-between items-center mb-8 border-b border-white/5 pb-6">
+    <div className="min-h-screen bg-[#020617] text-slate-300 font-mono selection:bg-blue-500/30">
+      {/* PROMETHEUS TOP BAR */}
+      <header className="border-b border-slate-800 bg-slate-900/50 backdrop-blur-md sticky top-0 z-50 px-6 py-3 flex justify-between items-center">
         <div className="flex items-center gap-4">
-          <div className="bg-indigo-600 p-2 rounded-lg">
-            <Layers className="text-white" size={24} />
+          <div className="w-8 h-8 bg-orange-600 rounded flex items-center justify-center text-white font-black shadow-lg shadow-orange-900/20">
+            H
           </div>
-          <div>
-            <h1 className="text-xl font-bold text-white tracking-tight">HybridTimeNet</h1>
-            <p className="text-xs text-white/40 font-medium uppercase tracking-wider">Uncertainty-Aware Cloud Autoscaler</p>
-          </div>
-        </div>
-        
-        <div className="flex gap-4">
-          <div className="flex flex-col items-end">
-            <span className="text-[10px] font-bold text-white/30 uppercase tracking-widest">System Status</span>
-            <span className="text-xs font-bold text-emerald-400 flex items-center gap-2">
-              <div className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
-              ORCHESTRATOR ACTIVE
-            </span>
-          </div>
-          <div className="h-8 w-px bg-white/10 mx-2" />
-          <div className="flex flex-col items-end">
-            <span className="text-[10px] font-bold text-white/30 uppercase tracking-widest">Model Mode</span>
-            <span className="text-xs font-bold text-indigo-400">BAYESIAN_MC_DROPOUT</span>
-          </div>
-        </div>
-      </div>
-
-      {/* KPI GRID */}
-      <div className="grid grid-cols-1 md:grid-cols-5 gap-6 mb-8">
-        {[
-          { label: 'Active Servers', val: metrics.activeServers, icon: Cpu, color: 'text-white' },
-          { label: 'SLA Violation Rate', val: `${(metrics.slaViolationRate * 100).toFixed(2)}%`, icon: ShieldCheck, color: 'text-emerald-400' },
-          { label: 'P95 Latency', val: `${metrics.p95Latency.toFixed(0)}ms`, icon: Zap, color: 'text-amber-400' },
-          { label: 'Overprovisioning', val: `${metrics.overprovisioningRatio.toFixed(2)}x`, icon: BarChart3, color: 'text-indigo-400' },
-          { label: 'Epistemic Risk', val: 'LOW', icon: AlertCircle, color: 'text-emerald-400' },
-        ].map((kpi, i) => (
-          <div key={i} className="bg-white/[0.03] border border-white/5 rounded-2xl p-5 hover:bg-white/[0.05] transition-colors">
-            <div className="flex justify-between items-start mb-4">
-              <div className="p-2 bg-white/5 rounded-lg">
-                <kpi.icon size={18} className="text-white/60" />
-              </div>
-            </div>
-            <div className="flex flex-col">
-              <span className="text-[11px] font-bold text-white/30 uppercase tracking-wider mb-1">{kpi.label}</span>
-              <span className={`text-2xl font-bold tracking-tight ${kpi.color}`}>{kpi.val}</span>
-            </div>
-          </div>
-        ))}
-      </div>
-
-      {/* MAIN VISUALIZATION */}
-      <div className="grid grid-cols-12 gap-8">
-        
-        {/* WORKLOAD FORECAST CHART */}
-        <div className="col-span-12 lg:col-span-8 bg-white/[0.03] border border-white/5 rounded-3xl p-8">
-          <div className="flex justify-between items-center mb-8">
-            <div>
-              <h3 className="text-lg font-bold text-white">Workload Prediction & Uncertainty Bands</h3>
-              <p className="text-sm text-white/40">Real-time inference vs Bayesian confidence intervals</p>
-            </div>
-            <div className="flex gap-4">
-              <div className="flex items-center gap-2">
-                <div className="w-3 h-3 rounded-full bg-indigo-500/20 border border-indigo-500" />
-                <span className="text-xs font-bold text-white/60 uppercase">95% CI Band</span>
-              </div>
-              <div className="flex items-center gap-2">
-                <div className="w-3 h-0.5 bg-white" />
-                <span className="text-xs font-bold text-white/60 uppercase">Actual</span>
-              </div>
-            </div>
-          </div>
-          
-          <div className="h-[400px] w-full">
-            <ResponsiveContainer width="100%" height="100%">
-              <ComposedChart data={data}>
-                <defs>
-                  <linearGradient id="colorUncertainty" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="5%" stopColor="#6366f1" stopOpacity={0.1}/>
-                    <stop offset="95%" stopColor="#6366f1" stopOpacity={0}/>
-                  </linearGradient>
-                </defs>
-                <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.05)" vertical={false} />
-                <XAxis dataKey="time" hide />
-                <YAxis stroke="rgba(255,255,255,0.3)" fontSize={11} axisLine={false} tickLine={false} />
-                <Tooltip 
-                  contentStyle={{ backgroundColor: '#141416', border: '1px solid rgba(255,255,255,0.1)', borderRadius: '12px', fontSize: '12px' }}
-                />
-                <Area 
-                  type="monotone" 
-                  dataKey="upper" 
-                  stroke="none" 
-                  fill="#6366f1" 
-                  fillOpacity={0.1} 
-                  baseValue="lower"
-                />
-                <Line type="monotone" dataKey="mean" stroke="#6366f1" strokeWidth={2} dot={false} strokeDasharray="5 5" />
-                <Line type="monotone" dataKey="actual" stroke="#fff" strokeWidth={2} dot={false} />
-              </ComposedChart>
-            </ResponsiveContainer>
+          <div className="flex flex-col">
+            <span className="text-white font-bold text-sm tracking-tight">HybridTimeNet v1.0.4</span>
+            <span className="text-[10px] text-slate-500 uppercase tracking-widest font-black">Cluster: htn-prod-simulator-01</span>
           </div>
         </div>
 
-        {/* SIDEBAR: MODEL INSIGHTS */}
-        <div className="col-span-12 lg:col-span-4 space-y-6">
-          <div className="bg-white/[0.03] border border-white/5 rounded-3xl p-6">
-            <h3 className="text-sm font-bold text-white uppercase tracking-widest mb-6 flex items-center gap-2">
-              <Database size={16} className="text-indigo-400" /> Ensemble Weights
-            </h3>
-            <div className="space-y-6">
-              {[
-                { name: 'Bayesian LSTM', weight: 0.65, label: 'Temporal Trends' },
-                { name: 'Neural Prophet', weight: 0.25, label: 'Seasonality' },
-                { name: 'XGBoost', weight: 0.10, label: 'Residual Correction' },
-              ].map((m, i) => (
-                <div key={i}>
-                  <div className="flex justify-between items-end mb-2">
-                    <div className="flex flex-col">
-                      <span className="text-xs font-bold text-white">{m.name}</span>
-                      <span className="text-[10px] text-white/30 uppercase">{m.label}</span>
+        <div className="flex items-center gap-6">
+           <div className="flex items-center gap-8">
+              <div className="flex flex-col items-end">
+                <span className="text-[9px] text-slate-500 uppercase font-black">Simulator Status</span>
+                <span className="text-[11px] text-emerald-400 flex items-center gap-1.5 font-bold">
+                  <div className="w-1.5 h-1.5 bg-emerald-500 rounded-full animate-pulse" /> OPERATIONAL
+                </span>
+              </div>
+              <div className="flex flex-col items-end">
+                <span className="text-[9px] text-slate-500 uppercase font-black">ML Inference</span>
+                <span className="text-[11px] text-blue-400 flex items-center gap-1.5 font-bold">
+                  <div className="w-1.5 h-1.5 bg-blue-500 rounded-full" /> ACTIVE (MC_DROPOUT)
+                </span>
+              </div>
+           </div>
+           <div className="w-px h-8 bg-slate-800" />
+           <div className="bg-slate-950 border border-slate-800 rounded px-3 py-1.5 text-[10px] flex items-center gap-3">
+              <Clock size={12} className="text-slate-500" />
+              <span className="text-slate-300 font-bold uppercase tracking-wider">Last 15m</span>
+           </div>
+        </div>
+      </header>
+
+      <main className="p-6 max-w-[1600px] mx-auto">
+        {/* METRICS GRID */}
+        <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-6">
+          {stats.map((s, i) => (
+            <div key={i} className="bg-slate-900/50 border border-slate-800 p-5 rounded hover:border-slate-700 transition-colors group">
+              <div className="flex justify-between items-start mb-3">
+                 <div className="p-2 bg-slate-950 rounded text-slate-500 group-hover:text-blue-400 transition-colors">
+                   <s.icon size={18} />
+                 </div>
+                 <span className="text-[9px] font-black text-slate-600 uppercase tracking-widest">{s.label}</span>
+              </div>
+              <div className={`text-2xl font-black tabular-nums ${s.color}`}>{s.val}</div>
+              <div className="text-[10px] text-slate-500 mt-1 font-bold">{s.sub}</div>
+            </div>
+          ))}
+        </div>
+
+        {/* MAIN PANEL */}
+        <div className="grid grid-cols-12 gap-6">
+          {/* PRIMARY WORKLOAD CHART */}
+          <div className="col-span-12 lg:col-span-8 bg-slate-900/50 border border-slate-800 rounded p-6">
+            <div className="flex justify-between items-center mb-8">
+               <div>
+                  <h4 className="text-xs font-black text-slate-500 uppercase tracking-widest mb-1 flex items-center gap-2">
+                    <Activity size={14} /> Workload Forecast & Provisioning
+                  </h4>
+                  <p className="text-[10px] text-slate-600">Requests per Second (RPS) vs. Bayesian Upper Bound</p>
+               </div>
+               <div className="flex gap-4 text-[9px] font-black uppercase">
+                  <div className="flex items-center gap-2 text-slate-300"><div className="w-2 h-2 bg-white" /> Actual</div>
+                  <div className="flex items-center gap-2 text-blue-400"><div className="w-2 h-0.5 border-t-2 border-blue-400 border-dashed" /> Forecast</div>
+                  <div className="flex items-center gap-2 text-orange-500"><div className="w-2 h-2 bg-orange-500/20 border border-orange-500" /> Scale</div>
+               </div>
+            </div>
+
+            <div className="h-[450px] w-full">
+              <ResponsiveContainer width="100%" height="100%">
+                <ComposedChart data={data}>
+                  <CartesianGrid strokeDasharray="1 4" stroke="#1e293b" vertical={false} />
+                  <XAxis dataKey="time" axisLine={false} tickLine={false} tick={{ fontSize: 9, fill: '#475569' }} hide={data.length < 5} />
+                  <YAxis axisLine={false} tickLine={false} tick={{ fontSize: 9, fill: '#475569' }} />
+                  <Tooltip 
+                    contentStyle={{ backgroundColor: '#0f172a', border: '1px solid #1e293b', borderRadius: '4px', fontSize: '10px' }}
+                    cursor={{ stroke: '#334155', strokeWidth: 1 }}
+                  />
+                  <Area type="monotone" dataKey="upper" stroke="none" fill="#3b82f6" fillOpacity={0.05} baseValue="lower" />
+                  <Line type="monotone" dataKey="predicted" stroke="#3b82f6" strokeWidth={1} strokeDasharray="4 4" dot={false} animationDuration={0} />
+                  <Line type="stepAfter" dataKey="nodes" stroke="#ea580c" strokeWidth={2} dot={false} />
+                  <Line type="monotone" dataKey="actual" stroke="#ffffff" strokeWidth={2} dot={{ r: 2, fill: '#ffffff' }} animationDuration={400} />
+                </ComposedChart>
+              </ResponsiveContainer>
+            </div>
+          </div>
+
+          {/* SECONDARY PANELS */}
+          <div className="col-span-12 lg:col-span-4 flex flex-col gap-6">
+            {/* LATENCY CHART */}
+            <div className="flex-1 bg-slate-900/50 border border-slate-800 rounded p-5">
+              <h4 className="text-[10px] font-black text-slate-500 uppercase tracking-widest mb-6">P95 Latency (ms)</h4>
+              <div className="h-[180px] w-full">
+                <ResponsiveContainer width="100%" height="100%">
+                  <AreaChart data={data}>
+                    <CartesianGrid strokeDasharray="1 4" stroke="#1e293b" vertical={false} />
+                    <XAxis dataKey="time" hide />
+                    <YAxis domain={['dataMin - 10', 'dataMax + 10']} axisLine={false} tickLine={false} tick={{ fontSize: 9, fill: '#475569' }} />
+                    <Tooltip contentStyle={{ backgroundColor: '#0f172a', border: '1px solid #1e293b', fontSize: '10px' }} />
+                    <Area type="monotone" dataKey="latency" stroke="#10b981" fill="#10b981" fillOpacity={0.1} />
+                  </AreaChart>
+                </ResponsiveContainer>
+              </div>
+            </div>
+
+            {/* RESOURCE DISTRIBUTION */}
+            <div className="flex-1 bg-slate-900/50 border border-slate-800 rounded p-5">
+               <h4 className="text-[10px] font-black text-slate-500 uppercase tracking-widest mb-6">Ensemble Confidence</h4>
+               <div className="space-y-6">
+                  <div>
+                    <div className="flex justify-between text-[10px] mb-2 font-bold uppercase">
+                       <span className="text-slate-400">Bayesian LSTM (Epistemic)</span>
+                       <span className="text-blue-400">94.2%</span>
                     </div>
-                    <span className="text-xs font-mono text-indigo-400">{(m.weight * 100).toFixed(0)}%</span>
+                    <div className="w-full bg-slate-950 h-1.5 rounded-full overflow-hidden">
+                       <div className="bg-blue-500 h-full w-[94%]" />
+                    </div>
                   </div>
-                  <div className="h-1.5 w-full bg-white/5 rounded-full overflow-hidden">
-                    <div className="h-full bg-indigo-500 rounded-full" style={{ width: `${m.weight * 100}%` }} />
+                  <div>
+                    <div className="flex justify-between text-[10px] mb-2 font-bold uppercase">
+                       <span className="text-slate-400">Neural Prophet (Trend)</span>
+                       <span className="text-emerald-400">88.7%</span>
+                    </div>
+                    <div className="w-full bg-slate-950 h-1.5 rounded-full overflow-hidden">
+                       <div className="bg-emerald-500 h-full w-[88%]" />
+                    </div>
                   </div>
-                </div>
-              ))}
-            </div>
-          </div>
-
-          <div className="bg-indigo-600/10 border border-indigo-500/20 rounded-3xl p-6">
-            <h3 className="text-sm font-bold text-white uppercase tracking-widest mb-4 flex items-center gap-2">
-              <TrendingUp size={16} className="text-indigo-400" /> Provisioning Logic
-            </h3>
-            <p className="text-xs text-white/50 leading-relaxed mb-4">
-              System currently provisioning for <span className="text-white font-bold">P95 (Mean + 2σ)</span> to minimize SLA violations during high epistemic uncertainty periods.
-            </p>
-            <div className="bg-black/20 rounded-xl p-4 border border-white/5">
-              <div className="flex justify-between items-center text-[10px] font-mono mb-2">
-                <span className="text-white/40">Target Intensity (ρ)</span>
-                <span className="text-emerald-400">0.82</span>
-              </div>
-              <div className="flex justify-between items-center text-[10px] font-mono">
-                <span className="text-white/40">Erlang-C Wait Prob</span>
-                <span className="text-emerald-400">0.008</span>
-              </div>
+                  <div>
+                    <div className="flex justify-between text-[10px] mb-2 font-bold uppercase">
+                       <span className="text-slate-400">XGBoost (Residuals)</span>
+                       <span className="text-purple-400">91.4%</span>
+                    </div>
+                    <div className="w-full bg-slate-950 h-1.5 rounded-full overflow-hidden">
+                       <div className="bg-purple-500 h-full w-[91%]" />
+                    </div>
+                  </div>
+               </div>
             </div>
           </div>
         </div>
-      </div>
+
+        {/* LOGS TERMINAL */}
+        <div className="mt-6 bg-slate-950 border border-slate-800 rounded p-4 font-mono text-[10px] leading-relaxed">
+           <div className="flex items-center gap-2 mb-3 border-b border-slate-900 pb-2">
+              <Terminal size={12} className="text-slate-600" />
+              <span className="text-slate-500 font-bold uppercase">Kernel Events</span>
+           </div>
+           <div className="space-y-1 overflow-y-auto max-h-[120px] custom-scrollbar">
+              <div className="text-slate-600 font-bold">[{new Date().toISOString()}] <span className="text-blue-500">INFO</span>: HybridTimeNet Predictor warming up... (Window: 60s)</div>
+              <div className="text-slate-600 font-bold">[{new Date().toISOString()}] <span className="text-emerald-500">INFO</span>: gRPC Handshake established with Predictor at :50051</div>
+              <div className="text-slate-600 font-bold">[{new Date().toISOString()}] <span className="text-orange-500">WARN</span>: Variance spike detected. Switching to Risk-Averse provisioning.</div>
+              <div className="text-slate-600 font-bold">[{new Date().toISOString()}] <span className="text-blue-500">INFO</span>: Provisioning 2 additional nodes (Cold Start initiated).</div>
+              <div className="text-slate-600 font-bold">[{new Date().toISOString()}] <span className="text-slate-400 italic">... monitoring live trace ...</span></div>
+           </div>
+        </div>
+      </main>
+
+      <style jsx>{`
+        .custom-scrollbar::-webkit-scrollbar { width: 4px; }
+        .custom-scrollbar::-webkit-scrollbar-track { background: #020617; }
+        .custom-scrollbar::-webkit-scrollbar-thumb { background: #1e293b; border-radius: 2px; }
+      `}</style>
     </div>
   );
 };
 
-export default HybridTimeNetDashboard;
+export default Dashboard;

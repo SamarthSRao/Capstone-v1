@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"math"
@@ -13,17 +14,35 @@ import (
 
 	pb "github.com/samarthsrao/capstone/protos/predictor"
 )
-
-// Erlang-C helper functions
-func factorial(n int) float64 {
-	if n == 0 {
-		return 1
-	}
-	res := 1.0
+// logFactorial calculates the log of n!
+func logFactorial(n int) float64 {
+	res := 0.0
 	for i := 1; i <= n; i++ {
-		res *= float64(i)
+		res += math.Log(float64(i))
 	}
 	return res
+}
+
+
+// logSumExpMulti computes log(sum(exp(x_i))) in a stable way
+func logSumExpMulti(terms []float64) float64 {
+	if len(terms) == 0 {
+		return -math.MaxFloat64
+	}
+	max := terms[0]
+	for _, v := range terms {
+		if v > max {
+			max = v
+		}
+	}
+	if math.IsInf(max, 1) || math.IsInf(max, -1) {
+		return max
+	}
+	sum := 0.0
+	for _, v := range terms {
+		sum += math.Exp(v - max)
+	}
+	return max + math.Log(sum)
 }
 
 func calculateErlangC(c int, intensity float64) float64 {
@@ -31,25 +50,37 @@ func calculateErlangC(c int, intensity float64) float64 {
 		return 1.0
 	}
 
-	// Numerator: (intensity^c / c!) * (c / (c - intensity))
-	numerator := (math.Pow(intensity, float64(c)) / factorial(c)) * (float64(c) / (float64(c) - intensity))
+	// Use log-space to avoid overflow
+	// LNumerator = c * log(intensity) - log(c!) + log(c / (c - intensity))
+	lnum := float64(c)*math.Log(intensity) - logFactorial(c) + math.Log(float64(c)/(float64(c)-intensity))
 
-	// Denominator: Sum_{i=0}^{c-1} (intensity^i / i!) + Numerator
-	denominator := 0.0
+	// LDenominator = log( sum_{i=0}^{c-1} (intensity^i / i!) + exp(lnum) )
+	logTerms := make([]float64, c+1)
 	for i := 0; i < c; i++ {
-		denominator += math.Pow(intensity, float64(i)) / factorial(i)
+		logTerms[i] = float64(i)*math.Log(intensity) - logFactorial(i)
 	}
-	denominator += numerator
+	logTerms[c] = lnum
 
-	return numerator / denominator
+	lDenom := logSumExpMulti(logTerms)
+	
+	// Pw = exp(lnum - lDenom)
+	return math.Exp(lnum - lDenom)
 }
 
 // GetRequiredServers finds the minimum c such that Erlang-C probability < threshold
 func GetRequiredServers(lambda float64, mu float64, targetWaitProb float64) int {
+	if lambda <= 0 {
+		return 1
+	}
 	intensity := lambda / mu
 	c := int(math.Ceil(intensity))
-	if c == 0 {
+	if c <= 0 {
 		c = 1
+	}
+
+	// Ensure at least one more server than intensity to avoid division by zero/instability
+	if float64(c) <= intensity {
+		c++
 	}
 
 	for {
@@ -58,8 +89,8 @@ func GetRequiredServers(lambda float64, mu float64, targetWaitProb float64) int 
 			return c
 		}
 		c++
-		if c > 1000 { // Safety break
-			return 1000
+		if c > 2000 { // Increased safety break
+			return 2000
 		}
 	}
 }
@@ -90,36 +121,64 @@ func (o *Orchestrator) DecideScaling(history []float32) (int, float32, error) {
 }
 
 func main() {
-	// Connect to Predictor Service
-	conn, err := grpc.Dial("predictor:50051", grpc.WithTransportCredentials(insecure.NewCredentials()))
+	// Connect to Predictor Service with Retry Logic (Week 14)
+	var conn *grpc.ClientConn
+	var err error
+	for i := 0; i < 30; i++ {
+		conn, err = grpc.Dial("predictor:50051", grpc.WithTransportCredentials(insecure.NewCredentials()))
+		if err == nil {
+			client := pb.NewPredictorClient(conn)
+			_, err = client.GetPrediction(context.Background(), &pb.PredictionRequest{History: []float32{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}})
+			if err == nil {
+				break
+			}
+		}
+		fmt.Printf("Predictor not ready, retrying in 3s... (%v)\n", err)
+		time.Sleep(3 * time.Second)
+	}
 	if err != nil {
-		log.Fatalf("did not connect: %v", err)
+		log.Fatalf("could not connect to predictor after 90s: %v", err)
 	}
 	defer conn.Close()
 	client := pb.NewPredictorClient(conn)
 
 	orch := &Orchestrator{
 		predictorClient: client,
-		serviceRate:     50.0,  // Each server handles 50 RPM
+		serviceRate:     50.0,  // Each server handles 50 RPS
 		slaThreshold:    0.01, // 1% target wait probability
 	}
 
 	// Internal endpoint for the Simulator to call
 	http.HandleFunc("/scale", func(w http.ResponseWriter, r *http.Request) {
-		// In a real system, we'd take history from a TSDB or the request
-		// For simulation, we'll assume the simulator sends the history
-		// ... decoding logic omitted for brevity ...
+		if r.Method != http.MethodPost {
+			http.Error(w, "Only POST allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req struct {
+			History []float32 `json:"history"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request body", http.StatusBadRequest)
+			return
+		}
+
+		if len(req.History) == 0 {
+			// Fallback mock history if empty
+			req.History = []float32{4200, 4350, 4180, 4400, 4500, 4600, 4550, 4480, 4520, 4600, 4700, 4800, 4900, 5000, 5100, 5200, 5300, 5400, 5500, 5600, 5700, 5800, 5900, 6000}
+		}
 		
-		// Mock history for now
-		history := []float32{4200, 4350, 4180, 4400, 4500, 4600, 4550, 4480, 4520, 4600, 4700, 4800, 4900, 5000, 5100, 5200, 5300, 5400, 5500, 5600, 5700, 5800, 5900, 6000}
-		
-		servers, upperBound, err := orch.DecideScaling(history)
+		servers, upperBound, err := orch.DecideScaling(req.History)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 
-		fmt.Fprintf(w, "{\"servers\": %d, \"predicted_upper_bound\": %f}", servers, upperBound)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"servers":               servers,
+			"predicted_upper_bound": upperBound,
+		})
 	})
 
 	fmt.Println("Go Orchestrator starting on :8082")
