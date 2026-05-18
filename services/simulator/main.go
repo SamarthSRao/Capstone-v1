@@ -32,6 +32,8 @@ type Simulator struct {
 	TotalRequests  int
 	History        []float32
 	LastPrediction float32
+	PendingLoad    []int
+	RealRequests   int
 }
 
 func (s *Simulator) GetActiveServerCount() int {
@@ -133,16 +135,16 @@ func main() {
 				fmt.Printf("Orchestrator error: %v\n", err)
 				continue
 			}
-			defer resp.Body.Close()
-
 			var result struct {
 				Servers int     `json:"servers"`
 				Upper   float32 `json:"predicted_upper_bound"`
 			}
 			if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 				fmt.Printf("Decode error: %v\n", err)
+				resp.Body.Close()
 				continue
 			}
+			resp.Body.Close()
 			
 			sim.mu.Lock()
 			sim.LastPrediction = result.Upper
@@ -155,11 +157,25 @@ func main() {
 		}
 	}()
 
-	// Simulate traffic (Week 13)
+	// Simulate traffic (Live Simulation)
 	go func() {
 		for {
 			sim.mu.Lock()
-			sim.RequestsPerSec = 400 + int(200*math.Sin(float64(time.Now().Unix())/60.0)) + rand.Intn(100)
+			
+			realLoad := sim.RealRequests
+			sim.RealRequests = 0 // Reset for the next second
+
+			if len(sim.PendingLoad) > 0 {
+				sim.RequestsPerSec = sim.PendingLoad[0] + realLoad
+				sim.PendingLoad = sim.PendingLoad[1:]
+			} else if realLoad > 0 {
+				// If there's actual traffic hitting the e-commerce endpoint, use that + a tiny baseline
+				sim.RequestsPerSec = realLoad + rand.Intn(10)
+			} else {
+				// Idle / Baseline load when not simulating
+				sim.RequestsPerSec = 400 + int(50*math.Sin(float64(time.Now().Unix())/60.0)) + rand.Intn(20)
+			}
+			
 			rps := sim.RequestsPerSec
 			
 			// Update history here (once per second)
@@ -180,10 +196,63 @@ func main() {
 	http.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Content-Type", "application/json")
+		
+		// DO NOT hold the lock while calling GetActiveServerCount(), it has its own lock!
+		active := sim.GetActiveServerCount()
+		
 		sim.mu.Lock()
 		defer sim.mu.Unlock()
 		fmt.Fprintf(w, "{\"total_requests\": %d, \"violations\": %d, \"server_count\": %d, \"active_servers\": %d, \"predicted_load\": %f, \"current_rps\": %d}", 
-			sim.TotalRequests, sim.Violations, len(sim.Servers), sim.GetActiveServerCount(), sim.LastPrediction, sim.RequestsPerSec)
+			sim.TotalRequests, sim.Violations, len(sim.Servers), active, sim.LastPrediction, sim.RequestsPerSec)
+	})
+
+	http.HandleFunc("/start-simulation", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		if r.Method == http.MethodOptions {
+			w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if r.Method != http.MethodPost {
+			http.Error(w, "Only POST allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req struct {
+			Data []int `json:"data"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request body", http.StatusBadRequest)
+			return
+		}
+
+		sim.mu.Lock()
+		sim.PendingLoad = req.Data
+		sim.Violations = 0 // Reset violations for new simulation run
+		sim.TotalRequests = 0
+		sim.RealRequests = 0
+		sim.mu.Unlock()
+
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, "{\"status\": \"started\", \"points\": %d}", len(req.Data))
+	})
+
+	// E-commerce Dummy Endpoint for External Load Testing (JMeter/Locust/Scripts)
+	http.HandleFunc("/api/checkout", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		
+		sim.mu.Lock()
+		sim.TotalRequests++
+		sim.RealRequests++ // Track actual live requests arriving at this endpoint
+		sim.mu.Unlock()
+
+		// Simulate slight network/processing delay for the actual request
+		time.Sleep(time.Duration(rand.Intn(20)+10) * time.Millisecond)
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"status":"success","message":"Order processed successfully"}`))
 	})
 
 	log.Fatal(http.ListenAndServe(":8083", nil))

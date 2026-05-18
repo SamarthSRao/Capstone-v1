@@ -1,246 +1,333 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import { 
-  LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, 
-  AreaChart, Area, ComposedChart, Legend, BarChart, Bar, ReferenceLine
+  ComposedChart, Area, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
+  AreaChart, ReferenceLine, BarChart, Bar
 } from 'recharts';
 import { 
-  Cpu, Activity, Zap, ShieldCheck, TrendingUp, 
-  Layers, Database, ArrowRight, Github, 
-  Terminal, Globe, Shield, BarChart3, Info, Server,
-  CheckCircle2, AlertCircle, RefreshCw, Clock, Box
+  Activity, Zap, ShieldCheck, Server, Terminal, 
+  Clock, RefreshCw, ShoppingCart, TrendingUp, AlertTriangle, Play, Box
 } from 'lucide-react';
+import { motion, AnimatePresence } from 'framer-motion';
 
 const Dashboard = () => {
   const [data, setData] = useState([]);
-  const [sessionRequests, setSessionRequests] = useState(145820);
-  const [isLive, setIsLive] = useState(false); // Toggle to real backend if found
-  
-  // MOCK DATA GENERATOR
+  const [sessionRequests, setSessionRequests] = useState(0);
+  const [violations, setViolations] = useState(0);
+  const [isSimulating, setIsSimulating] = useState(false);
+  const [activeSimulation, setActiveSimulation] = useState(null);
+  const [logs, setLogs] = useState([]);
+
+  const addLog = (msg, type = "info") => {
+    const timestamp = new Date().toISOString().split('T')[1].substring(0, 8);
+    setLogs(prev => [...prev.slice(-49), { timestamp, msg, type }]);
+  };
+
   useEffect(() => {
-    const generateMockPoint = (prevData) => {
-      const now = new Date();
-      const timeStr = now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-      
-      // Simulate a workload pattern (Sine wave + random spikes)
-      const t = prevData.length;
-      const baseLoad = 500 + Math.sin(t / 10) * 150;
-      const noise = Math.random() * 40;
-      const actual = Math.max(0, baseLoad + noise);
-      
-      // Predictor looks ahead and estimates uncertainty
-      const predicted = baseLoad + Math.sin((t + 5) / 10) * 160 + (Math.random() * 20);
-      const uncertainty = 30 + Math.random() * 20;
-      
-      // Orchestrator decision (Risk-averse scaling)
-      const upper = predicted + uncertainty;
-      const lower = predicted - uncertainty;
-      
-      // Step-based node scaling (each node handles ~60 RPS)
-      const targetNodes = Math.ceil(upper / 55);
-      const prevNodes = prevData.length > 0 ? prevData[prevData.length-1].nodes : 10;
-      
-      // Simulate cold start delay for scaling
-      const nodes = targetNodes > prevNodes ? prevNodes + 0.1 : targetNodes;
-
-      return {
-        time: timeStr,
-        actual: parseFloat(actual.toFixed(1)),
-        predicted: parseFloat(predicted.toFixed(1)),
-        upper: parseFloat(upper.toFixed(1)),
-        lower: parseFloat(lower.toFixed(1)),
-        nodes: Math.round(nodes * 10) / 10,
-        latency: 140 + (actual / 100) + Math.random() * 10
-      };
-    };
-
-    const interval = setInterval(() => {
-      setData(prev => {
-        const next = generateMockPoint(prev);
-        setSessionRequests(s => s + Math.floor(next.actual));
-        const newData = [...prev, next];
-        return newData.slice(-40);
-      });
-    }, 2000);
-
-    return () => clearInterval(interval);
+    addLog("HybridTimeNet Agent Connected to Commerce Gateway", "info");
+    addLog("Monitoring API Endpoints: /checkout, /cart, /catalog", "info");
   }, []);
 
-  // PDF-Specified Metrics (Mocked to match HybridTimeNet performance)
-  const stats = useMemo(() => {
-    const last = data[data.length - 1] || {};
-    return [
-      { label: 'SLA Reliability', val: '99.94%', sub: 'Target: 99.9%', color: 'text-emerald-400', icon: ShieldCheck },
-      { label: 'Forecast MAPE', val: '3.18%', sub: 'Mean Abs % Error', color: 'text-blue-400', icon: BarChart3 },
-      { label: 'Over-provisioning', val: '12.4%', sub: 'Resource Waste', color: 'text-amber-400', icon: Zap },
-      { label: 'Active Fleet', val: `${Math.ceil(last.nodes || 10)} Nodes`, sub: 'Erlang-C Provisioned', color: 'text-white', icon: Server }
-    ];
-  }, [data]);
+  // REAL DATA POLLING
+  useEffect(() => {
+    const interval = setInterval(async () => {
+      try {
+        const response = await fetch('http://localhost:8083/metrics');
+        if (!response.ok) return;
+        
+        const json = await response.json();
+        const now = new Date();
+        const timeStr = now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+        
+        setData(prev => {
+          const next = {
+            time: timeStr,
+            actual: json.current_rps,
+            predicted: parseFloat(json.predicted_load.toFixed(1)),
+            upper: parseFloat(json.predicted_load.toFixed(1)), // Ideally these come from the backend if bounded
+            lower: parseFloat((json.predicted_load * 0.8).toFixed(1)),
+            nodes: json.active_servers,
+            latency: json.current_rps > 0 ? 120 + (json.current_rps / 50) + Math.random() * 20 : 100,
+            revenue: json.current_rps * (Math.random() * 2 + 5) // Simulated revenue based on load
+          };
+          return [...prev, next].slice(-60); // Keep last 60 seconds
+        });
+
+        if (json.current_rps > 1000 && !isSimulating) {
+           if (Math.random() > 0.9) addLog(`High traffic detected: ${json.current_rps} RPS. RL Agent scaling up.`, "warn");
+        }
+
+        setSessionRequests(json.total_requests);
+        setViolations(json.violations);
+      } catch (err) {
+        console.error("Failed to fetch metrics from Simulator", err);
+      }
+    }, 1000);
+
+    return () => clearInterval(interval);
+  }, [isSimulating]);
+
+  const handleSimulateLoad = async (type) => {
+    setIsSimulating(true);
+    setActiveSimulation(type);
+    addLog(`Initiated ${type} E-Commerce Load Simulation`, "success");
+    
+    try {
+      const dataset = [];
+      for(let i=0; i<120; i++) {
+         let rps = 200;
+         if (type === "Flash Sale") {
+             if (i > 15 && i < 45) rps = 2200 + Math.floor(Math.random() * 500);
+             else if (i >= 45 && i < 80) rps = 1200 + Math.floor(Math.random() * 200);
+             else rps = 300 + Math.floor(Math.random() * 100);
+         } else if (type === "Black Friday") {
+             if (i > 10) rps = 1500 + Math.floor(Math.random() * 800) + (i * 10);
+         } else if (type === "Bot Attack") {
+             if (i % 10 === 0) rps = 3000; // Sudden spikes
+             else rps = 200;
+         }
+         dataset.push(rps);
+      }
+
+      await fetch('http://localhost:8083/start-simulation', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ data: dataset })
+      });
+      
+    } catch (err) {
+      addLog(`Failed to start simulation: ${err.message}`, "error");
+    }
+    
+    setTimeout(() => {
+      setIsSimulating(false);
+      setActiveSimulation(null);
+      addLog(`${type} Simulation Complete`, "info");
+    }, 120000);
+  };
+
+  const lastData = data[data.length - 1] || { actual: 0, predicted: 0, nodes: 0, latency: 0, revenue: 0 };
+  const slaRate = sessionRequests > 0 ? ((1 - (violations / sessionRequests)) * 100).toFixed(2) : '100.00';
 
   return (
-    <div className="min-h-screen bg-[#020617] text-slate-300 font-mono selection:bg-blue-500/30">
-      {/* PROMETHEUS TOP BAR */}
-      <header className="border-b border-slate-800 bg-slate-900/50 backdrop-blur-md sticky top-0 z-50 px-6 py-3 flex justify-between items-center">
+    <div className="min-h-screen bg-[#050505] text-slate-300 font-sans selection:bg-blue-500/30">
+      {/* GLOWING BACKGROUND EFFECTS */}
+      <div className="fixed top-0 left-[20%] w-[60%] h-[300px] bg-blue-600/10 rounded-full blur-[150px] pointer-events-none" />
+      <div className="fixed bottom-[-10%] right-[-10%] w-[40%] h-[400px] bg-emerald-600/10 rounded-full blur-[150px] pointer-events-none" />
+
+      {/* HEADER */}
+      <header className="border-b border-white/5 bg-black/40 backdrop-blur-2xl sticky top-0 z-50 px-6 py-4 flex justify-between items-center">
         <div className="flex items-center gap-4">
-          <div className="w-8 h-8 bg-orange-600 rounded flex items-center justify-center text-white font-black shadow-lg shadow-orange-900/20">
-            H
+          <div className="w-10 h-10 bg-gradient-to-br from-blue-600 to-blue-900 border border-blue-500/30 rounded-xl flex items-center justify-center text-white font-black shadow-[0_0_20px_rgba(37,99,235,0.3)]">
+            HT
           </div>
           <div className="flex flex-col">
-            <span className="text-white font-bold text-sm tracking-tight">HybridTimeNet v1.0.4</span>
-            <span className="text-[10px] text-slate-500 uppercase tracking-widest font-black">Cluster: htn-prod-simulator-01</span>
+            <span className="text-white font-bold tracking-tight">HybridTimeNet</span>
+            <span className="text-xs text-blue-400 font-medium tracking-wide">E-Commerce Operations Center</span>
           </div>
         </div>
 
         <div className="flex items-center gap-6">
-           <div className="flex items-center gap-8">
+           <div className="hidden md:flex items-center gap-8">
               <div className="flex flex-col items-end">
-                <span className="text-[9px] text-slate-500 uppercase font-black">Simulator Status</span>
-                <span className="text-[11px] text-emerald-400 flex items-center gap-1.5 font-bold">
-                  <div className="w-1.5 h-1.5 bg-emerald-500 rounded-full animate-pulse" /> OPERATIONAL
+                <span className="text-[10px] text-slate-500 uppercase font-black tracking-widest">Target Environment</span>
+                <span className="text-xs text-white font-medium flex items-center gap-1.5">
+                  <Box size={12} className="text-slate-400" /> NexusGear Storefront
                 </span>
               </div>
               <div className="flex flex-col items-end">
-                <span className="text-[9px] text-slate-500 uppercase font-black">ML Inference</span>
-                <span className="text-[11px] text-blue-400 flex items-center gap-1.5 font-bold">
-                  <div className="w-1.5 h-1.5 bg-blue-500 rounded-full" /> ACTIVE (MC_DROPOUT)
+                <span className="text-[10px] text-slate-500 uppercase font-black tracking-widest">RL Predictor</span>
+                <span className="text-xs text-emerald-400 flex items-center gap-1.5 font-bold">
+                  <div className="w-1.5 h-1.5 bg-emerald-500 rounded-full animate-pulse shadow-[0_0_10px_rgba(16,185,129,0.5)]" /> ONLINE
                 </span>
               </div>
-           </div>
-           <div className="w-px h-8 bg-slate-800" />
-           <div className="bg-slate-950 border border-slate-800 rounded px-3 py-1.5 text-[10px] flex items-center gap-3">
-              <Clock size={12} className="text-slate-500" />
-              <span className="text-slate-300 font-bold uppercase tracking-wider">Last 15m</span>
            </div>
         </div>
       </header>
 
-      <main className="p-6 max-w-[1600px] mx-auto">
-        {/* METRICS GRID */}
-        <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-6">
-          {stats.map((s, i) => (
-            <div key={i} className="bg-slate-900/50 border border-slate-800 p-5 rounded hover:border-slate-700 transition-colors group">
-              <div className="flex justify-between items-start mb-3">
-                 <div className="p-2 bg-slate-950 rounded text-slate-500 group-hover:text-blue-400 transition-colors">
+      <main className="p-6 max-w-[1800px] mx-auto relative z-10 space-y-6">
+        
+        {/* TOP LEVEL METRICS */}
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-4">
+          {[
+            { label: 'Gateway RPS', val: `${Math.round(lastData.actual).toLocaleString()}`, sub: 'Requests/sec', icon: Activity, color: 'text-white' },
+            { label: 'Predicted Load', val: `${Math.round(lastData.predicted).toLocaleString()}`, sub: 'RL Agent Forecast', icon: Zap, color: 'text-blue-400' },
+            { label: 'Active Fleet', val: `${Math.ceil(lastData.nodes || 1)}`, sub: 'Provisioned Nodes', icon: Server, color: 'text-amber-400' },
+            { label: 'SLA Reliability', val: `${slaRate}%`, sub: `${violations} Violations`, icon: ShieldCheck, color: slaRate > 99 ? 'text-emerald-400' : 'text-red-400' },
+            { label: 'Live Revenue', val: `$${Math.round(lastData.revenue || 0).toLocaleString()}`, sub: 'Estimated / sec', icon: ShoppingCart, color: 'text-purple-400' }
+          ].map((s, i) => (
+            <motion.div 
+              initial={{ opacity: 0, y: 20 }}
+              animate={{ opacity: 1, y: 0 }}
+              transition={{ delay: i * 0.1 }}
+              key={i} 
+              className="bg-white/[0.02] border border-white/5 rounded-2xl p-5 hover:bg-white/[0.04] transition-colors relative overflow-hidden group"
+            >
+              <div className="absolute top-0 right-0 p-4 opacity-10 group-hover:opacity-20 transition-opacity">
+                <s.icon size={48} className={s.color} />
+              </div>
+              <div className="flex justify-between items-start mb-4 relative z-10">
+                 <div className={`p-2 bg-white/5 rounded-lg ${s.color}`}>
                    <s.icon size={18} />
                  </div>
-                 <span className="text-[9px] font-black text-slate-600 uppercase tracking-widest">{s.label}</span>
+                 <span className="text-[10px] font-black text-slate-500 uppercase tracking-widest">{s.label}</span>
               </div>
-              <div className={`text-2xl font-black tabular-nums ${s.color}`}>{s.val}</div>
-              <div className="text-[10px] text-slate-500 mt-1 font-bold">{s.sub}</div>
-            </div>
+              <div className={`text-3xl font-bold tracking-tight tabular-nums relative z-10 ${s.color}`}>{s.val}</div>
+              <div className="text-xs text-slate-500 mt-2 font-medium relative z-10">{s.sub}</div>
+            </motion.div>
           ))}
         </div>
 
-        {/* MAIN PANEL */}
-        <div className="grid grid-cols-12 gap-6">
-          {/* PRIMARY WORKLOAD CHART */}
-          <div className="col-span-12 lg:col-span-8 bg-slate-900/50 border border-slate-800 rounded p-6">
+        <div className="grid grid-cols-1 lg:grid-cols-4 gap-6">
+          
+          {/* MAIN CHART */}
+          <div className="lg:col-span-3 bg-white/[0.02] border border-white/5 rounded-2xl p-6">
             <div className="flex justify-between items-center mb-8">
                <div>
-                  <h4 className="text-xs font-black text-slate-500 uppercase tracking-widest mb-1 flex items-center gap-2">
-                    <Activity size={14} /> Workload Forecast & Provisioning
+                  <h4 className="text-lg font-bold text-white flex items-center gap-2">
+                    E-Commerce Traffic Telemetry
                   </h4>
-                  <p className="text-[10px] text-slate-600">Requests per Second (RPS) vs. Bayesian Upper Bound</p>
+                  <p className="text-sm text-slate-500">Live request volume vs. RL prediction boundaries</p>
                </div>
-               <div className="flex gap-4 text-[9px] font-black uppercase">
-                  <div className="flex items-center gap-2 text-slate-300"><div className="w-2 h-2 bg-white" /> Actual</div>
-                  <div className="flex items-center gap-2 text-blue-400"><div className="w-2 h-0.5 border-t-2 border-blue-400 border-dashed" /> Forecast</div>
-                  <div className="flex items-center gap-2 text-orange-500"><div className="w-2 h-2 bg-orange-500/20 border border-orange-500" /> Scale</div>
+               <div className="flex gap-6 text-xs font-bold uppercase tracking-wider">
+                  <div className="flex items-center gap-2 text-white"><div className="w-2.5 h-2.5 rounded-full bg-white" /> Actual Load</div>
+                  <div className="flex items-center gap-2 text-blue-500"><div className="w-2.5 h-2.5 rounded-full bg-blue-500" /> RL Forecast</div>
+                  <div className="flex items-center gap-2 text-amber-500"><div className="w-2.5 h-0.5 bg-amber-500" /> Provisioned Capacity</div>
                </div>
             </div>
 
-            <div className="h-[450px] w-full">
+            <div className="h-[400px] w-full">
               <ResponsiveContainer width="100%" height="100%">
-                <ComposedChart data={data}>
-                  <CartesianGrid strokeDasharray="1 4" stroke="#1e293b" vertical={false} />
-                  <XAxis dataKey="time" axisLine={false} tickLine={false} tick={{ fontSize: 9, fill: '#475569' }} hide={data.length < 5} />
-                  <YAxis axisLine={false} tickLine={false} tick={{ fontSize: 9, fill: '#475569' }} />
+                <ComposedChart data={data} margin={{ top: 10, right: 10, left: -20, bottom: 0 }}>
+                  <defs>
+                    <linearGradient id="colorPredicted" x1="0" y1="0" x2="0" y2="1">
+                      <stop offset="5%" stopColor="#3b82f6" stopOpacity={0.2}/>
+                      <stop offset="95%" stopColor="#3b82f6" stopOpacity={0}/>
+                    </linearGradient>
+                  </defs>
+                  <CartesianGrid strokeDasharray="3 3" stroke="#ffffff0a" vertical={false} />
+                  <XAxis dataKey="time" axisLine={false} tickLine={false} tick={{ fontSize: 11, fill: '#64748b' }} minTickGap={30} />
+                  <YAxis axisLine={false} tickLine={false} tick={{ fontSize: 11, fill: '#64748b' }} />
                   <Tooltip 
-                    contentStyle={{ backgroundColor: '#0f172a', border: '1px solid #1e293b', borderRadius: '4px', fontSize: '10px' }}
-                    cursor={{ stroke: '#334155', strokeWidth: 1 }}
+                    contentStyle={{ backgroundColor: '#0f172a', border: '1px solid #1e293b', borderRadius: '8px', boxShadow: '0 10px 15px -3px rgba(0, 0, 0, 0.5)' }}
+                    itemStyle={{ fontSize: '12px', fontWeight: 'bold' }}
+                    labelStyle={{ fontSize: '11px', color: '#94a3b8', marginBottom: '4px' }}
+                    cursor={{ stroke: '#334155', strokeWidth: 1, strokeDasharray: '4 4' }}
                   />
-                  <Area type="monotone" dataKey="upper" stroke="none" fill="#3b82f6" fillOpacity={0.05} baseValue="lower" />
-                  <Line type="monotone" dataKey="predicted" stroke="#3b82f6" strokeWidth={1} strokeDasharray="4 4" dot={false} animationDuration={0} />
-                  <Line type="stepAfter" dataKey="nodes" stroke="#ea580c" strokeWidth={2} dot={false} />
-                  <Line type="monotone" dataKey="actual" stroke="#ffffff" strokeWidth={2} dot={{ r: 2, fill: '#ffffff' }} animationDuration={400} />
+                  <Area type="monotone" dataKey="upper" stroke="none" fill="url(#colorPredicted)" baseValue="lower" />
+                  <Line type="monotone" dataKey="predicted" stroke="#3b82f6" strokeWidth={2} strokeDasharray="4 4" dot={false} isAnimationActive={false} />
+                  <Line type="stepAfter" dataKey="nodes" stroke="#f59e0b" strokeWidth={2} dot={false} isAnimationActive={false} />
+                  <Line type="monotone" dataKey="actual" stroke="#ffffff" strokeWidth={2} dot={false} isAnimationActive={false} />
                 </ComposedChart>
               </ResponsiveContainer>
             </div>
           </div>
 
-          {/* SECONDARY PANELS */}
-          <div className="col-span-12 lg:col-span-4 flex flex-col gap-6">
-            {/* LATENCY CHART */}
-            <div className="flex-1 bg-slate-900/50 border border-slate-800 rounded p-5">
-              <h4 className="text-[10px] font-black text-slate-500 uppercase tracking-widest mb-6">P95 Latency (ms)</h4>
-              <div className="h-[180px] w-full">
-                <ResponsiveContainer width="100%" height="100%">
-                  <AreaChart data={data}>
-                    <CartesianGrid strokeDasharray="1 4" stroke="#1e293b" vertical={false} />
-                    <XAxis dataKey="time" hide />
-                    <YAxis domain={['dataMin - 10', 'dataMax + 10']} axisLine={false} tickLine={false} tick={{ fontSize: 9, fill: '#475569' }} />
-                    <Tooltip contentStyle={{ backgroundColor: '#0f172a', border: '1px solid #1e293b', fontSize: '10px' }} />
-                    <Area type="monotone" dataKey="latency" stroke="#10b981" fill="#10b981" fillOpacity={0.1} />
-                  </AreaChart>
-                </ResponsiveContainer>
-              </div>
-            </div>
-
-            {/* RESOURCE DISTRIBUTION */}
-            <div className="flex-1 bg-slate-900/50 border border-slate-800 rounded p-5">
-               <h4 className="text-[10px] font-black text-slate-500 uppercase tracking-widest mb-6">Ensemble Confidence</h4>
-               <div className="space-y-6">
-                  <div>
-                    <div className="flex justify-between text-[10px] mb-2 font-bold uppercase">
-                       <span className="text-slate-400">Bayesian LSTM (Epistemic)</span>
-                       <span className="text-blue-400">94.2%</span>
-                    </div>
-                    <div className="w-full bg-slate-950 h-1.5 rounded-full overflow-hidden">
-                       <div className="bg-blue-500 h-full w-[94%]" />
-                    </div>
-                  </div>
-                  <div>
-                    <div className="flex justify-between text-[10px] mb-2 font-bold uppercase">
-                       <span className="text-slate-400">Neural Prophet (Trend)</span>
-                       <span className="text-emerald-400">88.7%</span>
-                    </div>
-                    <div className="w-full bg-slate-950 h-1.5 rounded-full overflow-hidden">
-                       <div className="bg-emerald-500 h-full w-[88%]" />
-                    </div>
-                  </div>
-                  <div>
-                    <div className="flex justify-between text-[10px] mb-2 font-bold uppercase">
-                       <span className="text-slate-400">XGBoost (Residuals)</span>
-                       <span className="text-purple-400">91.4%</span>
-                    </div>
-                    <div className="w-full bg-slate-950 h-1.5 rounded-full overflow-hidden">
-                       <div className="bg-purple-500 h-full w-[91%]" />
-                    </div>
-                  </div>
+          {/* SIMULATION CONTROLS */}
+          <div className="lg:col-span-1 space-y-6">
+            <div className="bg-white/[0.02] border border-white/5 rounded-2xl p-6 h-full">
+               <h4 className="text-sm font-bold text-white mb-1 flex items-center gap-2 uppercase tracking-widest">
+                 <Zap size={16} className="text-amber-400" /> Load Simulation
+               </h4>
+               <p className="text-xs text-slate-500 mb-6">Inject synthetic traffic patterns into the E-Commerce Gateway to test the RL Agent.</p>
+               
+               <div className="space-y-3">
+                 {[
+                   { name: "Flash Sale", desc: "Massive spike (2K+ RPS) at T+15s", icon: Zap, color: "hover:border-amber-500/50 hover:bg-amber-500/10", activeColor: "border-amber-500 bg-amber-500/20 text-amber-300" },
+                   { name: "Black Friday", desc: "Sustained high load growth", icon: TrendingUp, color: "hover:border-purple-500/50 hover:bg-purple-500/10", activeColor: "border-purple-500 bg-purple-500/20 text-purple-300" },
+                   { name: "Bot Attack", desc: "Sudden micro-bursts of traffic", icon: AlertTriangle, color: "hover:border-red-500/50 hover:bg-red-500/10", activeColor: "border-red-500 bg-red-500/20 text-red-300" }
+                 ].map((sim) => (
+                   <button 
+                     key={sim.name}
+                     onClick={() => handleSimulateLoad(sim.name)}
+                     disabled={isSimulating}
+                     className={`w-full p-4 rounded-xl border flex items-center gap-4 transition-all text-left group
+                        ${isSimulating && activeSimulation === sim.name ? sim.activeColor : 'border-white/5 bg-white/[0.01]'}
+                        ${!isSimulating ? sim.color : (activeSimulation !== sim.name ? 'opacity-50 cursor-not-allowed' : '')}
+                     `}
+                   >
+                     <div className={`p-2 rounded-lg bg-black/40 ${isSimulating && activeSimulation === sim.name ? '' : 'group-hover:scale-110 transition-transform'}`}>
+                       <sim.icon size={18} />
+                     </div>
+                     <div>
+                       <div className="font-bold text-sm text-slate-200">{sim.name}</div>
+                       <div className="text-[10px] text-slate-500">{sim.desc}</div>
+                     </div>
+                     {isSimulating && activeSimulation === sim.name && (
+                       <RefreshCw size={14} className="ml-auto animate-spin" />
+                     )}
+                   </button>
+                 ))}
                </div>
             </div>
           </div>
         </div>
 
-        {/* LOGS TERMINAL */}
-        <div className="mt-6 bg-slate-950 border border-slate-800 rounded p-4 font-mono text-[10px] leading-relaxed">
-           <div className="flex items-center gap-2 mb-3 border-b border-slate-900 pb-2">
-              <Terminal size={12} className="text-slate-600" />
-              <span className="text-slate-500 font-bold uppercase">Kernel Events</span>
-           </div>
-           <div className="space-y-1 overflow-y-auto max-h-[120px] custom-scrollbar">
-              <div className="text-slate-600 font-bold">[{new Date().toISOString()}] <span className="text-blue-500">INFO</span>: HybridTimeNet Predictor warming up... (Window: 60s)</div>
-              <div className="text-slate-600 font-bold">[{new Date().toISOString()}] <span className="text-emerald-500">INFO</span>: gRPC Handshake established with Predictor at :50051</div>
-              <div className="text-slate-600 font-bold">[{new Date().toISOString()}] <span className="text-orange-500">WARN</span>: Variance spike detected. Switching to Risk-Averse provisioning.</div>
-              <div className="text-slate-600 font-bold">[{new Date().toISOString()}] <span className="text-blue-500">INFO</span>: Provisioning 2 additional nodes (Cold Start initiated).</div>
-              <div className="text-slate-600 font-bold">[{new Date().toISOString()}] <span className="text-slate-400 italic">... monitoring live trace ...</span></div>
-           </div>
+        {/* BOTTOM PANELS */}
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+          {/* LATENCY */}
+          <div className="bg-white/[0.02] border border-white/5 rounded-2xl p-6">
+            <h4 className="text-sm font-bold text-white mb-6 uppercase tracking-widest flex items-center gap-2">
+               <Clock size={16} className="text-emerald-400" /> Gateway P95 Latency
+            </h4>
+            <div className="h-[200px] w-full">
+              <ResponsiveContainer width="100%" height="100%">
+                <AreaChart data={data} margin={{ top: 0, right: 0, left: -20, bottom: 0 }}>
+                  <defs>
+                    <linearGradient id="colorLatency" x1="0" y1="0" x2="0" y2="1">
+                      <stop offset="5%" stopColor="#10b981" stopOpacity={0.3}/>
+                      <stop offset="95%" stopColor="#10b981" stopOpacity={0}/>
+                    </linearGradient>
+                  </defs>
+                  <CartesianGrid strokeDasharray="3 3" stroke="#ffffff0a" vertical={false} />
+                  <XAxis dataKey="time" hide />
+                  <YAxis domain={['dataMin - 10', 'dataMax + 10']} axisLine={false} tickLine={false} tick={{ fontSize: 11, fill: '#64748b' }} />
+                  <Tooltip contentStyle={{ backgroundColor: '#0f172a', border: '1px solid #1e293b', borderRadius: '8px' }} />
+                  <Area type="monotone" dataKey="latency" stroke="#10b981" strokeWidth={2} fill="url(#colorLatency)" isAnimationActive={false} />
+                </AreaChart>
+              </ResponsiveContainer>
+            </div>
+          </div>
+
+          {/* SYSTEM LOGS */}
+          <div className="lg:col-span-2 bg-black border border-white/5 rounded-2xl p-6 font-mono relative overflow-hidden flex flex-col">
+            <div className="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-blue-500 via-emerald-500 to-purple-500" />
+            <h4 className="text-xs font-bold text-slate-500 mb-4 uppercase tracking-widest flex items-center gap-2">
+               <Terminal size={14} /> Agent / Gateway Event Stream
+            </h4>
+            <div className="flex-1 overflow-y-auto space-y-2 text-xs custom-scrollbar">
+              <AnimatePresence>
+                {logs.map((log, i) => (
+                  <motion.div 
+                    initial={{ opacity: 0, x: -10 }}
+                    animate={{ opacity: 1, x: 0 }}
+                    key={i} 
+                    className="flex gap-3"
+                  >
+                    <span className="text-slate-600">[{log.timestamp}]</span>
+                    <span className={`font-bold ${
+                      log.type === 'error' ? 'text-red-400' :
+                      log.type === 'warn' ? 'text-amber-400' :
+                      log.type === 'success' ? 'text-emerald-400' :
+                      'text-blue-400'
+                    }`}>
+                      {log.type.toUpperCase().padEnd(7)}
+                    </span>
+                    <span className="text-slate-300">{log.msg}</span>
+                  </motion.div>
+                ))}
+              </AnimatePresence>
+              {logs.length === 0 && <div className="text-slate-600 italic">Waiting for events...</div>}
+            </div>
+          </div>
         </div>
+
       </main>
 
       <style jsx>{`
-        .custom-scrollbar::-webkit-scrollbar { width: 4px; }
-        .custom-scrollbar::-webkit-scrollbar-track { background: #020617; }
-        .custom-scrollbar::-webkit-scrollbar-thumb { background: #1e293b; border-radius: 2px; }
+        .custom-scrollbar::-webkit-scrollbar { width: 6px; }
+        .custom-scrollbar::-webkit-scrollbar-track { background: transparent; }
+        .custom-scrollbar::-webkit-scrollbar-thumb { background: #334155; border-radius: 3px; }
+        .custom-scrollbar::-webkit-scrollbar-thumb:hover { background: #475569; }
       `}</style>
     </div>
   );

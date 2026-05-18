@@ -1,7 +1,7 @@
 {
-  "name": "dashboard",
+  "name": "prom-dashboard",
   "private": true,
-  "version": "0.0.0",
+  "version": "1.0.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -9,12 +9,11 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "clsx": "^2.1.1",
-    "framer-motion": "^12.38.0",
     "lucide-react": "^0.378.0",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
     "recharts": "^2.12.7",
+    "clsx": "^2.1.1",
     "tailwind-merge": "^2.3.0"
   },
   "devDependencies": {
