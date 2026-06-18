@@ -1,12 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"log"
 	"math"
 	"net/http"
+	"os"
 	"time"
 
 	"google.golang.org/grpc"
@@ -14,7 +16,7 @@ import (
 
 	pb "github.com/samarthsrao/capstone/protos/predictor"
 )
-// logFactorial calculates the log of n!
+
 func logFactorial(n int) float64 {
 	res := 0.0
 	for i := 1; i <= n; i++ {
@@ -23,8 +25,6 @@ func logFactorial(n int) float64 {
 	return res
 }
 
-
-// logSumExpMulti computes log(sum(exp(x_i))) in a stable way
 func logSumExpMulti(terms []float64) float64 {
 	if len(terms) == 0 {
 		return -math.MaxFloat64
@@ -50,11 +50,8 @@ func calculateErlangC(c int, intensity float64) float64 {
 		return 1.0
 	}
 
-	// Use log-space to avoid overflow
-	// LNumerator = c * log(intensity) - log(c!) + log(c / (c - intensity))
 	lnum := float64(c)*math.Log(intensity) - logFactorial(c) + math.Log(float64(c)/(float64(c)-intensity))
 
-	// LDenominator = log( sum_{i=0}^{c-1} (intensity^i / i!) + exp(lnum) )
 	logTerms := make([]float64, c+1)
 	for i := 0; i < c; i++ {
 		logTerms[i] = float64(i)*math.Log(intensity) - logFactorial(i)
@@ -62,12 +59,9 @@ func calculateErlangC(c int, intensity float64) float64 {
 	logTerms[c] = lnum
 
 	lDenom := logSumExpMulti(logTerms)
-	
-	// Pw = exp(lnum - lDenom)
 	return math.Exp(lnum - lDenom)
 }
 
-// GetRequiredServers finds the minimum c such that Erlang-C probability < threshold
 func GetRequiredServers(lambda float64, mu float64, targetWaitProb float64) int {
 	if lambda <= 0 {
 		return 1
@@ -78,7 +72,6 @@ func GetRequiredServers(lambda float64, mu float64, targetWaitProb float64) int 
 		c = 1
 	}
 
-	// Ensure at least one more server than intensity to avoid division by zero/instability
 	if float64(c) <= intensity {
 		c++
 	}
@@ -89,7 +82,7 @@ func GetRequiredServers(lambda float64, mu float64, targetWaitProb float64) int 
 			return c
 		}
 		c++
-		if c > 2000 { // Increased safety break
+		if c > 2000 {
 			return 2000
 		}
 	}
@@ -97,12 +90,13 @@ func GetRequiredServers(lambda float64, mu float64, targetWaitProb float64) int 
 
 type Orchestrator struct {
 	predictorClient pb.PredictorClient
-	serviceRate     float64 // mu: requests per minute per server
-	slaThreshold    float64 // max probability of waiting
+	serviceRate     float64
+	slaThreshold    float64
+	simulatorURL    string
 }
 
-func (o *Orchestrator) DecideScaling(history []float32) (int, float32, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second*2)
+func (o *Orchestrator) DecideScaling(history []float32) (int, *pb.PredictionResponse, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	resp, err := o.predictorClient.GetPrediction(ctx, &pb.PredictionRequest{
@@ -110,18 +104,53 @@ func (o *Orchestrator) DecideScaling(history []float32) (int, float32, error) {
 		Timestamp: time.Now().Format(time.RFC3339),
 	})
 	if err != nil {
-		return 0, 0, err
+		return 0, nil, err
 	}
 
-	// Use the Upper Bound (mean + 2*std) for risk-averse provisioning
 	lambda := float64(resp.UpperBound)
 	c := GetRequiredServers(lambda, o.serviceRate, o.slaThreshold)
+	return c, resp, nil
+}
 
-	return c, resp.UpperBound, nil
+func (o *Orchestrator) pushPredictionToSimulator(resp *pb.PredictionResponse, requiredServers int) {
+	horizon := 12
+	meanSeries := make([]float64, horizon)
+	upperSeries := make([]float64, horizon)
+	lowerSeries := make([]float64, horizon)
+	for i := 0; i < horizon; i++ {
+		meanSeries[i] = float64(resp.Mean)
+		upperSeries[i] = float64(resp.UpperBound)
+		lowerSeries[i] = float64(resp.LowerBound)
+	}
+
+	payload := map[string]interface{}{
+		"predicted_mean":    meanSeries,
+		"predicted_upper":   upperSeries,
+		"predicted_lower":   lowerSeries,
+		"required_servers":  requiredServers,
+	}
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		fmt.Printf("[Orchestrator] Failed to marshal prediction: %v\n", err)
+		return
+	}
+
+	client := &http.Client{Timeout: 2 * time.Second}
+	res, err := client.Post(o.simulatorURL+"/update-prediction", "application/json", bytes.NewBuffer(body))
+	if err != nil {
+		fmt.Printf("[Orchestrator] Could not push prediction to Simulator: %v\n", err)
+		return
+	}
+	res.Body.Close()
 }
 
 func main() {
-	// Connect to Predictor Service with Retry Logic (Week 14)
+	simulatorURL := os.Getenv("SIMULATOR_URL")
+	if simulatorURL == "" {
+		simulatorURL = "http://simulator:8083"
+	}
+
 	var conn *grpc.ClientConn
 	var err error
 	for i := 0; i < 30; i++ {
@@ -144,11 +173,11 @@ func main() {
 
 	orch := &Orchestrator{
 		predictorClient: client,
-		serviceRate:     50.0,  // Each server handles 50 RPS
-		slaThreshold:    0.01, // 1% target wait probability
+		serviceRate:     50.0,
+		slaThreshold:    0.01,
+		simulatorURL:    simulatorURL,
 	}
 
-	// Internal endpoint for the Simulator to call
 	http.HandleFunc("/scale", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Only POST allowed", http.StatusMethodNotAllowed)
@@ -164,20 +193,23 @@ func main() {
 		}
 
 		if len(req.History) == 0 {
-			// Fallback mock history if empty
-			req.History = []float32{4200, 4350, 4180, 4400, 4500, 4600, 4550, 4480, 4520, 4600, 4700, 4800, 4900, 5000, 5100, 5200, 5300, 5400, 5500, 5600, 5700, 5800, 5900, 6000}
+			req.History = []float32{50, 50, 50, 50, 50, 50, 50, 50, 50, 50, 50, 50, 50, 50, 50, 50, 50, 50, 50, 50, 50, 50, 50, 50}
 		}
-		
-		servers, upperBound, err := orch.DecideScaling(req.History)
+
+		servers, predResp, err := orch.DecideScaling(req.History)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 
+		orch.pushPredictionToSimulator(predResp, servers)
+
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"servers":               servers,
-			"predicted_upper_bound": upperBound,
+			"predicted_upper_bound": predResp.UpperBound,
+			"predicted_mean":        predResp.Mean,
+			"predicted_lower_bound": predResp.LowerBound,
 		})
 	})
 

@@ -35,6 +35,19 @@ services:
     networks:
       - capstone-net
 
+  ecommerce:
+    build:
+      context: ./services/ecommerce
+    ports:
+      - "5173:5173"
+    environment:
+      - VITE_SIMULATOR_URL=http://localhost:8083
+      - VITE_API_URL=http://localhost:8080
+    depends_on:
+      - simulator
+    networks:
+      - capstone-net
+
 networks:
   capstone-net:
     driver: bridge
