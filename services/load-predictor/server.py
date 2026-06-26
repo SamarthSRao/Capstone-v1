@@ -6,6 +6,10 @@ import numpy as np
 import pandas as pd
 from datetime import datetime
 
+import sys
+import os
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../hybrid_time_net')))
+
 # Import generated gRPC code
 import predictor_pb2
 import predictor_pb2_grpc
@@ -15,6 +19,7 @@ from models.lstm import BayesianLSTM
 from models.neural_prophet import WorkloadNeuralProphet
 from models.xgboost_residuals import XGBoostResidualModel
 from models.hybrid_mlp import HybridMLPFusion
+from rl_agent import RLAgent
 
 class PredictorService(predictor_pb2_grpc.PredictorServicer):
     def __init__(self):
@@ -34,9 +39,21 @@ class PredictorService(predictor_pb2_grpc.PredictorServicer):
         # 4. Fusion MLP
         self.fusion = HybridMLPFusion(input_size=3).to(self.device)
         
+        # RL Agent
+        self.rl_agent = RLAgent(state_size=3, action_size=3)
+        self.rl_agent.epsilon = 0.0 # Inference mode
+        try:
+            # Try to load if checkpoint exists
+            checkpoint_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../hybrid_time_net/models/rl_agent_checkpoint.pth'))
+            self.rl_agent.load(checkpoint_path)
+            print("Loaded trained RL Agent.")
+        except Exception as e:
+            print("Could not load RL Agent, using default initialized weights. Error:", e)
+
         # Scaling parameters (mock values, in production these would be saved from training)
         self.mean_train = 5000.0
         self.std_train = 1500.0
+        self.last_state = np.array([0.0, 0.0, 0.0])
 
     def GetPrediction(self, request, context):
         history = np.array(request.history)
@@ -89,16 +106,30 @@ class PredictorService(predictor_pb2_grpc.PredictorServicer):
         # mean = (0.7 * lstm_mean) + (0.2 * np_pred) + (0.1 * (np_pred + xgb_residual))
         mean = float(lstm_mean) # Focusing on the Bayesian output as primary
         
-        # User's thesis: mean + 2*std for upper bound (proactive safety)
+        # RL Agent Observation & Action
+        current_sla = request.sla_violation_rate
+        current_wasted = request.wasted_capacity
+        current_var_norm = float(total_std) / self.std_train
+        
+        current_state = np.array([current_var_norm, current_sla, current_wasted])
+        
+        action = self.rl_agent.act(current_state)
+        current_z_score = self.rl_agent.step_z_score(action)
+        
+        # We can do online learning here if desired, but for now we just act
+        self.last_state = current_state
+        
+        # User's thesis: mean + z_score*std for upper bound
         std_dev = float(total_std)
-        upper_bound = mean + 2 * std_dev
-        lower_bound = max(0, mean - 2 * std_dev)
+        upper_bound = mean + (current_z_score * std_dev)
+        lower_bound = max(0, mean - (current_z_score * std_dev))
 
         return predictor_pb2.PredictionResponse(
             mean=mean,
             std_dev=std_dev,
             upper_bound=upper_bound,
-            lower_bound=lower_bound
+            lower_bound=lower_bound,
+            z_score=current_z_score
         )
 
 def serve():

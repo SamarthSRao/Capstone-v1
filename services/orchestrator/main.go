@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -101,23 +102,60 @@ type Orchestrator struct {
 	slaThreshold    float64 // max probability of waiting
 }
 
-func (o *Orchestrator) DecideScaling(history []float32) (int, float32, error) {
+func (o *Orchestrator) DecideScaling(history []float32, currentSLA float32, currentWasted float32) (int, float32, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second*2)
 	defer cancel()
 
 	resp, err := o.predictorClient.GetPrediction(ctx, &pb.PredictionRequest{
-		History:   history,
-		Timestamp: time.Now().Format(time.RFC3339),
+		History:            history,
+		Timestamp:          time.Now().Format(time.RFC3339),
+		SlaViolationRate:   currentSLA,
+		WastedCapacity:     currentWasted,
 	})
 	if err != nil {
 		return 0, 0, err
 	}
 
-	// Use the Upper Bound (mean + 2*std) for risk-averse provisioning
+	// Use the Upper Bound (mean + z_score*std) tuned by RL agent
 	lambda := float64(resp.UpperBound)
 	c := GetRequiredServers(lambda, o.serviceRate, o.slaThreshold)
 
 	return c, resp.UpperBound, nil
+}
+
+// scaleZopdevDeployment sends a request to the real zopdev/api to scale the cluster
+func (o *Orchestrator) scaleZopdevDeployment(envID string, deploymentName string, replicas int) error {
+	url := fmt.Sprintf("http://localhost:8000/environments/%s/deploymentspace/scale", envID)
+	
+	payload := map[string]interface{}{
+		"deployment": deploymentName,
+		"replicas":   replicas,
+	}
+	
+	jsonPayload, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonPayload))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	
+	if resp.StatusCode >= 300 {
+		return fmt.Errorf("failed to scale zopdev deployment, status: %d", resp.StatusCode)
+	}
+	
+	log.Printf("Successfully scaled Zopdev deployment %s to %d replicas", deploymentName, replicas)
+	return nil
 }
 
 func main() {
@@ -156,7 +194,11 @@ func main() {
 		}
 
 		var req struct {
-			History []float32 `json:"history"`
+			History        []float32 `json:"history"`
+			CurrentSLA     float32   `json:"current_sla"`
+			CurrentWasted  float32   `json:"current_wasted"`
+			EnvID          string    `json:"env_id"`
+			DeploymentName string    `json:"deployment_name"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, "Invalid request body", http.StatusBadRequest)
@@ -168,10 +210,18 @@ func main() {
 			req.History = []float32{4200, 4350, 4180, 4400, 4500, 4600, 4550, 4480, 4520, 4600, 4700, 4800, 4900, 5000, 5100, 5200, 5300, 5400, 5500, 5600, 5700, 5800, 5900, 6000}
 		}
 		
-		servers, upperBound, err := orch.DecideScaling(req.History)
+		servers, upperBound, err := orch.DecideScaling(req.History, req.CurrentSLA, req.CurrentWasted)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
+		}
+
+		// Integration with zopdev/api
+		if req.EnvID != "" && req.DeploymentName != "" {
+			err = orch.scaleZopdevDeployment(req.EnvID, req.DeploymentName, servers)
+			if err != nil {
+				log.Printf("Warning: Zopdev scaling failed: %v\n", err)
+			}
 		}
 
 		w.Header().Set("Content-Type", "application/json")

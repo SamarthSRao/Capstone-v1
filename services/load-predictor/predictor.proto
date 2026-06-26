@@ -11,11 +11,14 @@ service Predictor {
 message PredictionRequest {
   repeated float history = 1; // Last 60 minutes of data
   string timestamp = 2;
+  float sla_violation_rate = 3;
+  float wasted_capacity = 4;
 }
 
 message PredictionResponse {
   float mean = 1;
   float std_dev = 2;
-  float upper_bound = 3; // Mean + 2*std_dev
-  float lower_bound = 4; // Mean - 2*std_dev
+  float upper_bound = 3; 
+  float lower_bound = 4; 
+  float z_score = 5;
 }

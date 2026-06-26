@@ -8,6 +8,7 @@ from models.lstm import BayesianLSTM
 from models.xgboost_residuals import XGBoostResidualModel
 from queueing.mmc import MMCAllocator
 from data.ecommerce_dataset import generate_ecommerce_workload
+from rl_agent import RLAgent
 
 def create_sequences(data, seq_length=24):
     xs = []
@@ -172,26 +173,72 @@ def train_pipeline(data_path=None):
     total_hours = len(y_test_actual)
     wasted_capacity_sum = 0
     
-    z_score = 1.96 # 95% confidence interval margin
+    # RL Agent Setup
+    rl_agent = RLAgent(state_size=3, action_size=3)
     
-    for i in range(total_hours):
-        pred_w = final_predictions[i]
-        actual_w = y_test_actual[i]
+    # We will simulate multiple episodes over the test data to train the RL agent
+    episodes = 5
+    print(f"\n--- Training RL Agent for {episodes} Episodes over Test Set ---")
+    
+    for episode in range(episodes):
+        sla_violations = 0
+        wasted_capacity_sum = 0
         
-        uncertainty_margin = z_score * total_std[i]
+        # Initial State: [Load Variance (normalized), SLA Violation Rate, Wasted Capacity Ratio]
+        current_state = np.array([total_std[0] / std_train, 0.0, 0.0])
         
-        # Calculate servers based on predicted workload + uncertainty margin
-        servers_allocated = allocator.get_required_servers(pred_w, uncertainty_margin=uncertainty_margin)
-        total_capacity = servers_allocated * service_rate
-        
-        # Check SLA Violation (Actual Workload > Server Capacity)
-        if actual_w > total_capacity:
-            sla_violations += 1
+        for i in range(total_hours):
+            # 1. RL Agent chooses action
+            action = rl_agent.act(current_state)
             
-        # Check Wasted Capacity (Capacity > Actual Workload)
-        if total_capacity > actual_w:
-            wasted_capacity_sum += (total_capacity - actual_w)
+            # 2. Environment steps based on action
+            current_z_score = rl_agent.step_z_score(action)
             
+            pred_w = final_predictions[i]
+            actual_w = y_test_actual[i]
+            
+            uncertainty_margin = current_z_score * total_std[i]
+            
+            # Calculate servers based on predicted workload + uncertainty margin
+            servers_allocated = allocator.get_required_servers(pred_w, uncertainty_margin=uncertainty_margin)
+            total_capacity = servers_allocated * service_rate
+            
+            # Step metrics
+            step_sla_violation = 0
+            step_wasted_capacity = 0
+            
+            if actual_w > total_capacity:
+                step_sla_violation = 1
+                sla_violations += 1
+                
+            if total_capacity > actual_w:
+                step_wasted_capacity = total_capacity - actual_w
+                wasted_capacity_sum += step_wasted_capacity
+                
+            # 3. Calculate Reward
+            # heavy penalty for SLA drop, smaller penalty for waste
+            reward = -(100.0 * step_sla_violation) - (0.1 * step_wasted_capacity)
+            
+            # 4. Next State
+            current_sla_rate = sla_violations / (i + 1)
+            # normalize wasted capacity (roughly max 1000 requests wasted)
+            norm_wasted = (wasted_capacity_sum / (i + 1)) / 1000.0 
+            
+            next_state_variance = total_std[i+1] / std_train if i + 1 < total_hours else total_std[i] / std_train
+            next_state = np.array([next_state_variance, current_sla_rate, norm_wasted])
+            
+            # 5. Remember and Train
+            done = (i == total_hours - 1)
+            rl_agent.remember(current_state, action, reward, next_state, done)
+            current_state = next_state
+            
+            rl_agent.replay(batch_size=32)
+            
+        print(f"Episode {episode+1}/{episodes} - SLA Violations: {sla_violations}, Wasted: {wasted_capacity_sum:.1f}, Final Z-Score: {rl_agent.current_z_score:.2f}, Epsilon: {rl_agent.epsilon:.3f}")
+        
+    # Save the trained RL Agent
+    rl_agent.save("models/rl_agent_checkpoint.pth")
+    
     sla_violation_rate = (sla_violations / total_hours) * 100
     avg_wasted_capacity = wasted_capacity_sum / total_hours
     
