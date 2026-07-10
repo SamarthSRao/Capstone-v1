@@ -1,0 +1,57 @@
+@import "tailwindcss";
+
+@theme {
+  --font-display: "Syne", sans-serif;
+  --font-body: "DM Sans", sans-serif;
+  --color-ink: #0a0c10;
+  --color-panel: #12161e;
+  --color-edge: #1e2633;
+  --color-mist: #8b95a8;
+  --color-snow: #eef1f6;
+  --color-accent: #3dd6c6;
+  --color-accent-dim: #1a8f84;
+  --color-warn: #e8b84a;
+  --color-danger: #e24b4b;
+}
+
+@keyframes slide-down {
+  from {
+    opacity: 0;
+    transform: translateY(-100%);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.animate-slide-down {
+  animation: slide-down 0.3s ease-out;
+}
+
+.animate-spin-slow {
+  animation: spin 0.8s linear infinite;
+}
+
+html,
+body,
+#root {
+  min-height: 100%;
+}
+
+body {
+  margin: 0;
+  font-family: var(--font-body);
+  background:
+    radial-gradient(ellipse 80% 50% at 50% -20%, rgba(61, 214, 198, 0.12), transparent),
+    radial-gradient(ellipse 60% 40% at 100% 50%, rgba(30, 38, 51, 0.8), transparent),
+    var(--color-ink);
+  color: var(--color-snow);
+  -webkit-font-smoothing: antialiased;
+}
