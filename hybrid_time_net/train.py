@@ -59,7 +59,7 @@ def train_pipeline(data_path=None):
     model = BayesianLSTM(input_size=1, hidden_size=64, num_layers=2, dropout_rate=0.2)
     optimizer = torch.optim.Adam(model.parameters(), lr=0.005)
     
-    epochs = 50
+    epochs = 5
     for epoch in range(epochs):
         model.train()
         optimizer.zero_grad()
@@ -177,7 +177,7 @@ def train_pipeline(data_path=None):
     rl_agent = RLAgent(state_size=3, action_size=3)
     
     # We will simulate multiple episodes over the test data to train the RL agent
-    episodes = 5
+    episodes = 1
     print(f"\n--- Training RL Agent for {episodes} Episodes over Test Set ---")
     
     for episode in range(episodes):

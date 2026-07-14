@@ -17,21 +17,13 @@ services:
     networks:
       - capstone-net
 
-  simulator:
+  dummy-ecommerce:
     build:
-      context: ./services/simulator
+      context: ./services/dummy-ecommerce
     ports:
-      - "8083:8083"
+      - "8084:8084"
     depends_on:
       - orchestrator
-    networks:
-      - capstone-net
-
-  dashboard:
-    build:
-      context: ./services/dashboard
-    ports:
-      - "3000:3000"
     networks:
       - capstone-net
 

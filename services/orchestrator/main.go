@@ -125,7 +125,7 @@ func (o *Orchestrator) DecideScaling(history []float32, currentSLA float32, curr
 
 // scaleZopdevDeployment sends a request to the real zopdev/api to scale the cluster
 func (o *Orchestrator) scaleZopdevDeployment(envID string, deploymentName string, replicas int) error {
-	url := fmt.Sprintf("http://localhost:8000/environments/%s/deploymentspace/scale", envID)
+	url := fmt.Sprintf("http://host.docker.internal:8000/environments/%s/deploymentspace/scale", envID)
 	
 	payload := map[string]interface{}{
 		"deployment": deploymentName,
