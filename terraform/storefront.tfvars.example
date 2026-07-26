@@ -1,0 +1,2 @@
+aws_region             = "us-east-1"
+storefront_bucket_name = "nexusgear-storefront-CHANGE-ME"

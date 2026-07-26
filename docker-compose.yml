@@ -12,18 +12,30 @@ services:
       context: ./services/orchestrator
     ports:
       - "8082:8082"
+    environment:
+      - SIMULATOR_URL=http://simulator:8083
     depends_on:
       - predictor
     networks:
       - capstone-net
 
-  dummy-ecommerce:
+  simulator:
     build:
-      context: ./services/dummy-ecommerce
+      context: ./services/simulator
     ports:
-      - "8084:8084"
+      - "8083:8083"
     depends_on:
       - orchestrator
+    networks:
+      - capstone-net
+
+  dashboard:
+    build:
+      context: ./services/dashboard
+    ports:
+      - "3000:3000"
+    environment:
+      - VITE_SIMULATOR_URL=http://localhost:8083
     networks:
       - capstone-net
 
