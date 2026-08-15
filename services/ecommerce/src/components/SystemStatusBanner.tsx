@@ -3,23 +3,33 @@ import { AlertTriangle, XCircle } from 'lucide-react'
 import { useSystemLoad } from '../hooks/useSystemLoad'
 
 /**
- * HT-306 — Top alert banner that appears when SLA reliability drops.
- * Yellow (warning) when reliability is between 98 and 99.5 with violations.
- * Red (critical) when reliability falls below 98%.
+ * HT-306 — Top alert banner when SLA reliability drops.
+ * Auto-dismisses 3 seconds after load normalizes.
  */
 export const SystemStatusBanner = () => {
   const { violations, slaReliability, currentRPS } = useSystemLoad()
   const [visible, setVisible] = useState(false)
   const [dismissed, setDismissed] = useState(false)
 
+  const shouldShow = violations > 0 && slaReliability < 99.5
+
   useEffect(() => {
-    if (violations > 0 && slaReliability < 99.5) {
+    if (shouldShow) {
       setVisible(true)
       setDismissed(false)
-    } else {
-      setVisible(false)
+      return
     }
-  }, [violations, slaReliability])
+
+    if (!visible) {
+      return
+    }
+
+    const timer = window.setTimeout(() => {
+      setVisible(false)
+    }, 3000)
+
+    return () => window.clearTimeout(timer)
+  }, [shouldShow, visible])
 
   if (!visible || dismissed) return null
 

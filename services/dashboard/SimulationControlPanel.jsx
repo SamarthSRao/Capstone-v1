@@ -1,16 +1,83 @@
-import React from 'react';
-import { Zap, TrendingUp, AlertTriangle, Leaf, RefreshCw, Play } from 'lucide-react';
-import { DATASETS } from './src/data/traces';
+import React, { useState } from 'react';
 
-const ICONS = {
-  'Organic Growth': Leaf,
-  'Flash Sale Spike': Zap,
-  'Bot DDoS Attack': AlertTriangle,
+const SIMULATOR_URL =
+  import.meta.env.VITE_SIMULATOR_URL || 'http://localhost:8083';
+
+/* ============================================================
+   Simulation datasets
+   ============================================================ */
+
+const DATASETS = {
+  'Organic Growth': {
+    label: 'Organic Traffic',
+    description: 'Steady baseline — 50 to 100 RPS',
+    data: [
+      50, 52, 55, 58, 60, 62, 65, 63, 70, 72,
+      68, 75, 78, 80, 76, 72, 70, 68, 65, 60,
+      58, 55, 60, 62, 65, 70, 72, 75, 78, 80,
+      82, 80, 78, 75, 72, 70, 68, 65, 62, 60,
+    ],
+  },
+
+  'Flash Sale': {
+    label: '⚡ Flash Sale Spike',
+    description: 'Organic → 2,500 RPS spike → cooldown',
+    data: [
+      50, 55, 60, 65, 70, 80, 100, 200, 500, 1000,
+      1800, 2200, 2500, 2500, 2400, 2000, 1500, 1000,
+      600, 400, 250, 150, 100, 80, 65, 55, 50, 50,
+      50, 50,
+    ],
+  },
+
+  'NASA Trace': {
+    label: 'NASA HTTP Trace',
+    description: 'Real 1995 NASA server traffic pattern',
+    data: [
+      120, 135, 140, 180, 210, 350, 620, 980, 1200, 1450,
+      1600, 1580, 1420, 1300, 1200, 1100, 980, 850, 720,
+      600, 480, 380, 280, 200, 160, 140, 130, 125, 120,
+      118,
+    ],
+  },
+
+  'Calgary Trace': {
+    label: 'Calgary HTTP Trace',
+    description: 'University server — sharp midday spike',
+    data: [
+      80, 85, 90, 95, 100, 120, 180, 320, 580, 850,
+      1100, 1250, 1100, 900, 750, 600, 480, 380, 280,
+      200, 160, 130, 110, 95, 88, 85, 82, 80, 80,
+    ],
+  },
 };
 
-const SIMULATOR_URL = import.meta.env.VITE_SIMULATOR_URL || 'http://localhost:8083';
+/* ============================================================
+   Status styles
+   ============================================================ */
 
-export const SimulationControlPanel = ({
+const STATUS_STYLES = {
+  IDLE: {
+    background: 'rgba(113, 113, 122, 0.2)',
+    color: '#71717A',
+  },
+
+  SIMULATING: {
+    background: 'rgba(34, 197, 94, 0.2)',
+    color: '#22c55e',
+  },
+
+  FINISHED: {
+    background: 'rgba(59, 130, 246, 0.2)',
+    color: '#3b82f6',
+  },
+};
+
+/* ============================================================
+   SimulationControlPanel
+   ============================================================ */
+
+export function SimulationControlPanel({
   selectedDataset,
   onDatasetChange,
   simStatus,
@@ -18,105 +85,356 @@ export const SimulationControlPanel = ({
   activeSimulation,
   onStart,
   onLog,
-}) => {
-  const selected = DATASETS[selectedDataset];
-  const SelectedIcon = ICONS[selectedDataset] ?? TrendingUp;
+}) {
+  const [starting, setStarting] = useState(false);
 
-  const handleStart = async () => {
-    if (!selected) return;
-    const workload = selected.build();
-    onStart(selectedDataset);
-    onLog(`POSTing dataset ${selectedDataset} to Simulator...`, 'info');
+  /* ------------------------------------------------------------
+     Current dataset
+     ------------------------------------------------------------ */
+
+  const currentDataset =
+    DATASETS[selectedDataset] || DATASETS['Organic Growth'];
+
+  /* ------------------------------------------------------------
+     Current status
+
+     Dashboard is the source of truth.
+     ------------------------------------------------------------ */
+
+  const currentStatus = simStatus || 'IDLE';
+
+  const statusStyle =
+    STATUS_STYLES[currentStatus] || STATUS_STYLES.IDLE;
+
+  /* ------------------------------------------------------------
+     Running state
+
+     Disable controls while simulation is being submitted
+     or while Dashboard reports SIMULATING.
+     ------------------------------------------------------------ */
+
+  const running =
+    starting ||
+    isSimulating ||
+    currentStatus === 'SIMULATING';
+
+  /* ============================================================
+     Start simulation
+     ============================================================ */
+
+  const startSimulation = async () => {
+    if (running) {
+      return;
+    }
+
+    const dataset =
+      DATASETS[selectedDataset] || DATASETS['Organic Growth'];
+
+    setStarting(true);
+
+    if (onLog) {
+      onLog(
+        `Loading simulation dataset: ${dataset.label} — ${dataset.data.length} ticks`,
+        'info'
+      );
+    }
 
     try {
-      const res = await fetch(`${SIMULATOR_URL}/start-simulation`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ workload }),
-      });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const json = await res.json();
-      onLog(
-        `Simulator started successfully: ${json.ticks ?? json.points ?? workload.length} ticks queued`,
-        'success'
+      const response = await fetch(
+        `${SIMULATOR_URL}/start-simulation`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            workload: dataset.data,
+          }),
+        }
       );
-    } catch (err) {
-      onLog(`Simulation trigger failed: ${err.message}`, 'error');
+
+      if (!response.ok) {
+        const responseText = await response.text();
+
+        throw new Error(
+          responseText ||
+            `Simulator returned HTTP ${response.status}`
+        );
+      }
+
+      let result = null;
+
+      try {
+        result = await response.json();
+      } catch {
+        // Some endpoints may return an empty/non-JSON response.
+        // A successful HTTP response is still considered success.
+      }
+
+      console.log(
+        '[SimulationControlPanel] Simulation started:',
+        result
+      );
+
+      /*
+       * IMPORTANT:
+       * Tell Dashboard about the simulation only after the
+       * simulator successfully accepted the workload.
+       */
+      if (onStart) {
+        onStart(selectedDataset);
+      }
+
+      if (onLog) {
+        onLog(
+          `${dataset.label} started successfully — ${dataset.data.length} ticks loaded`,
+          'success'
+        );
+      }
+    } catch (error) {
+      console.error(
+        '[SimulationControlPanel] Failed to start simulation:',
+        error
+      );
+
+      if (onLog) {
+        onLog(
+          `Failed to start simulation: ${
+            error instanceof Error
+              ? error.message
+              : 'Unknown error'
+          }`,
+          'error'
+        );
+      }
+    } finally {
+      setStarting(false);
     }
   };
 
-  const isActive = simStatus === 'SIMULATING' || isSimulating;
-  const badgeLabel = isActive
-    ? 'ACTIVE LOAD INJECTION'
-    : simStatus === 'FINISHED'
-      ? 'RUN COMPLETE'
-      : 'STEADY STATE';
-  const badgeClass = isActive
-    ? 'bg-amber-500/20 text-amber-400 border-amber-500/40 animate-pulse'
-    : simStatus === 'FINISHED'
-      ? 'bg-blue-500/20 text-blue-400 border-blue-500/30'
-      : 'bg-emerald-500/20 text-emerald-400 border-emerald-500/40';
+  /* ============================================================
+     Render
+     ============================================================ */
 
   return (
-    <div className="bg-white/[0.02] border border-white/5 rounded-2xl p-6 h-full">
-      <h4 className="text-sm font-bold text-white mb-1 flex items-center gap-2 uppercase tracking-widest">
-        <Zap size={16} className="text-amber-400" /> Load Simulation
-      </h4>
-      <p className="text-xs text-slate-500 mb-4">
-        Inject synthetic traffic into the E-Commerce Gateway to test the RL Agent.
-      </p>
+    <div
+      style={{
+        background: 'rgba(255,255,255,0.03)',
+        border: '1px solid #252525',
+        borderRadius: 12,
+        padding: 20,
+        height: '100%',
+      }}
+    >
+      {/* ========================================================
+          Header
+          ======================================================== */}
 
-      <span
-        className={`inline-flex items-center gap-2 text-xs font-bold uppercase tracking-wider px-3 py-1.5 rounded-full border mb-4 ${badgeClass}`}
+      <div
+        style={{
+          fontSize: 14,
+          fontWeight: 600,
+          color: '#E7E6D9',
+          marginBottom: 16,
+        }}
       >
-        <span className="w-2 h-2 rounded-full bg-current" />
-        {badgeLabel}
-      </span>
+        Simulation Control
+      </div>
 
-      <label className="block text-[10px] font-black text-slate-500 uppercase tracking-widest mb-2">
-        Traffic Dataset
-      </label>
-      <select
-        value={selectedDataset}
-        onChange={(e) => onDatasetChange(e.target.value)}
-        disabled={isSimulating}
-        className="w-full mb-4 bg-black/40 border border-white/10 rounded-lg px-3 py-2.5 text-sm text-white
-                   focus:outline-none focus:border-blue-500/50 disabled:opacity-50"
+      {/* ========================================================
+          Dataset selector
+          ======================================================== */}
+
+      <div style={{ marginBottom: 14 }}>
+        <label
+          htmlFor="simulation-dataset"
+          style={{
+            display: 'block',
+            fontSize: 11,
+            color: '#71717A',
+            textTransform: 'uppercase',
+            letterSpacing: '0.08em',
+            marginBottom: 6,
+            fontWeight: 600,
+          }}
+        >
+          Dataset
+        </label>
+
+        <select
+          id="simulation-dataset"
+          value={selectedDataset}
+          onChange={(event) =>
+            onDatasetChange(event.target.value)
+          }
+          disabled={running}
+          style={{
+            width: '100%',
+            background: '#111111',
+            color: '#E7E6D9',
+            border: '1px solid #252525',
+            borderRadius: 8,
+            padding: '10px 12px',
+            fontSize: 13,
+            cursor: running
+              ? 'not-allowed'
+              : 'pointer',
+            opacity: running ? 0.6 : 1,
+            outline: 'none',
+          }}
+        >
+          {Object.entries(DATASETS).map(
+            ([key, dataset]) => (
+              <option
+                key={key}
+                value={key}
+              >
+                {dataset.label}
+              </option>
+            )
+          )}
+        </select>
+      </div>
+
+      {/* ========================================================
+          Dataset information
+          ======================================================== */}
+
+      <div
+        style={{
+          background: 'rgba(255,255,255,0.025)',
+          border: '1px solid #202020',
+          borderRadius: 8,
+          padding: 12,
+          marginBottom: 14,
+        }}
       >
-        {Object.keys(DATASETS).map((name) => (
-          <option key={name} value={name}>
-            {name}
-          </option>
-        ))}
-      </select>
-
-      <p className="text-[10px] text-slate-500 mb-4">{selected?.desc}</p>
-
-      <button
-        type="button"
-        onClick={handleStart}
-        disabled={isSimulating}
-        className={`w-full py-4 rounded-xl border flex items-center justify-center gap-3 transition-all font-bold text-sm
-          ${isSimulating
-            ? 'border-white/5 bg-white/[0.01] opacity-50 cursor-not-allowed'
-            : 'border-amber-500/40 bg-amber-500/10 hover:bg-amber-500/20 text-amber-200 hover:border-amber-500/60'
-          }`}
-      >
-        {isSimulating ? (
-          <RefreshCw size={18} className="animate-spin" />
-        ) : (
-          <Play size={18} fill="currentColor" />
-        )}
-        {isSimulating ? `Running ${activeSimulation}…` : 'Inject Telemetry'}
-      </button>
-
-      <div className="mt-4 p-3 rounded-lg bg-black/30 border border-white/5 flex items-center gap-3">
-        <SelectedIcon size={16} className="text-slate-400 shrink-0" />
-        <div>
-          <div className="text-xs font-bold text-slate-300">{selectedDataset}</div>
-          <div className="text-[10px] text-slate-500">{selected?.desc}</div>
+        <div
+          style={{
+            color: '#E7E6D9',
+            fontSize: 13,
+            fontWeight: 600,
+            marginBottom: 4,
+          }}
+        >
+          {currentDataset.label}
         </div>
+
+        <div
+          style={{
+            color: '#71717A',
+            fontSize: 12,
+            lineHeight: 1.5,
+          }}
+        >
+          {currentDataset.description}
+        </div>
+
+        <div
+          style={{
+            color: '#52525B',
+            fontSize: 11,
+            marginTop: 6,
+          }}
+        >
+          {currentDataset.data.length} simulation ticks
+        </div>
+      </div>
+
+      {/* ========================================================
+          Start button + status
+          ======================================================== */}
+
+      <div
+        style={{
+          display: 'flex',
+          gap: 10,
+          alignItems: 'center',
+          flexWrap: 'wrap',
+        }}
+      >
+        <button
+          type="button"
+          onClick={startSimulation}
+          disabled={running}
+          style={{
+            flex: 1,
+            minWidth: 150,
+            background: running
+              ? 'rgba(99,102,241,0.3)'
+              : '#6366f1',
+            color: 'white',
+            border: 'none',
+            borderRadius: 8,
+            padding: '10px 16px',
+            fontSize: 13,
+            fontWeight: 600,
+            cursor: running
+              ? 'not-allowed'
+              : 'pointer',
+            transition: 'all 0.2s',
+            opacity: running ? 0.7 : 1,
+          }}
+        >
+          {starting
+            ? '⏳ Starting...'
+            : currentStatus === 'SIMULATING'
+            ? '⏳ Running...'
+            : '▶ Start Simulation'}
+        </button>
+
+        <span
+          style={{
+            background: statusStyle.background,
+            color: statusStyle.color,
+            borderRadius: 20,
+            padding: '5px 12px',
+            fontSize: 12,
+            fontWeight: 600,
+            whiteSpace: 'nowrap',
+          }}
+        >
+          {currentStatus}
+        </span>
+      </div>
+
+      {/* ========================================================
+          Active simulation
+          ======================================================== */}
+
+      {activeSimulation && (
+        <div
+          style={{
+            marginTop: 12,
+            paddingTop: 10,
+            borderTop:
+              '1px solid rgba(255,255,255,0.05)',
+            fontSize: 11,
+            color: '#52525B',
+          }}
+        >
+          Active:{' '}
+          {DATASETS[activeSimulation]?.label ||
+            activeSimulation}
+        </div>
+      )}
+
+      {/* ========================================================
+          Simulator endpoint
+          ======================================================== */}
+
+      <div
+        style={{
+          marginTop: 12,
+          fontSize: 10,
+          color: '#3F3F46',
+          wordBreak: 'break-all',
+        }}
+      >
+        Simulator: {SIMULATOR_URL}
       </div>
     </div>
   );
-};
+}
+
+export default SimulationControlPanel;
