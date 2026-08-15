@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import { CartProvider } from './context/CartContext'
+import { SystemLoadProvider } from './context/SystemLoadContext'
 import { SystemStatusBanner } from './components/SystemStatusBanner'
 import { ChaosAlertPanel } from './components/ChaosAlertPanel'
 import { Navbar } from './components/Navbar'
@@ -10,6 +11,7 @@ function App() {
   const [cartOpen, setCartOpen] = useState(false)
 
   return (
+    <SystemLoadProvider pollMs={1000}>
     <CartProvider>
       <Navbar onOpenCart={() => setCartOpen(true)} />
       {/* HT-306: slides in below the navbar when SLA degrades */}
@@ -21,6 +23,7 @@ function App() {
       </main>
       <CartDrawer open={cartOpen} onClose={() => setCartOpen(false)} />
     </CartProvider>
+    </SystemLoadProvider>
   )
 }
 

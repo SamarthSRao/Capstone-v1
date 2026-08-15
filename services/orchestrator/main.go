@@ -100,7 +100,7 @@ type Orchestrator struct {
 }
 
 func (o *Orchestrator) DecideScaling(history []float32, currentSLA float32, currentWasted float32) (int, *pb.PredictionResponse, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second*2)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
 	defer cancel()
 
 	resp, err := o.predictorClient.GetPrediction(ctx, &pb.PredictionRequest{
