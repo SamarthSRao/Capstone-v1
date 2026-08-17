@@ -32,7 +32,6 @@ async function postCheckout(
   }
 }
 
-/** Local mock checkout used when the circuit breaker is OPEN (HT-704). */
 function mockCheckout(): { order_id: string; status: string; mode: string } {
   return {
     order_id: `mock-${Date.now()}`,
@@ -41,45 +40,41 @@ function mockCheckout(): { order_id: string; status: string; mode: string } {
   }
 }
 
-/**
- * HT-306 — Chaos checkout delay:
- * RPS > 2000 → wait 2500ms before POST
- * RPS > 1000 → wait 1000ms
- * otherwise → checkout immediately
- *
- * HT-704 — Circuit breaker wraps the live API; on OPEN, falls back to mock checkout.
- */
 export function CartDrawer({ open, onClose }: CartDrawerProps) {
   const { items, total, removeItem, clearCart } = useCart()
   const systemLoad = useSystemLoad()
   const breaker = useCircuitBreaker({ failureThreshold: 3, resetTimeoutMs: 12_000 })
   const [loading, setLoading] = useState(false)
+  const [waitingForServer, setWaitingForServer] = useState(false)
   const [message, setMessage] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [fallbackMode, setFallbackMode] = useState(false)
 
   if (!open) return null
 
+  const isDegraded =
+    systemLoad.violations > 0 || systemLoad.slaReliability < 98
+
   const handleCheckout = async () => {
     if (items.length === 0 || loading) return
 
     setLoading(true)
+    setWaitingForServer(false)
     setMessage(null)
     setError(null)
 
-    // Inject dynamic latency to represent network congestion under load
     let delay = 0
-    if (systemLoad.currentRPS > 2000) {
-      delay = 2500
+    if (isDegraded || systemLoad.currentRPS > 2000) {
+      delay = 3000
     } else if (systemLoad.currentRPS > 1000) {
       delay = 1000
     }
 
     if (delay > 0) {
+      setWaitingForServer(isDegraded || systemLoad.currentRPS > 2000)
       await new Promise((r) => setTimeout(r, delay))
     }
 
-    // If breaker is already OPEN, skip the network and use local mock flow
     if (breaker.state === 'OPEN') {
       mockCheckout()
       clearCart()
@@ -88,6 +83,7 @@ export function CartDrawer({ open, onClose }: CartDrawerProps) {
         'Safe mode: order recorded locally while the checkout API recovers.',
       )
       setLoading(false)
+      setWaitingForServer(false)
       return
     }
 
@@ -100,7 +96,7 @@ export function CartDrawer({ open, onClose }: CartDrawerProps) {
 
       clearCart()
       setFallbackMode(false)
-      setMessage('Order confirmed. Gear is on the way.')
+      setMessage('✓ Order Confirmed!')
     } catch (e) {
       const msg = e instanceof Error ? e.message : 'Checkout failed'
 
@@ -113,11 +109,11 @@ export function CartDrawer({ open, onClose }: CartDrawerProps) {
         )
         setError(null)
       } else {
-        // After enough failures the breaker trips OPEN on the next attempt
         setError(msg)
       }
     } finally {
       setLoading(false)
+      setWaitingForServer(false)
     }
   }
 
@@ -216,10 +212,11 @@ export function CartDrawer({ open, onClose }: CartDrawerProps) {
             <span className="text-[var(--color-mist)]">Total</span>
             <span className="font-semibold">${total.toFixed(2)}</span>
           </div>
-          {systemLoad.currentRPS > 1000 && (
+          {(isDegraded || systemLoad.currentRPS > 1000) && (
             <p className="mb-3 text-xs text-[var(--color-warn)]">
-              High load detected ({systemLoad.currentRPS} RPS) — checkout may
-              feel slower.
+              High load detected ({systemLoad.currentRPS} RPS, SLA{' '}
+              {systemLoad.slaReliability.toFixed(1)}%) — checkout may feel
+              slower.
             </p>
           )}
           <button
@@ -231,7 +228,9 @@ export function CartDrawer({ open, onClose }: CartDrawerProps) {
             {loading ? (
               <>
                 <Loader2 className="h-4 w-4 animate-spin-slow" />
-                Processing…
+                {waitingForServer
+                  ? 'Waiting for server...'
+                  : 'Processing…'}
               </>
             ) : breaker.state === 'OPEN' ? (
               'Checkout (Safe Mode)'

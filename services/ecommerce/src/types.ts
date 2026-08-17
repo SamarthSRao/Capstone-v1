@@ -14,16 +14,20 @@ export interface CartItem {
 
 export interface SystemLoad {
   currentRPS: number
+  activeServers: number
   violations: number
   slaReliability: number
-  status: string
-  activeServers?: number
+  status: 'IDLE' | 'SIMULATING' | 'FINISHED'
+  predictedUpper: number
+  pendingTicks: number
 }
 
 export const DEFAULT_SYSTEM_LOAD: SystemLoad = {
-  currentRPS: 0,
+  currentRPS: 50,
+  activeServers: 10,
   violations: 0,
   slaReliability: 100,
   status: 'IDLE',
-  activeServers: 1,
+  predictedUpper: 0,
+  pendingTicks: 0,
 }
