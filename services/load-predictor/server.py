@@ -40,7 +40,7 @@ class PredictorService(predictor_pb2_grpc.PredictorServicer):
         self.fusion = HybridMLPFusion(input_size=3).to(self.device)
         
         # RL Agent
-        self.rl_agent = RLAgent(state_size=3, action_size=3)
+        self.rl_agent = RLAgent(state_size=6, action_size=3)
         self.rl_agent.epsilon = 0.0 # Inference mode
         try:
             # Try to load if checkpoint exists
@@ -53,7 +53,7 @@ class PredictorService(predictor_pb2_grpc.PredictorServicer):
         # Scaling parameters (mock values, in production these would be saved from training)
         self.mean_train = 5000.0
         self.std_train = 1500.0
-        self.last_state = np.array([0.0, 0.0, 0.0])
+        self.last_state = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
 
     def GetPrediction(self, request, context):
         history = np.array(request.history)
@@ -111,7 +111,29 @@ class PredictorService(predictor_pb2_grpc.PredictorServicer):
         current_wasted = request.wasted_capacity
         current_var_norm = float(total_std) / self.std_train
         
-        current_state = np.array([current_var_norm, current_sla, current_wasted])
+        # Calculate trend from history
+        if len(history) >= 3:
+            trend = (history[-1] - history[-3]) / (max(history) + 1e-8)
+        else:
+            trend = 0.0
+        trend = np.clip(trend, -1.0, 1.0)
+        
+        # Extract hour of day from timestamp
+        try:
+            dt = datetime.fromisoformat(request.timestamp)
+            hour = dt.hour
+        except Exception:
+            hour = datetime.now().hour
+
+        MAX_WASTE = 1000.0
+        current_state = np.array([
+            current_var_norm,
+            current_sla,
+            current_wasted / MAX_WASTE,
+            trend,
+            self.rl_agent.current_z_score / 5.0,
+            np.sin(2 * np.pi * hour / 24)
+        ], dtype=np.float32)
         
         action = self.rl_agent.act(current_state)
         current_z_score = self.rl_agent.step_z_score(action)

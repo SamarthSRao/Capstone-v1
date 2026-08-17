@@ -205,6 +205,21 @@ func checkout(w http.ResponseWriter, r *http.Request) {
 		total,
 	)
 
+	// Forward telemetry to simulator asynchronously
+	go func() {
+		simURL := os.Getenv("SIMULATOR_URL")
+		if simURL == "" {
+			simURL = "http://simulator:8083"
+		}
+		client := &http.Client{Timeout: 2 * time.Second}
+		resp, err := client.Post(simURL+"/api/checkout", "application/json", nil)
+		if err != nil {
+			log.Printf("[API] Warning: Failed to forward checkout telemetry to simulator: %v\n", err)
+			return
+		}
+		defer resp.Body.Close()
+	}()
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"order_id":   orderID,
