@@ -4,6 +4,7 @@ services:
       context: ./services/load-predictor
     ports:
       - "50051:50051"
+      - "50052:50052"
     networks:
       - capstone-net
 
@@ -24,6 +25,10 @@ services:
       context: ./services/simulator
     ports:
       - "8083:8083"
+    environment:
+      - ORCHESTRATOR_URL=http://orchestrator:8082
+      - API_URL=http://api:8080
+      - PREDICTOR_HTTP_URL=http://predictor:50052
     depends_on:
       - orchestrator
     networks:
@@ -32,6 +37,7 @@ services:
   dashboard:
     build:
       context: ../zopdev/dashboard
+      dockerfile: Dockerfile.dev
     ports:
       - "3000:3000"
     environment:

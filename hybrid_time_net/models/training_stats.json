@@ -1,0 +1,10 @@
+{
+  "mean_train": 122.2378296690473,
+  "std_train": 139.085683906168,
+  "mae": 102.73,
+  "rmse": 178.7,
+  "avg_uncertainty": 132.09,
+  "epochs_lstm": 100,
+  "episodes_rl": 1000,
+  "seq_length": 24
+}

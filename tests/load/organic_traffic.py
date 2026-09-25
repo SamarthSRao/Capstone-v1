@@ -1,9 +1,10 @@
+import random
 from locust import HttpUser, task, between
 
 
 class OrganicUser(HttpUser):
     wait_time = between(3, 5)
-    host = "http://localhost:8081"
+    host = "http://localhost:8080"
 
     @task(3)
     def browse(self):
@@ -11,12 +12,13 @@ class OrganicUser(HttpUser):
 
     @task(1)
     def checkout(self):
+        product_id = random.randint(1, 12)
         self.client.post(
             "/api/checkout",
             json={
-                "product_id": 1,
+                "product_id": product_id,
                 "quantity": 1,
-                "session_id": "locust-organic",
+                "session_id": f"locust-organic-{product_id}",
             },
             headers={"Content-Type": "application/json"},
         )

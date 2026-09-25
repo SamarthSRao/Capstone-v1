@@ -19,7 +19,7 @@ class DQN(nn.Module):
         return self.fc3(x)
 
 class RLAgent:
-    def __init__(self, state_size=6, action_size=5):
+    def __init__(self, state_size=7, action_size=5):
         self.state_size = state_size
         self.action_size = action_size
         self.memory = deque(maxlen=50000)
@@ -52,17 +52,17 @@ class RLAgent:
         return torch.argmax(act_values[0]).item()
         
     def step_z_score(self, action):
-        # Action 0: decrease 0.2, 1: decrease 0.1, 2: keep, 3: increase 0.1, 4: increase 0.2
+        # Action 0: decrease 0.5, 1: decrease 0.1, 2: keep, 3: increase 0.5, 4: increase 2.0 (Panic)
         if action == 0:
-            self.current_z_score -= 0.2
+            self.current_z_score -= 0.5
         elif action == 1:
             self.current_z_score -= 0.1
         elif action == 3:
-            self.current_z_score += 0.1
+            self.current_z_score += 0.5
         elif action == 4:
-            self.current_z_score += 0.2
-        # Keep within bounds [0.0, 5.0]
-        self.current_z_score = float(np.clip(self.current_z_score, 0.0, 5.0))
+            self.current_z_score += 2.0
+        # Keep within bounds [0.0, 10.0]
+        self.current_z_score = float(np.clip(self.current_z_score, 0.0, 10.0))
         return self.current_z_score
 
     def replay(self, batch_size):

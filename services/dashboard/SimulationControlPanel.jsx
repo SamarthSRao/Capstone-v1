@@ -1,7 +1,10 @@
 import React, { useState } from 'react';
 
 const SIMULATOR_URL =
-  import.meta.env.VITE_SIMULATOR_URL || 'http://localhost:8083';
+  import.meta.env.VITE_SIMULATOR_URL ||
+  (typeof window !== 'undefined' && window.location.hostname
+    ? `${window.location.protocol}//${window.location.hostname}:8083`
+    : 'http://localhost:8083');
 
 /* ============================================================
    Simulation datasets

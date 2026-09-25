@@ -18,6 +18,8 @@ RUN go mod tidy
 RUN go build -o main ./main.go
 
 FROM alpine:latest
+RUN apk add --no-cache docker-cli curl
 WORKDIR /root/
 COPY --from=builder /app/main .
 CMD ["./main"]
+

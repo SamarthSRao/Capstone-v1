@@ -1,39 +1,36 @@
 import numpy as np
 from rl_agent import RLAgent
-import torch
+from train_rl_flash import build_state
+
+ACTION_NAMES = {0: "z -= 0.5", 1: "z -= 0.1", 2: "Hold", 3: "z += 0.5", 4: "PANIC z += 2.0"}
+
 
 def test_rl_agent():
     print("Loading Trained RL Agent...")
-    agent = RLAgent(state_size=3, action_size=3)
+    agent = RLAgent(state_size=7, action_size=5)
     try:
         agent.load("models/rl_agent_checkpoint.pth")
         agent.model.eval()
-        agent.epsilon = 0.0 # pure exploitation (no random exploration)
+        agent.epsilon = 0.0
         print("Model loaded successfully.")
     except Exception as e:
         print(f"Error loading model (it might not be saved yet): {e}")
         return
 
     print("\n--- Testing Agent Scenarios ---")
-    
-    # State format: [normalized_variance, current_sla_violation_rate, normalized_wasted_capacity]
-    
+
     scenarios = [
-        {"name": "High Volatility, High SLA Violations", "state": np.array([2.5, 0.15, 0.0])},
-        {"name": "Low Volatility, High Wasted Capacity", "state": np.array([0.5, 0.0, 0.8])},
-        {"name": "Stable System (No Violations, Low Waste)", "state": np.array([1.0, 0.0, 0.1])},
+        ("Baseline traffic", build_state(10.0, 50.0, 0.0, 0.0, [50, 50, 50], 1.96, 12, 0.0)),
+        ("Moderate spike", build_state(10.0, 50.0, 0.0, 0.0, [50, 50, 500], 1.96, 12, 9.0)),
+        ("Flash sale spike", build_state(10.0, 50.0, 0.0, 0.0, [50, 50, 2500], 1.96, 12, 49.0)),
     ]
 
-    for s in scenarios:
-        state = s["state"]
+    for name, state in scenarios:
         action = agent.act(state)
-        
-        # Action map: 0 = decrease margin, 1 = hold, 2 = increase margin
-        action_map = {0: "Decrease Uncertainty Margin", 1: "Hold Margin Steady", 2: "Increase Uncertainty Margin"}
-        
-        print(f"\nScenario: {s['name']}")
-        print(f"State [Var, SLA, Waste]: {state}")
-        print(f"RL Agent Decision: {action_map[action]} (Action ID: {action})")
+        print(f"\nScenario: {name}")
+        print(f"State (7D): {state}")
+        print(f"RL Agent Decision: {ACTION_NAMES[action]} (Action ID: {action})")
+
 
 if __name__ == "__main__":
     test_rl_agent()

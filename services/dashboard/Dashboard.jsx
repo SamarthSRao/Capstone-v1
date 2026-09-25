@@ -22,9 +22,13 @@ import {
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { SlaCostVisualizer } from './SlaCostVisualizer';
+import { RlVisualizationPanel } from './RlVisualizationPanel';
 
 const SIMULATOR_URL =
-  import.meta.env.VITE_SIMULATOR_URL || 'http://localhost:8083';
+  import.meta.env.VITE_SIMULATOR_URL ||
+  (typeof window !== 'undefined' && window.location.hostname
+    ? `${window.location.protocol}//${window.location.hostname}:8083`
+    : 'http://localhost:8083');
 
 /* ============================================================
    Simulation Datasets
@@ -721,6 +725,12 @@ const Dashboard = () => {
   const lastSlaAlarmLog =
     useRef(0);
 
+  const lastRlAction =
+    useRef(null);
+
+  const loggedConnect =
+    useRef(false);
+
   const previousLatestStatus =
     useRef('IDLE');
 
@@ -749,16 +759,11 @@ const Dashboard = () => {
      ========================================================== */
 
   useEffect(() => {
-    addLog(
-      'HybridTimeNet Agent Connected to Commerce Gateway',
-      'info'
-    );
-
-    addLog(
-      'Monitoring API Endpoints: /checkout, /cart, /catalog',
-      'info'
-    );
-  }, []);
+    if (connected && !loggedConnect.current) {
+      loggedConnect.current = true;
+      addLog('Connected to simulator telemetry bus', 'info');
+    }
+  }, [connected]);
 
   /* ==========================================================
      Start New Simulation
@@ -780,6 +785,7 @@ const Dashboard = () => {
 
     lastHighLoadLog.current = 0;
     lastSlaAlarmLog.current = 0;
+    lastRlAction.current = null;
 
     previousLatestStatus.current =
       'SIMULATING';
@@ -926,6 +932,43 @@ const Dashboard = () => {
             100
           );
 
+        const rawMlMean =
+          getPredictionValue(
+            data,
+            'raw_ml_mean',
+            'rawMlMean'
+          );
+
+        const zScore = toNumber(
+          data.z_score ?? data.zScore
+        );
+
+        const rlAction = toNumber(
+          data.rl_action ?? data.rlAction,
+          2
+        );
+
+        const rlActionLabel =
+          data.rl_action_label ??
+          data.rlActionLabel ??
+          null;
+
+        const errorRatio = toNumber(
+          data.error_ratio ?? data.errorRatio,
+          0
+        );
+
+        const stdDev = toNumber(
+          data.std_dev ?? data.stdDev,
+          0
+        );
+
+        const stateVarianceNorm = toNumber(data.state_variance_norm ?? data.stateVarianceNorm);
+        const stateSla = toNumber(data.state_sla ?? data.stateSla);
+        const stateWasteNorm = toNumber(data.state_waste_norm ?? data.stateWasteNorm);
+        const stateTrend = toNumber(data.state_trend ?? data.stateTrend);
+        const stateHourSin = toNumber(data.state_hour_sin ?? data.stateHourSin);
+
         /* ----------------------------------------------------
            Confidence band
 
@@ -997,8 +1040,30 @@ const Dashboard = () => {
 
           bandWidth,
 
+          rawMlMean,
+
+          zScore,
+
+          rlAction,
+
+          rlActionLabel,
+
+          errorRatio,
+
+          stdDev,
+
+          stateVarianceNorm,
+
+          stateSla,
+
+          stateWasteNorm,
+
+          stateTrend,
+
+          stateHourSin,
+
           /*
-           * Approximate P95 latency visualization.
+           * Load-derived latency estimate (not measured P95).
            */
           latency:
             actualRPS > 0
@@ -1070,6 +1135,25 @@ const Dashboard = () => {
               'error'
             );
           }
+        }
+
+        if (
+          rlAction != null &&
+          lastRlAction.current !== rlAction
+        ) {
+          lastRlAction.current = rlAction;
+
+          const logType =
+            rlAction === 4
+              ? 'warn'
+              : rlAction === 3
+                ? 'info'
+                : 'info';
+
+          addLog(
+            `RL Agent: ${rlActionLabel} → z=${zScore?.toFixed(2) ?? '?'}, upper=${predictedUpper != null ? Math.round(predictedUpper).toLocaleString() : '?'} RPS, fleet=${requiredServers ?? '?'} servers`,
+            logType
+          );
         }
 
         /* ----------------------------------------------------
@@ -1170,6 +1254,13 @@ const Dashboard = () => {
       chartData.length - 1
     ];
 
+  const rlLive =
+    connected &&
+    latest?.rlActionLabel != null &&
+    latest.rlActionLabel.length > 0 &&
+    latest?.zScore != null &&
+    latest.zScore > 0;
+
   const slaCritical =
     (latest?.slaReliability ?? 100) <
     99;
@@ -1179,15 +1270,7 @@ const Dashboard = () => {
      ========================================================== */
 
   return (
-    <div className="min-h-screen bg-[#050505] text-slate-300 font-sans selection:bg-blue-500/30">
-
-      {/* ======================================================
-          Background effects
-      ====================================================== */}
-
-      <div className="fixed top-0 left-[20%] w-[60%] h-[300px] bg-blue-600/10 rounded-full blur-[150px] pointer-events-none" />
-
-      <div className="fixed bottom-[-10%] right-[-10%] w-[40%] h-[400px] bg-emerald-600/10 rounded-full blur-[150px] pointer-events-none" />
+    <div className="min-h-screen bg-[#09090b] text-slate-300 font-sans selection:bg-blue-500/30">
 
       {/* ======================================================
           SLA Alarm
@@ -1225,22 +1308,22 @@ const Dashboard = () => {
           Header
       ====================================================== */}
 
-      <header className="border-b border-white/5 bg-black/40 backdrop-blur-2xl sticky top-0 z-50 px-6 py-4 flex justify-between items-center">
+      <header className="border-b border-white/[0.06] bg-[#09090b]/95 backdrop-blur-sm sticky top-0 z-50 px-6 py-3 flex justify-between items-center">
 
-        <div className="flex items-center gap-4">
+        <div className="flex items-center gap-3">
 
-          <div className="w-10 h-10 bg-gradient-to-br from-blue-600 to-blue-900 border border-blue-500/30 rounded-xl flex items-center justify-center text-white font-black shadow-[0_0_20px_rgba(37,99,235,0.3)]">
+          <div className="w-9 h-9 bg-blue-600/20 border border-blue-500/30 rounded-lg flex items-center justify-center text-blue-300 text-sm font-semibold">
             HT
           </div>
 
           <div className="flex flex-col">
 
-            <span className="text-white font-bold tracking-tight">
+            <span className="text-slate-100 font-semibold tracking-tight text-sm">
               HybridTimeNet
             </span>
 
-            <span className="text-xs text-blue-400 font-medium tracking-wide">
-              E-Commerce Operations Center
+            <span className="text-xs text-slate-500">
+              Autoscaling control plane
             </span>
 
           </div>
@@ -1291,29 +1374,35 @@ const Dashboard = () => {
 
             <div className="flex flex-col items-end">
 
-              <span className="text-[10px] text-slate-500 uppercase font-black tracking-widest">
-                RL Predictor
+              <span className="text-[10px] text-slate-500">
+                RL predictor
               </span>
 
               <span
-                className={`text-xs flex items-center gap-1.5 font-bold ${
-                  connected
+                className={`text-xs flex items-center gap-1.5 font-medium ${
+                  rlLive
                     ? 'text-emerald-400'
-                    : 'text-red-400'
+                    : connected
+                      ? 'text-amber-400'
+                      : 'text-red-400'
                 }`}
               >
 
                 <span
                   className={`w-1.5 h-1.5 rounded-full ${
-                    connected
-                      ? 'bg-emerald-500 animate-pulse'
-                      : 'bg-red-500'
+                    rlLive
+                      ? 'bg-emerald-500'
+                      : connected
+                        ? 'bg-amber-500'
+                        : 'bg-red-500'
                   }`}
                 />
 
-                {connected
-                  ? 'ONLINE'
-                  : 'OFFLINE'}
+                {rlLive
+                  ? 'Streaming decisions'
+                  : connected
+                    ? 'Awaiting RL data'
+                    : 'Offline'}
               </span>
 
             </div>
@@ -1483,7 +1572,7 @@ const Dashboard = () => {
                 key={
                   stat.label
                 }
-                className="bg-white/[0.02] border border-white/5 rounded-2xl p-5 hover:bg-white/[0.04] transition-colors relative overflow-hidden group"
+                className="rounded-xl border border-white/[0.06] bg-[#0c0c0e] p-5 hover:border-white/[0.1] transition-colors relative overflow-hidden group"
               >
 
                 <div className="absolute top-0 right-0 p-4 opacity-10 group-hover:opacity-20 transition-opacity">
@@ -1530,21 +1619,31 @@ const Dashboard = () => {
         </div>
 
         {/* ====================================================
+            RL Agent Visualization
+        ==================================================== */}
+
+        <RlVisualizationPanel
+          latest={latest}
+          history={chartData}
+          live={rlLive}
+        />
+
+        {/* ====================================================
             Traffic Chart
         ==================================================== */}
 
-        <div className="bg-white/[0.02] border border-white/5 rounded-2xl p-6">
+        <div className="rounded-xl border border-white/[0.06] bg-[#0c0c0e] p-6">
 
           <div className="flex justify-between items-center mb-8">
 
             <div>
 
-              <h4 className="text-lg font-bold text-white">
-                E-Commerce Traffic Telemetry
+              <h4 className="text-sm font-semibold text-slate-100">
+                Traffic & scaling
               </h4>
 
-              <p className="text-sm text-slate-500">
-                Live request volume vs. RL prediction confidence band
+              <p className="text-xs text-slate-500 mt-0.5">
+                Live RPS from simulator · forecast bands from predictor
               </p>
 
             </div>
@@ -1558,12 +1657,12 @@ const Dashboard = () => {
 
               <div className="flex items-center gap-2 text-blue-400">
                 <div className="w-2.5 h-2.5 rounded-full bg-blue-400" />
-                Predicted Mean
+                RL Upper Bound
               </div>
 
-              <div className="flex items-center gap-2 text-amber-400">
-                <div className="w-2.5 h-2.5 rounded-full bg-amber-400" />
-                Upper Bound
+              <div className="flex items-center gap-2 text-cyan-400">
+                <div className="w-2.5 h-2.5 rounded-full bg-cyan-400" />
+                Raw ML Forecast
               </div>
 
               <div className="flex items-center gap-2 text-blue-500">
@@ -1708,28 +1807,40 @@ const Dashboard = () => {
 
                   <Line
                     type="monotone"
+                    dataKey="rawMlMean"
+                    stroke="#22d3ee"
+                    strokeWidth={2}
+                    strokeDasharray="8 4"
+                    dot={false}
+                    name="Raw ML Forecast"
+                    connectNulls={false}
+                    isAnimationActive={false}
+                  />
+
+                  <Line
+                    type="monotone"
                     dataKey="predictedMean"
                     stroke="#3b82f6"
                     strokeWidth={2}
                     strokeDasharray="6 4"
                     dot={false}
-                    name="Predicted Mean"
+                    name="RL Upper Bound"
                     connectNulls={false}
                     isAnimationActive={false}
                   />
 
                   {/* ==========================================
-                      Upper bound
+                      Upper bound (same as RL target)
                   ========================================== */}
 
                   <Line
                     type="monotone"
                     dataKey="predictedUpper"
                     stroke="#f59e0b"
-                    strokeWidth={2}
+                    strokeWidth={1.5}
                     strokeDasharray="2 4"
                     dot={false}
-                    name="Upper Bound"
+                    name="Upper Band Edge"
                     connectNulls={false}
                     isAnimationActive={false}
                   />
@@ -1831,9 +1942,13 @@ const Dashboard = () => {
                 className="text-emerald-400"
               />
 
-              Gateway P95 Latency
+              Load-derived latency estimate
 
             </h4>
+
+            <p className="text-[10px] text-slate-600 mb-4">
+              Derived from RPS/capacity model — not measured P95
+            </p>
 
             <div className="h-[200px] w-full">
 

@@ -9,6 +9,10 @@ import (
 	"math"
 	"net/http"
 	"os"
+	"os/exec"
+	"strconv"
+	"strings"
+	"sync"
 	"time"
 
 	"google.golang.org/grpc"
@@ -120,26 +124,60 @@ func (o *Orchestrator) DecideScaling(history []float32, currentSLA float32, curr
 	return c, resp, nil
 }
 
+func rlActionLabel(action int32) string {
+	switch action {
+	case 0:
+		return "TIGHTEN -0.5"
+	case 1:
+		return "TIGHTEN -0.1"
+	case 2:
+		return "HOLD"
+	case 3:
+		return "WIDEN +0.5"
+	case 4:
+		return "PANIC +2.0"
+	default:
+		return "UNKNOWN"
+	}
+}
+
 // forwardPredictionToSimulator POSTs prediction bounds to the Go Simulator (HT-308).
 // Timeout is capped at 2s so a slow simulator never blocks /scale responses.
-func (o *Orchestrator) forwardPredictionToSimulator(mean, upper, lower float64, servers int) {
+func (o *Orchestrator) forwardPredictionToSimulator(
+	mean, upper, lower float64,
+	servers int,
+	pred *pb.PredictionResponse,
+) {
 	client := &http.Client{Timeout: 2 * time.Second}
 
 	horizon := 12
 	meanSeries := make([]float64, horizon)
 	upperSeries := make([]float64, horizon)
 	lowerSeries := make([]float64, horizon)
+	rawSeries := make([]float64, horizon)
 	for i := 0; i < horizon; i++ {
 		meanSeries[i] = mean
 		upperSeries[i] = upper
 		lowerSeries[i] = lower
+		rawSeries[i] = float64(pred.RawMlMean)
 	}
 
 	payload := map[string]interface{}{
-		"predicted_mean":   meanSeries,
-		"predicted_upper":  upperSeries,
-		"predicted_lower":  lowerSeries,
-		"required_servers": servers,
+		"predicted_mean":      meanSeries,
+		"predicted_upper":     upperSeries,
+		"predicted_lower":     lowerSeries,
+		"raw_ml_mean":         rawSeries,
+		"required_servers":    servers,
+		"z_score":             pred.ZScore,
+		"rl_action":           pred.RlAction,
+		"rl_action_label":     rlActionLabel(pred.RlAction),
+		"error_ratio":         pred.ErrorRatio,
+		"std_dev":             pred.StdDev,
+		"state_variance_norm": pred.StateVarianceNorm,
+		"state_sla":           pred.StateSla,
+		"state_waste_norm":    pred.StateWasteNorm,
+		"state_trend":         pred.StateTrend,
+		"state_hour_sin":      pred.StateHourSin,
 	}
 
 	body, err := json.Marshal(payload)
@@ -191,6 +229,152 @@ func (o *Orchestrator) scaleZopdevDeployment(envID string, deploymentName string
 	return nil
 }
 
+// TargetStatus tracks live metrics and scaling status of the open-source target web app
+type TargetStatus struct {
+	TargetName     string    `json:"target_name"`
+	CurrentRPS     float64   `json:"current_rps"`
+	ActiveReplicas int       `json:"active_replicas"`
+	PredictedMean  float32   `json:"predicted_mean"`
+	PredictedUpper float32   `json:"predicted_upper"`
+	RLAction       string    `json:"rl_action"`
+	SLAReliability float64   `json:"sla_reliability"`
+	LastScaleEvent string    `json:"last_scale_event"`
+	UpdatedAt      time.Time `json:"updated_at"`
+}
+
+var (
+	targetMu     sync.RWMutex
+	targetStatus = TargetStatus{
+		TargetName:     "Online Boutique (Open-Source Store)",
+		CurrentRPS:     0,
+		ActiveReplicas: 1,
+		SLAReliability: 100.0,
+		LastScaleEvent: "System initialized at baseline (1 replica)",
+		UpdatedAt:      time.Now(),
+	}
+	lastScaleDownTime = time.Now()
+)
+
+// scaleDockerTargetApp physically scales the open-source target-app containers via Docker CLI or socket
+func scaleDockerTargetApp(replicas int) error {
+	log.Printf("[Orchestrator Actuator] >>> SCALING TARGET-APP TO %d REPLICAS <<<", replicas)
+	cmd := exec.Command("docker", "compose", "up", "-d", "--scale", fmt.Sprintf("target-app=%d", replicas), "--no-recreate")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		log.Printf("[Orchestrator Actuator] Docker command output / notice: %s (%v)", string(output), err)
+	} else {
+		log.Printf("[Orchestrator Actuator] Docker scale executed successfully: %s", string(output))
+	}
+	return nil
+}
+
+// startTargetAppMonitor polls live HTTP traffic from Nginx or target app metrics and autonomously adapts
+func startTargetAppMonitor(orch *Orchestrator) {
+	metricsURL := os.Getenv("TARGET_METRICS_URL")
+	if metricsURL == "" {
+		metricsURL = "http://nginx-lb:8090/stub_status"
+	}
+
+	log.Printf("[Target Monitor] Starting live traffic monitor for: %s", metricsURL)
+
+	client := &http.Client{Timeout: 1500 * time.Millisecond}
+	history := make([]float32, 24)
+	for i := range history {
+		history[i] = 50.0 // Baseline
+	}
+
+	var lastTotalReqs int64 = -1
+	currentReplicas := 1
+
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		resp, err := client.Get(metricsURL)
+		var currentRPS float64 = 0.0
+
+		if err == nil && resp.StatusCode == 200 {
+			buf := new(bytes.Buffer)
+			buf.ReadFrom(resp.Body)
+			resp.Body.Close()
+			bodyStr := buf.String()
+
+			// Parse Nginx stub_status:
+			// Active connections: 1
+			// server accepts handled requests
+			//  10 10 250
+			lines := strings.Split(bodyStr, "\n")
+			for _, line := range lines {
+				fields := strings.Fields(line)
+				if len(fields) == 3 {
+					if reqs, parseErr := strconv.ParseInt(fields[2], 10, 64); parseErr == nil {
+						if lastTotalReqs >= 0 {
+							diff := reqs - lastTotalReqs
+							if diff >= 0 {
+								currentRPS = float64(diff)
+							}
+						}
+						lastTotalReqs = reqs
+						break
+					}
+				}
+			}
+		} else if resp != nil {
+			resp.Body.Close()
+		}
+
+		// Shift sliding history window
+		copy(history, history[1:])
+		history[len(history)-1] = float32(currentRPS)
+
+		// Decide scaling using HybridTimeNet (Bayesian LSTM + Erlang-C + RL)
+		servers, predResp, predErr := orch.DecideScaling(history, 0.0, 0.0)
+		if predErr != nil {
+			continue
+		}
+
+		// Clamp servers to realistic range [1, 10]
+		if servers < 1 {
+			servers = 1
+		}
+		if servers > 10 {
+			servers = 10
+		}
+
+		// Autonomous scaling logic with cooldown
+		now := time.Now()
+		scaleTriggered := false
+		var eventMsg string
+
+		if servers > currentReplicas {
+			// Proactive scale up: Immediate!
+			scaleDockerTargetApp(servers)
+			eventMsg = fmt.Sprintf("Proactive surge detected (%.0f RPS): Scaled from %d -> %d replicas", currentRPS, currentReplicas, servers)
+			currentReplicas = servers
+			scaleTriggered = true
+		} else if servers < currentReplicas && now.Sub(lastScaleDownTime) > 15*time.Second {
+			// Scale down: Graceful cooldown (15s)
+			scaleDockerTargetApp(servers)
+			eventMsg = fmt.Sprintf("Traffic subsided (%.0f RPS): Scaled down from %d -> %d replicas", currentRPS, currentReplicas, servers)
+			currentReplicas = servers
+			lastScaleDownTime = now
+			scaleTriggered = true
+		}
+
+		targetMu.Lock()
+		targetStatus.CurrentRPS = currentRPS
+		targetStatus.ActiveReplicas = currentReplicas
+		targetStatus.PredictedMean = predResp.Mean
+		targetStatus.PredictedUpper = predResp.UpperBound
+		targetStatus.RLAction = rlActionLabel(predResp.RlAction)
+		if scaleTriggered {
+			targetStatus.LastScaleEvent = eventMsg
+		}
+		targetStatus.UpdatedAt = now
+		targetMu.Unlock()
+	}
+}
+
 func main() {
 	simulatorURL := os.Getenv("SIMULATOR_URL")
 	if simulatorURL == "" {
@@ -225,6 +409,18 @@ func main() {
 		simulatorURL:    simulatorURL,
 	}
 
+	// Start background autonomous monitor for open-source target web application
+	go startTargetAppMonitor(orch)
+
+	// Expose target application status for frontend and presentation
+	http.HandleFunc("/api/target/status", func(w http.ResponseWriter, r *http.Request) {
+		targetMu.RLock()
+		defer targetMu.RUnlock()
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		json.NewEncoder(w).Encode(targetStatus)
+	})
+
 	http.HandleFunc("/scale", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Only POST allowed", http.StatusMethodNotAllowed)
@@ -253,12 +449,13 @@ func main() {
 			return
 		}
 
-		// HT-308: forward prediction band to simulator (non-blocking timeout inside helper)
+		// HT-308: forward prediction band + RL telemetry to simulator
 		orch.forwardPredictionToSimulator(
 			float64(predResp.Mean),
 			float64(predResp.UpperBound),
 			float64(predResp.LowerBound),
 			servers,
+			predResp,
 		)
 
 		// Integration with zopdev/api
@@ -275,9 +472,14 @@ func main() {
 			"predicted_upper_bound": predResp.UpperBound,
 			"predicted_mean":        predResp.Mean,
 			"predicted_lower_bound": predResp.LowerBound,
+			"z_score":               predResp.ZScore,
+			"rl_action":             predResp.RlAction,
+			"rl_action_label":       rlActionLabel(predResp.RlAction),
+			"raw_ml_mean":           predResp.RawMlMean,
+			"error_ratio":           predResp.ErrorRatio,
 		})
 	})
 
-	fmt.Println("Go Orchestrator starting on :8082")
+	fmt.Println("Go Orchestrator starting on :8082 (with Autonomous Target App Scaler)")
 	log.Fatal(http.ListenAndServe(":8082", nil))
 }
