@@ -15,4 +15,4 @@ COPY . .
 # Generate gRPC code
 RUN python -m grpc_tools.protoc -I. --python_out=. --grpc_python_out=. ./predictor.proto
 
-CMD ["python", "server.py"]
+CMD ["python", "-u", "server.py"]

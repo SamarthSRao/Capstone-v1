@@ -12,18 +12,20 @@ class MMCAllocator:
         self.overprovision_factor = overprovision_factor
         
     def erlang_c(self, c, rho):
-        if rho >= c:
-            return 1.0 # Unstable queue
+        if rho >= c or rho <= 0:
+            return 1.0 if rho >= c else 0.0
             
-        sum_p = 0
-        for k in range(c):
-            sum_p += (rho**k) / math.factorial(k)
-            
-        term_c = (rho**c) / (math.factorial(c) * (1 - rho/c))
-        p0 = 1 / (sum_p + term_c)
+        import math
+        lnum = c * math.log(rho) - math.lgamma(c + 1) + math.log(c / (c - rho))
         
-        p_wait = term_c * p0
-        return p_wait
+        log_terms = [k * math.log(rho) - math.lgamma(k + 1) for k in range(c)]
+        log_terms.append(lnum)
+        
+        max_log = max(log_terms)
+        sum_exp = sum(math.exp(lt - max_log) for lt in log_terms)
+        ldenom = max_log + math.log(sum_exp)
+        
+        return math.exp(lnum - ldenom)
 
     def get_required_servers(self, arrival_rate, uncertainty_margin=0):
         """

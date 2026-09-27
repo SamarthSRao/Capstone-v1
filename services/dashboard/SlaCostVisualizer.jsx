@@ -32,12 +32,12 @@ export function SlaCostVisualizer({ latest, chartData }) {
   const utilColor = utilization > 90 ? '#ef4444' : utilization > 70 ? '#f59e0b' : '#22c55e';
 
   return (
-    <div className="bg-white/[0.02] border border-white/5 rounded-2xl p-6">
-      <h4 className="text-sm font-bold text-white mb-1 flex items-center gap-2 uppercase tracking-widest">
-        <Gauge size={16} className="text-cyan-400" /> SLA & Cost Efficiency
+    <div className="rounded-xl border border-white/[0.06] bg-[#0c0c0e] p-6">
+      <h4 className="text-sm font-semibold text-slate-100 mb-1 flex items-center gap-2">
+        <Gauge size={15} className="text-slate-400" /> SLA & efficiency
       </h4>
       <p className="text-xs text-slate-500 mb-5">
-        Live reliability, violation count, and simulated fleet spend.
+        Reliability and fleet utilization from live simulator metrics.
       </p>
 
       <div className="grid grid-cols-2 gap-4 mb-5">

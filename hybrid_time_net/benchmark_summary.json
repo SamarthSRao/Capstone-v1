@@ -1,0 +1,24 @@
+{
+  "dataset": "Amazon Customer Transactions (Hourly/Minutely Workload)",
+  "test_samples": 476,
+  "metrics": {
+    "mae": 228.88,
+    "rmse": 305.62,
+    "mean_uncertainty": 34.57
+  },
+  "comparison": {
+    "proactive_hybridtimenet": {
+      "sla_compliance_percent": 78.57,
+      "violations": 102,
+      "avg_wasted_capacity_rps": 214.5,
+      "peak_servers": 18
+    },
+    "reactive_standard_hpa": {
+      "sla_compliance_percent": 67.65,
+      "violations": 154,
+      "avg_wasted_capacity_rps": 219.11,
+      "peak_servers": 59
+    }
+  },
+  "conclusion": "Proactive HybridTimeNet achieved 78.6% SLA compliance vs 67.6% for Reactive HPA on Amazon trace."
+}

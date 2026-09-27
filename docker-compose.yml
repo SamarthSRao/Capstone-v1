@@ -4,6 +4,7 @@ services:
       context: ./services/load-predictor
     ports:
       - "50051:50051"
+      - "50052:50052"
     networks:
       - capstone-net
 
@@ -24,6 +25,10 @@ services:
       context: ./services/simulator
     ports:
       - "8083:8083"
+    environment:
+      - ORCHESTRATOR_URL=http://orchestrator:8082
+      - API_URL=http://api:8080
+      - PREDICTOR_HTTP_URL=http://predictor:50052
     depends_on:
       - orchestrator
     networks:
@@ -31,11 +36,57 @@ services:
 
   dashboard:
     build:
-      context: ./services/dashboard
+      context: ../zopdev/dashboard
+      dockerfile: Dockerfile.dev
     ports:
       - "3000:3000"
     environment:
       - VITE_SIMULATOR_URL=http://localhost:8083
+    networks:
+      - capstone-net
+
+  nexusgear-db:
+    image: postgres:15-alpine
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_USER=nexus
+      - POSTGRES_PASSWORD=nexusgear123
+      - POSTGRES_DB=nexusgear
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nexus -d nexusgear"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - capstone-net
+
+  api:
+    build:
+      context: ./services/api
+    ports:
+      - "8080:8080"
+    environment:
+      - DATABASE_URL=postgres://nexus:nexusgear123@nexusgear-db:5432/nexusgear?sslmode=disable
+      - SIMULATOR_URL=http://simulator:8083
+    depends_on:
+      nexusgear-db:
+        condition: service_healthy
+      simulator:
+        condition: service_started
+    networks:
+      - capstone-net
+
+  ecommerce:
+    build:
+      context: ./services/ecommerce
+    ports:
+      - "3001:5173"
+    environment:
+      - VITE_API_URL=http://localhost:8080
+      - VITE_SIMULATOR_URL=http://localhost:8083
+    depends_on:
+      - api
     networks:
       - capstone-net
 

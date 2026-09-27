@@ -1,3 +1,4 @@
+import os
 import pandas as pd
 import numpy as np
 import torch
@@ -14,16 +15,50 @@ def create_sequences(data, seq_length=24):
     xs = []
     ys = []
     for i in range(len(data)-seq_length):
-        x = data[i:(i+seq_length)]
-        y = data[i+seq_length] if i+seq_length < len(data) else data[-1]
-        xs.append(x)
-        ys.append(y)
+        xs.append(data[i:(i+seq_length)])
+        ys.append(data[i+seq_length] if i+seq_length < len(data) else data[-1])
     return np.array(xs), np.array(ys)
 
 def gaussian_nll_loss(mu, logvar, target):
     var = torch.exp(logvar)
     loss = 0.5 * ((target - mu)**2) / var + 0.5 * logvar
     return loss.mean()
+
+def build_state(prediction_variance, std_train, sla_rate, wasted_capacity, recent_loads, current_z, hour):
+    # load trend over last 3 steps
+    if len(recent_loads) >= 3:
+        trend = (recent_loads[-1] - recent_loads[-3]) / (max(recent_loads) + 1e-8)
+    else:
+        trend = 0.0
+    trend = np.clip(trend, -1.0, 1.0)
+    
+    MAX_WASTE = 1000.0
+    
+    return np.array([
+        prediction_variance / std_train,       # [0] normalized variance
+        sla_rate,                              # [1] SLA violation rate
+        wasted_capacity / MAX_WASTE,           # [2] normalized waste
+        trend,                                 # [3] load direction slope
+        current_z / 5.0,                       # [4] current policy z-score
+        np.sin(2 * np.pi * hour / 24)          # [5] time of day sine
+    ], dtype=np.float32)
+
+def compute_reward(step_sla_violation, step_wasted_capacity, total_capacity, z_score, prev_z_score):
+    # Component 1: SLA penalty (binary, dominant)
+    sla_penalty = -10.0 * step_sla_violation
+    
+    # Component 2: Waste penalty (proportional, normalized)
+    waste_ratio = step_wasted_capacity / (total_capacity + 1e-8)
+    waste_penalty = -2.0 * waste_ratio # [-2, 0] range
+    
+    # Component 3: Action stability penalty (discourage thrashing)
+    Z_STEP = 0.1
+    action_cost = -0.5 * abs(z_score - prev_z_score) / Z_STEP
+    
+    # Component 4: Efficiency bonus (reward good allocations)
+    efficiency_bonus = 1.0 if (not step_sla_violation and waste_ratio < 0.15) else 0.0
+    
+    return sla_penalty + waste_penalty + action_cost + efficiency_bonus
 
 def train_pipeline(data_path=None):
     print("Loading e-commerce data...")
@@ -59,7 +94,7 @@ def train_pipeline(data_path=None):
     model = BayesianLSTM(input_size=1, hidden_size=64, num_layers=2, dropout_rate=0.2)
     optimizer = torch.optim.Adam(model.parameters(), lr=0.005)
     
-    epochs = 50
+    epochs = 5
     for epoch in range(epochs):
         model.train()
         optimizer.zero_grad()
@@ -150,7 +185,6 @@ def train_pipeline(data_path=None):
     xgb_resid_preds = xgb_model.predict(np.array(xgb_X_test))
     
     # 3. Hybrid Mean Prediction (LSTM + Seasonality + XGB)
-    # Combining components as described in the HybridTimeNet procedure
     final_predictions = (pred_mean + season_preds_test + (season_preds_test + xgb_resid_preds)) / 3
     final_predictions = np.maximum(final_predictions, 0)
     
@@ -164,46 +198,49 @@ def train_pipeline(data_path=None):
     print(f"- Average Total Uncertainty (StdDev): {total_std.mean():.2f}")
     
     print("\nEvaluating SLA Violations & Overprovisioning...")
-    # Queueing Theory Allocation Parameters
-    service_rate = 50  # 1 server handles 50 requests per hour
-    # We remove static overprovisioning because we'll use uncertainty margin!
+    service_rate = 50
     allocator = MMCAllocator(service_rate_per_server=service_rate, target_wait_prob=0.05, overprovision_factor=0)
     
-    sla_violations = 0
-    total_hours = len(y_test_actual)
-    wasted_capacity_sum = 0
+    # RL Agent Setup (6D state space, 5 actions)
+    rl_agent = RLAgent(state_size=6, action_size=5)
     
-    # RL Agent Setup
-    rl_agent = RLAgent(state_size=3, action_size=3)
-    
-    # We will simulate multiple episodes over the test data to train the RL agent
-    episodes = 5
+    episodes = 500
     print(f"\n--- Training RL Agent for {episodes} Episodes over Test Set ---")
+    
+    os.makedirs("models", exist_ok=True)
+    best_reward = -float('inf')
+    total_hours = len(y_test_actual)
     
     for episode in range(episodes):
         sla_violations = 0
         wasted_capacity_sum = 0
+        episode_reward = 0.0
         
-        # Initial State: [Load Variance (normalized), SLA Violation Rate, Wasted Capacity Ratio]
-        current_state = np.array([total_std[0] / std_train, 0.0, 0.0])
+        recent_loads = []
+        recent_loads.append(y_test_actual[0])
+        
+        prev_z_score = rl_agent.current_z_score
+        current_state = build_state(
+            total_std[0], std_train, 0.0, 0.0, recent_loads, rl_agent.current_z_score, test_df.iloc[0]['ds'].hour
+        )
         
         for i in range(total_hours):
-            # 1. RL Agent chooses action
             action = rl_agent.act(current_state)
             
-            # 2. Environment steps based on action
+            prev_z_score = rl_agent.current_z_score
             current_z_score = rl_agent.step_z_score(action)
             
             pred_w = final_predictions[i]
             actual_w = y_test_actual[i]
             
+            recent_loads.append(actual_w)
+            if len(recent_loads) > 24:
+                recent_loads.pop(0)
+                
             uncertainty_margin = current_z_score * total_std[i]
-            
-            # Calculate servers based on predicted workload + uncertainty margin
             servers_allocated = allocator.get_required_servers(pred_w, uncertainty_margin=uncertainty_margin)
             total_capacity = servers_allocated * service_rate
             
-            # Step metrics
             step_sla_violation = 0
             step_wasted_capacity = 0
             
@@ -215,28 +252,40 @@ def train_pipeline(data_path=None):
                 step_wasted_capacity = total_capacity - actual_w
                 wasted_capacity_sum += step_wasted_capacity
                 
-            # 3. Calculate Reward
-            # heavy penalty for SLA drop, smaller penalty for waste
-            reward = -(100.0 * step_sla_violation) - (0.1 * step_wasted_capacity)
+            reward = compute_reward(step_sla_violation, step_wasted_capacity, total_capacity, current_z_score, prev_z_score)
             
-            # 4. Next State
             current_sla_rate = sla_violations / (i + 1)
-            # normalize wasted capacity (roughly max 1000 requests wasted)
-            norm_wasted = (wasted_capacity_sum / (i + 1)) / 1000.0 
+            norm_wasted = wasted_capacity_sum / (i + 1)
             
-            next_state_variance = total_std[i+1] / std_train if i + 1 < total_hours else total_std[i] / std_train
-            next_state = np.array([next_state_variance, current_sla_rate, norm_wasted])
+            next_state_variance = total_std[i+1] if i + 1 < total_hours else total_std[i]
+            next_hour = test_df.iloc[i+1]['ds'].hour if i + 1 < total_hours else test_df.iloc[i]['ds'].hour
             
-            # 5. Remember and Train
             done = (i == total_hours - 1)
+            if done:
+                final_sla_rate = sla_violations / total_hours
+                if final_sla_rate < 0.02:
+                    reward += 20.0
+                elif final_sla_rate > 0.05:
+                    reward += -50.0
+                    
+            next_state = build_state(
+                next_state_variance, std_train, current_sla_rate, norm_wasted, recent_loads, current_z_score, next_hour
+            )
+            
             rl_agent.remember(current_state, action, reward, next_state, done)
             current_state = next_state
+            episode_reward += reward
             
-            rl_agent.replay(batch_size=32)
+            rl_agent.replay(batch_size=64)
             
-        print(f"Episode {episode+1}/{episodes} - SLA Violations: {sla_violations}, Wasted: {wasted_capacity_sum:.1f}, Final Z-Score: {rl_agent.current_z_score:.2f}, Epsilon: {rl_agent.epsilon:.3f}")
-        
-    # Save the trained RL Agent
+        if episode_reward > best_reward:
+            best_reward = episode_reward
+            rl_agent.save("models/rl_agent_checkpoint.pth")
+            
+        if (episode + 1) % 10 == 0 or (episode + 1) == episodes:
+            print(f"Episode {episode+1}/{episodes} - Reward: {episode_reward:.2f} - SLA Violations: {sla_violations} ({sla_violations/total_hours*100:.2f}%), Wasted: {wasted_capacity_sum:.1f}, Final Z-Score: {rl_agent.current_z_score:.2f}, Epsilon: {rl_agent.epsilon:.3f}")
+            
+    # Save the final RL Agent model as converged fallback
     rl_agent.save("models/rl_agent_checkpoint.pth")
     
     sla_violation_rate = (sla_violations / total_hours) * 100

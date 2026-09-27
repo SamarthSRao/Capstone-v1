@@ -1,0 +1,62 @@
+
+
+======================================================================
+  DEMO REHEARSAL - FULL REPORT
+======================================================================
+
+### Run 1 (2026-08-21 01:15:55) - 11/13 PASS - 67s
+
+| Step | Action | Expected | Actual | Pass/Fail |
+|------|--------|----------|--------|-----------|
+| 1 | docker compose up | All 7 services green | All 7 services Up | PASS |
+| 2 | Open Dashboard (localhost:3000) | Live badge green, IDLE status, 50 RPS baselin | Dashboard HTTP 200, status=IDLE, RPS=50 | PASS |
+| 3 | Open Storefront (localhost:5173) | 12 product cards, normal prices, no badges | Storefront HTTP 200 (:5174), 12 products, RPS=50, no badges  | PASS |
+| 4 | Select "Flash Sale Spike" in dro | Description updates | Organic -> 2,500 RPS spike -> cooldown (30 ticks) | PASS |
+| 5 | Click "Start Simulation" | Status -> SIMULATING, chart begins climbing | POST /start-simulation HTTP 200, status=SIMULATING, RPS=55 | PASS |
+| 6 | Watch Dashboard (30 seconds) | RPS hits 2,500. Blue prediction band. Green b | Peak RPS=2,500, max_servers=112, prediction_band=yes | PASS |
+| 7 | Watch Storefront | High Demand badges, prices +30% | t+13s RPS=2400, badge=High Demand +30% | PASS |
+| 8 | Wait for SLA violations | Yellow banner OR RL prevents violations (0 SL | t+30s violations=224, SLA=88.83%, yellow banner active | PASS |
+| 9 | Click Checkout during violations | 3-second "Waiting for server..." spinner | Checkout not attempted during violation window | FAIL |
+| 10 | Order confirmed | Cart clears, "Order Confirmed!" shows | Order not confirmed | FAIL |
+| 11 | Run SLA Evaluator | python scripts/evaluate_sla.py 60 -> PASS | Max RPS Reached:             2,500; Total SLA Violations:    | PASS |
+| 12 | Wait for FINISHED | Status -> FINISHED, RPS drops to 50, prices n | status=FINISHED, RPS=50, multiplier=1.0 (normalized) | PASS |
+| 13 | Banner auto-dismisses | After 3 seconds, chaos banner disappears | After 3s post-FINISHED: RPS=50, violations=224, SLA=89.7%, b | PASS |
+
+### Run 2 (2026-08-21 01:17:17) - 9/13 PASS - 134s
+
+| Step | Action | Expected | Actual | Pass/Fail |
+|------|--------|----------|--------|-----------|
+| 1 | docker compose up | All 7 services green | docker compose ps failed: Command '['docker', 'compose', 'ps | FAIL |
+| 2 | Open Dashboard (localhost:3000) | Live badge green, IDLE status, 50 RPS baselin | Dashboard HTTP 200, status=?, RPS=-1 | FAIL |
+| 3 | Open Storefront (localhost:5173) | 12 product cards, normal prices, no badges | Storefront HTTP 200 (:5174), 12 products, RPS=-1, no badges  | PASS |
+| 4 | Select "Flash Sale Spike" in dro | Description updates | Organic -> 2,500 RPS spike -> cooldown (30 ticks) | PASS |
+| 5 | Click "Start Simulation" | Status -> SIMULATING, chart begins climbing | POST /start-simulation HTTP 200, status=SIMULATING, RPS=60 | PASS |
+| 6 | Watch Dashboard (30 seconds) | RPS hits 2,500. Blue prediction band. Green b | Peak RPS=2,500, max_servers=133, prediction_band=yes | PASS |
+| 7 | Watch Storefront | High Demand badges, prices +30% | t+11s RPS=2400, badge=High Demand +30% | PASS |
+| 8 | Wait for SLA violations | Yellow banner OR RL prevents violations (0 SL | t+11s RPS=2400, violations=0, SLA=100.0%, servers=133 — RL a | PASS |
+| 9 | Click Checkout during violations | 3-second "Waiting for server..." spinner | Checkout not attempted during violation window | FAIL |
+| 10 | Order confirmed | Cart clears, "Order Confirmed!" shows | Order not confirmed | FAIL |
+| 11 | Run SLA Evaluator | python scripts/evaluate_sla.py 60 -> PASS | Max RPS Reached:             2,500; Total SLA Violations:    | PASS |
+| 12 | Wait for FINISHED | Status -> FINISHED, RPS drops to 50, prices n | status=FINISHED, RPS=50, multiplier=1.0 (normalized) | PASS |
+| 13 | Banner auto-dismisses | After 3 seconds, chaos banner disappears | After 3s post-FINISHED: RPS=50, violations=0, SLA=100.0%, ba | PASS |
+
+### Run 3 (2026-08-21 01:19:46) - 11/13 PASS - 86s
+
+| Step | Action | Expected | Actual | Pass/Fail |
+|------|--------|----------|--------|-----------|
+| 1 | docker compose up | All 7 services green | All 7 services Up | PASS |
+| 2 | Open Dashboard (localhost:3000) | Live badge green, IDLE status, 50 RPS baselin | Dashboard HTTP 200, status=FINISHED, RPS=50 | PASS |
+| 3 | Open Storefront (localhost:5173) | 12 product cards, normal prices, no badges | Storefront HTTP 200 (:5174), 12 products, RPS=50, no badges  | PASS |
+| 4 | Select "Flash Sale Spike" in dro | Description updates | Organic -> 2,500 RPS spike -> cooldown (30 ticks) | PASS |
+| 5 | Click "Start Simulation" | Status -> SIMULATING, chart begins climbing | POST /start-simulation HTTP 200, status=SIMULATING, RPS=60 | PASS |
+| 6 | Watch Dashboard (30 seconds) | RPS hits 2,500. Blue prediction band. Green b | Peak RPS=2,500, max_servers=149, prediction_band=yes | PASS |
+| 7 | Watch Storefront | High Demand badges, prices +30% | t+12s RPS=2400, badge=High Demand +30% | PASS |
+| 8 | Wait for SLA violations | Yellow banner OR RL prevents violations (0 SL | t+12s RPS=2400, violations=0, SLA=100.0%, servers=149 — RL a | PASS |
+| 9 | Click Checkout during violations | 3-second "Waiting for server..." spinner | Checkout not attempted during violation window | FAIL |
+| 10 | Order confirmed | Cart clears, "Order Confirmed!" shows | Order not confirmed | FAIL |
+| 11 | Run SLA Evaluator | python scripts/evaluate_sla.py 60 -> PASS | Max RPS Reached:             2,500; Total SLA Violations:    | PASS |
+| 12 | Wait for FINISHED | Status -> FINISHED, RPS drops to 50, prices n | status=FINISHED, RPS=50, multiplier=1.0 (normalized) | PASS |
+| 13 | Banner auto-dismisses | After 3 seconds, chaos banner disappears | After 3s post-FINISHED: RPS=50, violations=0, SLA=100.0%, ba | PASS |
+
+**Overall:** 0/3 runs all PASS
+**Step totals:** [11, 9, 11]
