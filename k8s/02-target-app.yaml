@@ -1,0 +1,120 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nginx-lb-config
+  namespace: capstone
+data:
+  nginx.conf: |
+    events {
+        worker_connections 2048;
+    }
+    http {
+        upstream target_backend {
+            least_conn;
+            server target-app:8080 max_fails=3 fail_timeout=5s;
+        }
+        server {
+            listen 8090;
+            location /stub_status {
+                stub_status on;
+                access_log off;
+                allow all;
+            }
+            location / {
+                proxy_pass http://target_backend;
+                proxy_set_header Host $host;
+                proxy_set_header X-Real-IP $remote_addr;
+                proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                proxy_set_header X-Forwarded-Proto $scheme;
+                proxy_connect_timeout 2s;
+                proxy_read_timeout 5s;
+            }
+        }
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: target-app
+  namespace: capstone
+  labels:
+    app: target-app
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: target-app
+  template:
+    metadata:
+      labels:
+        app: target-app
+    spec:
+      containers:
+        - name: target-app
+          image: capstone/target-app:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: target-app
+  namespace: capstone
+spec:
+  selector:
+    app: target-app
+  ports:
+    - protocol: TCP
+      port: 8080
+      targetPort: 8080
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nginx-lb
+  namespace: capstone
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nginx-lb
+  template:
+    metadata:
+      labels:
+        app: nginx-lb
+    spec:
+      containers:
+        - name: nginx-lb
+          image: nginx:alpine
+          ports:
+            - containerPort: 8090
+          volumeMounts:
+            - name: nginx-config
+              mountPath: /etc/nginx/nginx.conf
+              subPath: nginx.conf
+      volumes:
+        - name: nginx-config
+          configMap:
+            name: nginx-lb-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nginx-lb
+  namespace: capstone
+spec:
+  type: LoadBalancer
+  selector:
+    app: nginx-lb
+  ports:
+    - protocol: TCP
+      port: 8090
+      targetPort: 8090

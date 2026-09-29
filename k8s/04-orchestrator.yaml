@@ -1,0 +1,55 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: orchestrator
+  namespace: capstone
+  labels:
+    app: orchestrator
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: orchestrator
+  template:
+    metadata:
+      labels:
+        app: orchestrator
+    spec:
+      serviceAccountName: orchestrator-sa
+      containers:
+        - name: orchestrator
+          image: capstone/orchestrator:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8082
+          env:
+            - name: KUBERNETES_ENABLED
+              value: "true"
+            - name: K8S_NAMESPACE
+              value: "capstone"
+            - name: K8S_DEPLOYMENT
+              value: "target-app"
+            - name: TARGET_METRICS_URL
+              value: "http://nginx-lb:8090/stub_status"
+            - name: PREDICTOR_URL
+              value: "predictor:50051"
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: orchestrator
+  namespace: capstone
+spec:
+  selector:
+    app: orchestrator
+  ports:
+    - protocol: TCP
+      port: 8082
+      targetPort: 8082

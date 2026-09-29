@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -257,15 +259,98 @@ var (
 
 // scaleDockerTargetApp physically scales the open-source target-app containers via Docker CLI or socket
 func scaleDockerTargetApp(replicas int) error {
-	log.Printf("[Orchestrator Actuator] >>> SCALING TARGET-APP TO %d REPLICAS <<<", replicas)
+	log.Printf("[Orchestrator Docker Actuator] >>> SCALING TARGET-APP TO %d REPLICAS <<<", replicas)
 	cmd := exec.Command("docker", "compose", "up", "-d", "--scale", fmt.Sprintf("target-app=%d", replicas), "--no-recreate")
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		log.Printf("[Orchestrator Actuator] Docker command output / notice: %s (%v)", string(output), err)
+		log.Printf("[Orchestrator Docker Actuator] Docker command output / notice: %s (%v)", string(output), err)
 	} else {
-		log.Printf("[Orchestrator Actuator] Docker scale executed successfully: %s", string(output))
+		log.Printf("[Orchestrator Docker Actuator] Docker scale executed successfully: %s", string(output))
 	}
 	return nil
+}
+
+// scaleKubernetesDeployment scales the target Kubernetes deployment via in-cluster service account or kubectl
+func scaleKubernetesDeployment(replicas int) error {
+	namespace := os.Getenv("K8S_NAMESPACE")
+	if namespace == "" {
+		namespace = "capstone"
+	}
+	deployment := os.Getenv("K8S_DEPLOYMENT")
+	if deployment == "" {
+		deployment = "target-app"
+	}
+
+	log.Printf("[Orchestrator K8s Actuator] >>> PROACTIVELY SCALING K8S DEPLOYMENT %s/%s TO %d PODS <<<", namespace, deployment, replicas)
+
+	tokenBytes, err := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/token")
+	if err == nil {
+		// In-cluster execution using Kubernetes REST API
+		k8sHost := os.Getenv("KUBERNETES_SERVICE_HOST")
+		k8sPort := os.Getenv("KUBERNETES_SERVICE_PORT")
+		if k8sHost == "" {
+			k8sHost = "kubernetes.default.svc"
+			k8sPort = "443"
+		}
+
+		caCert, err := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/ca.crt")
+		caCertPool := x509.NewCertPool()
+		if err == nil {
+			caCertPool.AppendCertsFromPEM(caCert)
+		}
+
+		tr := &http.Transport{
+			TLSClientConfig: &tls.Config{
+				RootCAs: caCertPool,
+			},
+		}
+		client := &http.Client{Transport: tr, Timeout: 5 * time.Second}
+
+		url := fmt.Sprintf("https://%s:%s/apis/apps/v1/namespaces/%s/deployments/%s/scale", k8sHost, k8sPort, namespace, deployment)
+		payload := fmt.Sprintf(`{"spec":{"replicas":%d}}`, replicas)
+
+		req, err := http.NewRequest("PATCH", url, bytes.NewBufferString(payload))
+		if err != nil {
+			return err
+		}
+		req.Header.Set("Content-Type", "application/merge-patch+json")
+		req.Header.Set("Authorization", "Bearer "+string(tokenBytes))
+
+		resp, err := client.Do(req)
+		if err != nil {
+			log.Printf("[Orchestrator K8s Actuator] In-cluster scale request error: %v", err)
+			return err
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode >= 300 {
+			buf := new(bytes.Buffer)
+			buf.ReadFrom(resp.Body)
+			log.Printf("[Orchestrator K8s Actuator] K8s API scale error (HTTP %d): %s", resp.StatusCode, buf.String())
+			return fmt.Errorf("k8s api scale failed with status %d", resp.StatusCode)
+		}
+
+		log.Printf("[Orchestrator K8s Actuator] Successfully scaled %s/%s to %d replicas via K8s API", namespace, deployment, replicas)
+		return nil
+	}
+
+	// Fallback to kubectl if running externally with kubeconfig
+	cmd := exec.Command("kubectl", "scale", fmt.Sprintf("deployment/%s", deployment), fmt.Sprintf("--replicas=%d", replicas), "-n", namespace)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		log.Printf("[Orchestrator K8s Actuator] kubectl scale notice: %s (%v)", string(out), err)
+		return err
+	}
+	log.Printf("[Orchestrator K8s Actuator] kubectl scale success: %s", string(out))
+	return nil
+}
+
+// scaleTargetApp routes scaling to Kubernetes (if in cluster or enabled) or Docker
+func scaleTargetApp(replicas int) error {
+	if os.Getenv("KUBERNETES_ENABLED") == "true" || os.Getenv("KUBERNETES_SERVICE_HOST") != "" {
+		return scaleKubernetesDeployment(replicas)
+	}
+	return scaleDockerTargetApp(replicas)
 }
 
 // startTargetAppMonitor polls live HTTP traffic from Nginx or target app metrics and autonomously adapts
@@ -348,13 +433,13 @@ func startTargetAppMonitor(orch *Orchestrator) {
 
 		if servers > currentReplicas {
 			// Proactive scale up: Immediate!
-			scaleDockerTargetApp(servers)
+			scaleTargetApp(servers)
 			eventMsg = fmt.Sprintf("Proactive surge detected (%.0f RPS): Scaled from %d -> %d replicas", currentRPS, currentReplicas, servers)
 			currentReplicas = servers
 			scaleTriggered = true
 		} else if servers < currentReplicas && now.Sub(lastScaleDownTime) > 15*time.Second {
 			// Scale down: Graceful cooldown (15s)
-			scaleDockerTargetApp(servers)
+			scaleTargetApp(servers)
 			eventMsg = fmt.Sprintf("Traffic subsided (%.0f RPS): Scaled down from %d -> %d replicas", currentRPS, currentReplicas, servers)
 			currentReplicas = servers
 			lastScaleDownTime = now
