@@ -15,6 +15,7 @@ spec:
       labels:
         app: predictor
     spec:
+      terminationGracePeriodSeconds: 20
       containers:
         - name: predictor
           image: capstone/predictor:latest
@@ -24,12 +25,34 @@ spec:
               name: grpc
             - containerPort: 50052
               name: http
+          # Model load happens before :50052 listens. The startup probe
+          # allows a few minutes for that without killing the container.
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+            failureThreshold: 60
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sh", "-c", "sleep 5"]
           resources:
             requests:
               cpu: 200m
               memory: 512Mi
             limits:
-              cpu: 1000m
+              cpu: "1"
               memory: 1Gi
 ---
 apiVersion: v1

@@ -15,21 +15,40 @@ spec:
       labels:
         app: dashboard
     spec:
+      terminationGracePeriodSeconds: 15
       containers:
         - name: dashboard
           image: capstone/dashboard:latest
           imagePullPolicy: IfNotPresent
           ports:
-            - containerPort: 3000
-          env:
-            - name: VITE_ORCHESTRATOR_URL
-              value: "http://orchestrator:8082"
+            - name: http
+              containerPort: 80
+          # Static nginx build. The browser calls /api/orchestrator/..., which
+          # this pod proxies to the orchestrator Service. VITE_* URLs are baked
+          # at image build time and must not be cluster DNS names: the browser
+          # cannot resolve them.
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+            failureThreshold: 12
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
           resources:
             requests:
-              cpu: 50m
-              memory: 64Mi
+              cpu: 20m
+              memory: 32Mi
             limits:
-              cpu: 250m
+              cpu: 200m
               memory: 128Mi
 ---
 apiVersion: v1
@@ -42,6 +61,7 @@ spec:
   selector:
     app: dashboard
   ports:
-    - protocol: TCP
-      port: 3000
-      targetPort: 3000
+    - name: http
+      protocol: TCP
+      port: 80
+      targetPort: http

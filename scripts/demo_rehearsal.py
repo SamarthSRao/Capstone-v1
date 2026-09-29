@@ -6,6 +6,7 @@ Usage: python scripts/demo_rehearsal.py [--run N] [--runs 3]
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import threading
@@ -181,6 +182,35 @@ def record(steps, n, action, expected, ok, actual):
     steps.append(StepResult(n, action, expected, actual, ok))
 
 
+def ensure_demo_stock() -> tuple[bool, str]:
+    """Restock NexusGear before checkout.
+
+    Seed data is only a few hundred units. A previous Locust run, or repeated
+    rehearsal checkouts, returns HTTP 409 once stock is gone and steps 9-10
+    fail even though the autoscaler path is fine. This calls
+    scripts/prep_load_test_stock.py (same helper operators run by hand).
+    """
+    script = __import__("pathlib").Path(__file__).resolve().parent / "prep_load_test_stock.py"
+    container = os.environ.get("NEXUS_DB_CONTAINER", "").strip()
+    if not container:
+        listed = subprocess.run(
+            ["docker", "ps", "--format", "{{.Names}}"],
+            capture_output=True, text=True, timeout=20,
+        )
+        matches = [n for n in listed.stdout.splitlines() if "nexusgear-db" in n]
+        if matches:
+            container = matches[0]
+    cmd = [sys.executable, str(script), "--stock", "1000000"]
+    if container:
+        cmd.extend(["--container", container])
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
+    detail = ((proc.stdout or "") + (proc.stderr or "")).strip()
+    last = detail.splitlines()[-1] if detail else "no output"
+    if not container:
+        last = "no nexusgear-db container found; " + last
+    return proc.returncode == 0, last
+
+
 def run_scenario(run_num: int) -> ScenarioResult:
     result = ScenarioResult(run=run_num, started_at=time.strftime("%Y-%m-%d %H:%M:%S"))
     steps: list[StepResult] = []
@@ -194,6 +224,11 @@ def run_scenario(run_num: int) -> ScenarioResult:
     ok, msg = docker_services_up()
     record(steps, 1, "docker compose up", "All 7 services green", ok, msg)
     print(f"  Step  1: {'PASS' if ok else 'FAIL'} - {msg}")
+
+    # Seed stock is small enough that checkout steps 9-10 return 409 after a
+    # load test. Restock before the scenario spends any units.
+    stock_ok, stock_msg = ensure_demo_stock()
+    print(f"  Restock: {'OK' if stock_ok else 'FAIL'} - {stock_msg}")
 
     # Step 2
     m = get_metrics()
@@ -318,6 +353,18 @@ def run_scenario(run_num: int) -> ScenarioResult:
                 },
                 timeout=15,
             )
+            if c_code == 409:
+                print("    Checkout got 409 (stock). Restocking and retrying once.")
+                ensure_demo_stock()
+                c_code, _ = http_post(
+                    f"{API}/api/checkout",
+                    {
+                        "product_id": checkout_product["id"],
+                        "quantity": 1,
+                        "session_id": f"rehearsal-run{run_num}-retry",
+                    },
+                    timeout=15,
+                )
             elapsed_ms = int((time.time() - t_check) * 1000)
             checkout_done = True
             step9_ok = c_code == 200 and delay_s >= 3.0

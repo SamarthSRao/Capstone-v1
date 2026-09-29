@@ -24,11 +24,70 @@ import { motion, AnimatePresence } from 'framer-motion';
 import { SlaCostVisualizer } from './SlaCostVisualizer';
 import { RlVisualizationPanel } from './RlVisualizationPanel';
 
-const SIMULATOR_URL =
-  import.meta.env.VITE_SIMULATOR_URL ||
-  (typeof window !== 'undefined' && window.location.hostname
-    ? `${window.location.protocol}//${window.location.hostname}:8083`
-    : 'http://localhost:8083');
+// Empty in the AKS image so the browser does not invent :8083 on the
+// dashboard's public host. Set VITE_SIMULATOR_URL for the local simulator demo.
+const SIMULATOR_URL = import.meta.env.VITE_SIMULATOR_URL || '';
+
+// Relative by default. nginx (cluster) and the Vite dev proxy both forward
+// /api/orchestrator to the orchestrator. Do not bake http://orchestrator:8082
+// into the bundle: the browser cannot resolve cluster DNS.
+const ORCHESTRATOR_URL = (
+  import.meta.env.VITE_ORCHESTRATOR_URL || '/api/orchestrator'
+).replace(/\/$/, '');
+
+function mapOrchestratorStatus(data) {
+  return {
+    status: data.status || 'LIVE',
+    current_rps: data.current_rps,
+    active_servers: data.active_replicas,
+    required_servers: data.desired_replicas ?? data.active_replicas,
+    predicted_mean: data.predicted_mean,
+    predicted_upper: data.predicted_upper,
+    predicted_lower: data.predicted_lower,
+    sla_reliability: data.sla_reliability,
+    violations: data.violations ?? 0,
+    rl_action: data.rl_action,
+    rl_action_label: data.rl_action_label,
+    z_score: data.z_score,
+    std_dev: data.std_dev,
+    raw_ml_mean: data.raw_ml_mean,
+    error_ratio: data.error_ratio,
+    source: 'orchestrator',
+  };
+}
+
+// Prefer the orchestrator's live target status (AKS and kind). Fall back to
+// the simulator only when that loop is not running.
+async function fetchTelemetry() {
+  if (ORCHESTRATOR_URL) {
+    try {
+      const response = await fetch(
+        `${ORCHESTRATOR_URL}/api/target/status`,
+        { cache: 'no-store' }
+      );
+      if (response.ok) {
+        const data = await response.json();
+        if (data && data.live) {
+          return mapOrchestratorStatus(data);
+        }
+      }
+    } catch (err) {
+      console.warn('[Dashboard] orchestrator status unavailable', err);
+    }
+  }
+
+  if (!SIMULATOR_URL) {
+    throw new Error('orchestrator status is not live and no simulator URL is configured');
+  }
+
+  const response = await fetch(`${SIMULATOR_URL}/metrics`, {
+    cache: 'no-store',
+  });
+  if (!response.ok) {
+    throw new Error(`simulator HTTP ${response.status}`);
+  }
+  return response.json();
+}
 
 /* ============================================================
    Simulation Datasets
@@ -239,6 +298,29 @@ const SimulationControlPanel = ({
 
   const running =
     starting || localStatus === 'SIMULATING';
+
+  if (!SIMULATOR_URL) {
+    return (
+      <div
+        style={{
+          background: 'rgba(255,255,255,0.03)',
+          border: '1px solid #252525',
+          borderRadius: 12,
+          padding: 20,
+          marginBottom: 24,
+        }}
+      >
+        <div style={{ fontSize: 14, fontWeight: 600, color: '#E7E6D9', marginBottom: 8 }}>
+          Live cluster
+        </div>
+        <div style={{ fontSize: 12, color: '#A1A1AA', lineHeight: 1.5 }}>
+          Reading RPS, forecast, upper bound, and current/desired replicas from the orchestrator.
+          Generate load with deploy/load_gen.sh (or the in-cluster loadgen Job) against the target app.
+          There is no simulator in this mode.
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div
@@ -810,23 +892,7 @@ const Dashboard = () => {
 
     const pollMetrics = async () => {
       try {
-        const response = await fetch(
-          `${SIMULATOR_URL}/metrics`,
-          {
-            cache: 'no-store',
-          }
-        );
-
-        if (!response.ok) {
-          if (mounted) {
-            setConnected(false);
-          }
-
-          return;
-        }
-
-        const data =
-          await response.json();
+        const data = await fetchTelemetry();
 
         if (!mounted) {
           return;
@@ -1162,8 +1228,9 @@ const Dashboard = () => {
 
         if (
           actualRPS > 1000 &&
-          currentStatus ===
-            'SIMULATING'
+          (currentStatus ===
+            'SIMULATING' ||
+            currentStatus === 'LIVE')
         ) {
           const bucket =
             Math.floor(
@@ -1497,7 +1564,7 @@ const Dashboard = () => {
                 )}`,
 
               sub:
-                'Provisioned Nodes',
+                'Current replicas',
 
               icon:
                 Server,
@@ -1508,7 +1575,7 @@ const Dashboard = () => {
 
             {
               label:
-                'Required Servers',
+                'Desired replicas',
 
               val:
                 latest?.requiredServers !=
@@ -1519,7 +1586,7 @@ const Dashboard = () => {
                   : '—',
 
               sub:
-                'RL recommendation',
+                'Forecast target',
 
               icon:
                 Server,
@@ -1687,8 +1754,9 @@ const Dashboard = () => {
             chartData.length === 0 ? (
 
               <div className="h-full flex items-center justify-center text-slate-500 text-sm">
-                Waiting for simulator at{' '}
-                {SIMULATOR_URL}/metrics…
+                Waiting for orchestrator at{' '}
+                {ORCHESTRATOR_URL}/api/target/status
+                {SIMULATOR_URL ? ` or simulator ${SIMULATOR_URL}/metrics` : ''}…
               </div>
 
             ) : (

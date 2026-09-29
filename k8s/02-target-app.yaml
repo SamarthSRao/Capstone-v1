@@ -49,16 +49,46 @@ spec:
       labels:
         app: target-app
     spec:
+      terminationGracePeriodSeconds: 20
       containers:
         - name: target-app
           image: capstone/target-app:latest
+          # IfNotPresent so kind/minikube can use a locally loaded image.
+          # The AKS deploy scripts overlay imagePullPolicy: Always after the
+          # image has been pushed to ACR.
           imagePullPolicy: IfNotPresent
           ports:
-            - containerPort: 8080
+            - name: http
+              containerPort: 8080
+          # /health is implemented by services/target-app and is not used for
+          # traffic. Readiness keeps a pod out of the Service until it can
+          # serve, which is the 10-30s startup the forecast lead time covers.
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 2
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sh", "-c", "sleep 5"]
           resources:
+            # 50m request lets a 2-vCPU student node schedule the warm-up
+            # fleet (requests, not limits, decide scheduling).
             requests:
-              cpu: 100m
-              memory: 128Mi
+              cpu: 50m
+              memory: 64Mi
             limits:
               cpu: 500m
               memory: 256Mi
@@ -91,11 +121,41 @@ spec:
       labels:
         app: nginx-lb
     spec:
+      terminationGracePeriodSeconds: 20
       containers:
         - name: nginx-lb
           image: nginx:alpine
+          imagePullPolicy: IfNotPresent
           ports:
-            - containerPort: 8090
+            - name: http
+              containerPort: 8090
+          startupProbe:
+            httpGet:
+              path: /stub_status
+              port: http
+            periodSeconds: 2
+            failureThreshold: 15
+          livenessProbe:
+            httpGet:
+              path: /stub_status
+              port: http
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /stub_status
+              port: http
+            periodSeconds: 5
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sh", "-c", "sleep 5"]
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 128Mi
           volumeMounts:
             - name: nginx-config
               mountPath: /etc/nginx/nginx.conf

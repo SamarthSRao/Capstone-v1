@@ -16,12 +16,14 @@ spec:
         app: orchestrator
     spec:
       serviceAccountName: orchestrator-sa
+      terminationGracePeriodSeconds: 15
       containers:
         - name: orchestrator
           image: capstone/orchestrator:latest
           imagePullPolicy: IfNotPresent
           ports:
-            - containerPort: 8082
+            - name: http
+              containerPort: 8082
           env:
             - name: KUBERNETES_ENABLED
               value: "true"
@@ -31,12 +33,49 @@ spec:
               value: "target-app"
             - name: TARGET_METRICS_URL
               value: "http://nginx-lb:8090/stub_status"
+            # Dial target. The process used to ignore this and hardcode predictor:50051.
             - name: PREDICTOR_URL
               value: "predictor:50051"
+            # Requests per second per pod (not per minute). 200 keeps a
+            # ~300 RPS uncertainty band at 1-2 replicas on a student cluster.
+            - name: SERVICE_RATE_RPS
+              value: "200"
+            - name: CAPACITY_MODEL
+              value: "true"
+            # Warm floor. Never scale to zero; raise to 2 to keep a spare pod hot.
+            - name: MIN_REPLICAS
+              value: "1"
+            - name: MAX_REPLICAS
+              value: "10"
+            # Pods need 10-30s to become Ready. Project the forecast slope
+            # forward by this many seconds so scale-up starts before the peak.
+            - name: FORECAST_LEAD_SECONDS
+              value: "30"
+            # Scale-up is immediate. Scale-down waits, then drops one pod at a time.
+            - name: SCALE_DOWN_STABILIZATION_SEC
+              value: "45"
+            - name: SCALE_DOWN_STEP
+              value: "1"
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+            failureThreshold: 40
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
           resources:
             requests:
-              cpu: 100m
-              memory: 128Mi
+              cpu: 50m
+              memory: 64Mi
             limits:
               cpu: 500m
               memory: 256Mi

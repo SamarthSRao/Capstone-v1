@@ -94,6 +94,12 @@ class PredictorService(predictor_pb2_grpc.PredictorServicer):
             print("Could not load RL Agent, using default initialized weights. Error:", e)
 
         self.last_state = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+        # current_z_score is one value for the whole process. Concurrent
+        # GetPrediction calls (monitor + /scale) would race and step it twice
+        # per tick. The lock makes each step atomic. Callers should still
+        # avoid having two controllers: the orchestrator only runs its
+        # autonomous loop on Kubernetes, and uses POST /scale for the simulator.
+        self._predict_lock = threading.Lock()
 
     def reset_rl(self):
         if hasattr(self, 'rl_agent') and self.rl_agent is not None:
@@ -101,6 +107,12 @@ class PredictorService(predictor_pb2_grpc.PredictorServicer):
         return 1.96
 
     def GetPrediction(self, request, context):
+        # Serialize RL z-score updates. MC dropout itself is read-only, but
+        # step_z_score mutates shared agent state.
+        with self._predict_lock:
+            return self._predict_locked(request, context)
+
+    def _predict_locked(self, request, context):
         history = np.array(request.history)
         if len(history) < 24:
             # Fallback if not enough data
@@ -252,6 +264,18 @@ def serve():
             self.send_header("Access-Control-Allow-Methods", "POST, OPTIONS")
             self.send_header("Access-Control-Allow-Headers", "Content-Type")
             self.end_headers()
+
+        def do_GET(self):
+            if self.path not in ("/health", "/healthz", "/ready"):
+                self.send_response(404)
+                self.end_headers()
+                return
+            body = b'{"status":"ok"}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
 
         def do_POST(self):
             if self.path != "/reset":

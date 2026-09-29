@@ -32,6 +32,9 @@ obj/
 *.test
 *.prof
 go.sum
+# The orchestrator module is built and tested outside Docker, so its checksums
+# have to be in the tree. Other go.sum files stay ignored.
+!services/orchestrator/go.sum
 
 # Node.js
 node_modules/
@@ -65,6 +68,9 @@ out/
 # OS
 .DS_Store
 Thumbs.db
+
+# Generated at deploy time by deploy/deploy_aks.sh and deploy_aks.ps1
+deploy/aks-overlay/
 
 # IDEs
 .vscode/

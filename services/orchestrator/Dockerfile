@@ -15,7 +15,9 @@ RUN protoc --proto_path=./protos --go_out=./protos/predictor --go_opt=paths=sour
 
 RUN go mod init github.com/samarthsrao/capstone || true
 RUN go mod tidy
-RUN go build -o main ./main.go
+# Build the whole package. scaling.go holds the parser, replica math, and
+# scale-down policy; `go build ./main.go` would leave those symbols out.
+RUN go build -o main .
 
 FROM alpine:latest
 RUN apk add --no-cache docker-cli curl
