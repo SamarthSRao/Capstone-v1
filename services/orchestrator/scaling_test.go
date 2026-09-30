@@ -166,6 +166,121 @@ func TestRampTrustsUpperBoundImmediately(t *testing.T) {
 	}
 }
 
+func prescaleFixture() (ForecastGuard, PrescaleConfig) {
+	return ForecastGuard{FlatHeadroomRPS: 50, RisingSlope: 2}, PrescaleConfig{PersistTicks: 3, MarginCapRPS: 40, SmoothAlpha: 0.2}
+}
+
+func TestIdleUpperBoundSpikesNeverScale(t *testing.T) {
+	// 10 minutes at ~1 RPS. The upper bound cycles through the kind readings
+	// (178, 285, 438) while the forecast mean stays near 72, under the
+	// 200 RPS capacity of one pod. Desired replicas must stay at 1.
+	guard, cfg := prescaleFixture()
+	const mu = 200.0
+	state := &PrescaleState{}
+	uppers := []float64{178, 285, 283, 438}
+	for tick := 0; tick < 600; tick++ {
+		upper := uppers[tick%len(uppers)]
+		signal := decideScaleRate(upper, 72, 1, 0, mu, 30*time.Second, guard, cfg, state)
+		got := ReplicasForLoad(signal.Lambda, mu, 1, 10)
+		if got != 1 {
+			t.Fatalf("tick %d upper %.0f rule %s lambda %.1f -> %d pods", tick, upper, signal.Rule, signal.Lambda, got)
+		}
+		if signal.Rule != ruleIdleGuard {
+			t.Fatalf("tick %d rule %s, want idle-guard", tick, signal.Rule)
+		}
+	}
+	// One mean sample as wild as the upper bound is still not a forecast.
+	signal := decideScaleRate(438, 438, 1, 0, mu, 30*time.Second, guard, cfg, state)
+	if got := ReplicasForLoad(signal.Lambda, mu, 1, 10); got != 1 {
+		t.Fatalf("single mean spike scaled to %d (rule %s lambda %.1f)", got, signal.Rule, signal.Lambda)
+	}
+}
+
+func TestPersistentMeanScalesBeforeLiveCrossesCapacity(t *testing.T) {
+	guard, cfg := prescaleFixture()
+	const mu = 200.0
+	state := &PrescaleState{}
+	// Live RPS is 80 and flat. One pod can still serve it (capacity 200).
+	// The forecast mean is already 250, which is the horizon value.
+	var signal ScaleSignal
+	for tick := 0; tick < 3; tick++ {
+		signal = decideScaleRate(438, 250, 80, 0, mu, 30*time.Second, guard, cfg, state)
+		got := ReplicasForLoad(signal.Lambda, mu, 1, 10)
+		if tick < 2 {
+			if got != 1 {
+				t.Fatalf("tick %d scaled early to %d (rule %s)", tick, got, signal.Rule)
+			}
+			continue
+		}
+		if signal.Rule != rulePersistence {
+			t.Fatalf("tick %d rule %s, want forecast-persistence", tick, signal.Rule)
+		}
+		if got < 2 {
+			t.Fatalf("persistent mean did not add a pod: %+v -> %d", signal, got)
+		}
+		if 80 >= mu {
+			t.Fatal("test setup: live RPS must still be under one pod")
+		}
+	}
+	// The idle cap on the upper bound would have held this at 1 RPS + 50.
+	// Persistence must not inherit that cap.
+	if signal.Lambda < 250 {
+		t.Fatalf("persistence lambda %.1f was capped like the upper bound", signal.Lambda)
+	}
+}
+
+func TestSmoothedMarginPrescalesWhenMeanIsNearCapacity(t *testing.T) {
+	// Mean stays just under capacity, so the persistence counter never trips.
+	// The smoothed lead margin is what crosses the line, after more than one tick.
+	guard, cfg := prescaleFixture()
+	const mu = 200.0
+	state := &PrescaleState{}
+	fired := -1
+	for tick := 0; tick < 12; tick++ {
+		signal := decideScaleRate(50, 190, 100, 0, mu, 30*time.Second, guard, cfg, state)
+		got := ReplicasForLoad(signal.Lambda, mu, 1, 10)
+		if tick == 0 && got != 1 {
+			t.Fatalf("margin rule fired on the first tick: %+v", signal)
+		}
+		if got >= 2 && fired < 0 {
+			fired = tick
+			if signal.Rule != ruleMargin {
+				t.Fatalf("tick %d rule %s, want forecast-margin", tick, signal.Rule)
+			}
+		}
+	}
+	if fired < 2 {
+		t.Fatalf("margin rule fired at tick %d, want it to wait for the smooth", fired)
+	}
+}
+
+func TestRampStillScalesImmediatelyWithPrescale(t *testing.T) {
+	guard, cfg := prescaleFixture()
+	const mu = 200.0
+	state := &PrescaleState{}
+	// First tick of a real ramp. Persistence has not had time to count.
+	signal := decideScaleRate(1200, 50, 40, 20, mu, 30*time.Second, guard, cfg, state)
+	if signal.Rule != ruleSlope {
+		t.Fatalf("rule %s, want slope", signal.Rule)
+	}
+	if signal.Lambda < 1200 {
+		t.Fatalf("ramp lambda %.1f, want the upper bound", signal.Lambda)
+	}
+	got := ReplicasForLoad(signal.Lambda, mu, 1, 10)
+	if got < 6 {
+		t.Fatalf("ramp replicas %d", got)
+	}
+	decision := applyScalePolicy(1, got, 0, ScalePolicy{
+		MinReplicas:            1,
+		MaxReplicas:            10,
+		ScaleDownStabilization: 45 * time.Second,
+		ScaleDownStep:          1,
+	})
+	if decision.Direction != "up" || decision.Next != got {
+		t.Fatalf("scale-up delayed: %+v", decision)
+	}
+}
+
 func TestLeadTimeProjection(t *testing.T) {
 	// Upper bound has not caught up, but RPS is rising 10/s. Over a 30s
 	// pod start we should provision for 50+300=350, not the stale upper bound.

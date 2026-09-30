@@ -2,7 +2,7 @@
 
 One path shows the same loop on Azure Kubernetes Service and on a local kind or minikube cluster:
 
-traffic rises, the forecast upper bound moves, pods scale up before the peak is fully being served, then pods step down after the spike instead of dropping to one replica in a single tick.
+traffic rises, the forecast mean moves ahead of live RPS, pods scale up before that live rate crosses what the current pods can serve, then pods step down after the spike instead of dropping to one replica in a single tick.
 
 Do not point this at a production subscription. The scripts create a resource group, a Basic container registry, and a small AKS cluster. They were not executed against Azure in the change that added them.
 
@@ -15,9 +15,18 @@ Do not point this at a production subscription. The scripts create a resource gr
 | Replica decision | Go orchestrator, `:8082` `/api/target/status` |
 | Dashboard | Static build, nginx proxies `/api/orchestrator/` to the orchestrator |
 
-Each target pod is treated as **200 requests/second**. The cap is 10, which fits a 1-node student pool if the node is a 2-vCPU size. Scale-up has no cooldown once requests per second are rising (default slope at least 2 RPS/s, `RISING_SLOPE_RPS`). Scale-down waits 45 seconds, then removes one pod per window.
+Each target pod is treated as **200 requests/second**. The cap is 10, which fits a 1-node student pool if the node is a 2-vCPU size. Scale-down waits 45 seconds, then removes one pod per window.
 
-At idle the forecast mean sits near 70 RPS and the standard deviation near 100. The upper bound is `mean + z * std` (the error term is zero while live RPS is below the mean). Monte Carlo dropout redraws `std` every tick, and that value is also a DQN input, so `z` moves with it. The bound therefore jumps through roughly 180-440 RPS without any real traffic, which is enough to cross into a second or third pod. While RPS is flat the orchestrator caps the rate it will scale on at live RPS + `FLAT_HEADROOM_RPS` (default 50), so that noise stays on one pod. The dashboard still shows the raw upper bound. As soon as RPS is rising, the raw bound is used immediately and is projected 30 seconds forward.
+Three ways a scale-up is allowed. The orchestrator logs which one fired (`rule=...` on the orchestrator pod, and `scale_rule` on `/api/target/status`):
+
+- `forecast-persistence` — the forecast **mean** (not the upper bound) has stayed above the current fleet's capacity for `PRESCALE_PERSIST_TICKS` (default 3). This is the pre-scale. Live RPS can still be flat.
+- `forecast-margin` — a smoothed lead (mean minus live RPS, capped at `PRESCALE_MARGIN_CAP_RPS`, default 40) pushes the smoothed mean over current capacity. The cap is far below one pod, so an idle mean near 70 cannot clear 200.
+- `slope` — live RPS is rising at least `RISING_SLOPE_RPS` (default 2 RPS/s). The raw upper bound is used on that same tick and projected `FORECAST_LEAD_SECONDS` (default 30) forward.
+- `idle-guard` — none of the above. The noisy upper bound is capped at live RPS + `FLAT_HEADROOM_RPS` (default 50).
+
+At idle the upper bound is `mean + z * std` (the error term is zero while live RPS is below the mean). Monte Carlo dropout redraws `std` every tick, and that draw is also a DQN input, so `z` moves with it. The bound jumps through roughly 180-440 RPS with almost no traffic. That jump is what `idle-guard` ignores. The dashboard still shows it. The mean is what pre-scale trusts, and only after it holds.
+
+The original LSTM was trained on hourly samples and is served 24 seconds of live traffic, so it does not know this ramp. Pre-scale only leads if you load the NASA fine-tune (`MODEL_DIR`). Until then the mean will not clear 200 RPS ahead of the replay, and scale-up falls back to `slope`.
 
 ## 1. Azure (AKS)
 
@@ -150,16 +159,55 @@ minikube service -n capstone nginx-lb --url
 
 `minikube tunnel` (separate terminal, often needs sudo) is the other way to materialize LoadBalancer addresses. Load generation is the same `./deploy/load_gen.sh`.
 
+## Retrain on the NASA trace
+
+The forecaster has to see the ramp at 1-second cadence. `services/load-predictor/data/nasa_per_minute.csv` is the public NASA-KSC minute counts (Jul-Aug 1995). `finetune_nasa.py` drops the outage zeros from 1995-08-01 14:52 through 1995-08-03 04:36, smooths 7 minutes, compresses time 40x (one demo second per 40 real seconds), and scales the trace so the peak is 750 RPS. That peak is the 13 July morning, which is also `deploy/nasa_demo_window_10min.csv`. Training holds out 13 July, 20 July, 10 August, and 17 August. The target is RPS 30 seconds ahead, not the next second.
+
+This does not overwrite `models/lstm_weights.pth`. Output goes to `models/nasa/`. CPU, a few GB of RAM, a few minutes to well under an hour.
+
+Windows, from `services\load-predictor`:
+
+```powershell
+py -3 -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+py -3 -m pip install numpy
+py -3 finetune_nasa.py --trace data\nasa_per_minute.csv --base-weights models\lstm_weights.pth --base-stats models\training_stats.json --out-dir models\nasa --epochs 6 --batch-size 256
+```
+
+Linux is the same command with `python3` and forward slashes. The script prints held-out MAE, RMSE, and median lead time (seconds before live RPS crosses 200, 400, and 600) for the new weights and for the original hourly weights. A shift of the real series by 30 seconds is the ceiling. Rising windows are up-weighted, and a stretched copy of them is added so the mean can pass the training-day peak (about 360 RPS) and cover this morning.
+
+`services/load-predictor/models/nasa/` is that command, already run on CPU (6 epochs, batch 256). Held-out median lead: **23.5s** before 200 RPS, **18s** before 400, **24s** before 600. The original hourly weights on the same days led by **-6s** at 200 RPS and never reached 400 or 600. MAE 38 versus 63, RMSE 57 versus 97. Fraction of quiet seconds (under 80 RPS) whose forecast exceeded 200 was 0. `models/lstm_weights.pth` was not modified. The predictor manifest sets `MODEL_DIR=/app/models/nasa`. Re-running the command replaces that directory; it does not touch the original files.
+
+The DQN only picks the z-score. Retrain it on the same trace if you want, into a new file. Do not point the server at it until that command has finished:
+
+```powershell
+py -3 finetune_rl_nasa.py --trace data\nasa_per_minute.csv --base-checkpoint models\rl_agent_checkpoint.pth --out models\nasa\rl_agent_checkpoint.pth --episodes 20 --max-steps 8000
+```
+
+Rebuild the predictor image so `models/nasa` is in it, then set `MODEL_DIR=/app/models/nasa` on the predictor Deployment. `training_stats.json` in that directory has `"forecast_source": "lstm"`, which makes the published mean the horizon forecast. Leaving `MODEL_DIR` unset keeps the original hourly weights. Rebuild the orchestrator image as well: the pre-scale rule is in that binary.
+
+## Replay the morning
+
+About 10 minutes, looped 3 times (30 minutes). Have the dashboard and `kubectl get pods -l app=target-app -w` up first.
+
+```bash
+./deploy/load_gen.sh --replay
+```
+
+```powershell
+.\deploy\load_gen.ps1 -Replay
+```
+
+`k8s/06-loadgen-job.yaml` is still the short Locust spike. The replay is `k8s/07-nasa-replay-job.yaml` (python:3.12-slim, not part of `kubectl apply -k`).
+
 ## What to say, what to show
 
-About four minutes. Have the dashboard and `kubectl get pods -l app=target-app -w` visible before you start Locust.
-
-1. **Idle.** "One pod is the warm floor. The upper bound on the chart can jump even though almost nothing is arriving. That is dropout noise in the uncertainty, not a traffic forecast. Desired replicas stays at 1 until requests per second actually turn up."
-2. **Start the load job.** "Locust is inside the cluster, hitting the storefront through nginx. The orchestrator reads nginx's request counter, not the active-connection line, so this RPS is real."
-3. **As the curve climbs.** "Desired replicas moves with the upper bound, and the slope is projected about 30 seconds forward. That is the pod start time. New pods show up in kubectl while requests per second is still rising. Readiness probes keep them out of the Service until `/health` passes."
-4. **At the top.** "Each pod is budgeted at 200 RPS. The count is that forecast divided across pods, plus one extra pod only when the fleet would be fully saturated. It will not jump to 10 unless the forecast actually needs 10."
-5. **After Locust eases off.** "Desired drops right away. The running count does not. Scale-down waits 45 seconds and then removes one pod at a time, so we do not go from a full fleet back to one pod in a single second. `preStop` sleeps five seconds so nginx can finish in-flight requests."
-6. **Close on the dashboard numbers.** Point at current RPS, upper bound, current replicas, desired replicas. If you want the raw JSON: the dashboard's `/api/orchestrator/api/target/status`.
+1. **Idle, before the replay.** "One pod is the warm floor. The upper bound on the chart can jump even though almost nothing is arriving. That is dropout noise. Desired replicas stays at 1. The log line would say `rule=idle-guard`."
+2. **Start the replay.** "This is a real NASA morning, sped up 40 times. The orchestrator counts nginx requests, not the active-connection line."
+3. **Before live RPS crosses 200.** Point at the forecast-mean line sitting above the live line, and at desired replicas moving to 2 while live RPS is still under 200. "The mean stayed over one pod's capacity for a few seconds, so this is `rule=forecast-persistence`, not a reaction to the slope. The pod is requested before the load is being served." Orchestrator log: `kubectl logs -n capstone -l app=orchestrator --tail=30`.
+4. **If the ramp is already steep.** "`rule=slope` still scales on the same tick. We did not add a wait in front of a real rise."
+5. **At the top.** "Each pod is budgeted at 200 RPS, cap 10."
+6. **After the morning falls.** "Desired drops right away. The running count does not. Scale-down waits 45 seconds and then removes one pod at a time."
+7. **Close on the numbers.** Gateway RPS, the "forecast leads by" line, desired replicas, and `scale_rule`. Raw JSON: the dashboard's `/api/orchestrator/api/target/status` (`forecast_lead_rps`, `scale_rule`, `raw_ml_mean`, `current_rps`).
 
 If a pod stays in `ImagePullBackOff` on AKS, the registry was not attached or the overlay was not applied. Re-run `./deploy/deploy_aks.sh`; it attaches the registry again and rewrites image names to `<acr>.azurecr.io/...`. `capstone/<name>:latest` is only for kind and minikube.
 
@@ -172,4 +220,4 @@ python scripts/prep_load_test_stock.py
 python scripts/demo_rehearsal.py --runs 1
 ```
 
-The compose orchestrator does not run the Kubernetes monitor, so it does not fight the simulator for the predictor's z-score. Model weights are unchanged.
+The compose orchestrator does not run the Kubernetes monitor, so it does not fight the simulator for the predictor's z-score. It also does not set `MODEL_DIR`, so that path still uses the original hourly weights.

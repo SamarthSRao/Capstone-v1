@@ -52,6 +52,8 @@ function mapOrchestratorStatus(data) {
     std_dev: data.std_dev,
     raw_ml_mean: data.raw_ml_mean,
     error_ratio: data.error_ratio,
+    forecast_lead_rps: data.forecast_lead_rps,
+    scale_rule: data.scale_rule || '',
     source: 'orchestrator',
   };
 }
@@ -187,6 +189,7 @@ const SimulationControlPanel = ({
   selected,
   setSelected,
   onSimulationStarted,
+  latest,
 }) => {
   const [localStatus, setLocalStatus] = useState(
     latestStatus || 'IDLE'
@@ -315,8 +318,16 @@ const SimulationControlPanel = ({
         </div>
         <div style={{ fontSize: 12, color: '#A1A1AA', lineHeight: 1.5 }}>
           Reading RPS, forecast, upper bound, and current/desired replicas from the orchestrator.
-          Generate load with deploy/load_gen.sh (or the in-cluster loadgen Job) against the target app.
-          There is no simulator in this mode.
+          The NASA replay is deploy/load_gen.sh --replay. There is no simulator in this mode.
+        </div>
+        <div style={{ fontSize: 13, color: '#E7E6D9', marginTop: 12, lineHeight: 1.5 }}>
+          Forecast mean {Math.round(latest?.rawMlMean ?? latest?.predictedMean ?? 0).toLocaleString()} RPS
+          {' · '}
+          live {Math.round(latest?.actualRPS ?? 0).toLocaleString()} RPS
+          {Number(latest?.forecastLeadRPS) > 15
+            ? ` · forecast leads by ${Math.round(latest.forecastLeadRPS)} RPS`
+            : ''}
+          {latest?.scaleRule ? ` · rule ${latest.scaleRule}` : ''}
         </div>
       </div>
     );
@@ -1005,6 +1016,13 @@ const Dashboard = () => {
             'rawMlMean'
           );
 
+        const forecastLeadRPS = toNumber(
+          data.forecast_lead_rps ?? data.forecastLeadRPS,
+          rawMlMean != null ? rawMlMean - actualRPS : 0
+        );
+
+        const scaleRule = data.scale_rule ?? data.scaleRule ?? '';
+
         const zScore = toNumber(
           data.z_score ?? data.zScore
         );
@@ -1107,6 +1125,10 @@ const Dashboard = () => {
           bandWidth,
 
           rawMlMean,
+
+          forecastLeadRPS,
+
+          scaleRule,
 
           zScore,
 
@@ -1502,6 +1524,7 @@ const Dashboard = () => {
           onSimulationStarted={
             handleSimulationStarted
           }
+          latest={latest}
         />
 
         {/* ====================================================
@@ -1522,7 +1545,9 @@ const Dashboard = () => {
                 ).toLocaleString(),
 
               sub:
-                'Requests/sec',
+                Number(latest?.forecastLeadRPS) > 15
+                  ? `Forecast leads by ${Math.round(latest.forecastLeadRPS)} RPS`
+                  : 'Requests/sec',
 
               icon:
                 Activity,
@@ -1586,7 +1611,9 @@ const Dashboard = () => {
                   : '—',
 
               sub:
-                'Forecast target',
+                latest?.scaleRule
+                  ? `rule ${latest.scaleRule}`
+                  : 'Forecast target',
 
               icon:
                 Server,
@@ -1880,7 +1907,7 @@ const Dashboard = () => {
                     strokeWidth={2}
                     strokeDasharray="8 4"
                     dot={false}
-                    name="Raw ML Forecast"
+                    name="Forecast mean"
                     connectNulls={false}
                     isAnimationActive={false}
                   />

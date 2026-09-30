@@ -11,12 +11,17 @@
 
       .\deploy\load_gen.ps1 -Url http://<NGINX-IP>:8090
 
+    NASA morning, about 10 minutes looped 3 times:
+
+      .\deploy\load_gen.ps1 -Replay
+
     ASCII only for Windows PowerShell 5.1.
 #>
 [CmdletBinding()]
 param (
     [string]$Url = "",
-    [string]$Namespace = "capstone"
+    [string]$Namespace = "capstone",
+    [switch]$Replay
 )
 
 $ErrorActionPreference = "Stop"
@@ -61,6 +66,25 @@ if ($Url) {
 }
 
 $root = Split-Path -Parent $PSScriptRoot
+if ($Replay) {
+    $jobFile = Join-Path $root "k8s/07-nasa-replay-job.yaml"
+    Write-Host "Applying NASA replay Job in namespace $Namespace"
+    kubectl delete job nasa-replay -n $Namespace --ignore-not-found
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "WARNING: kubectl delete job returned $LASTEXITCODE (continuing)"
+    }
+    kubectl apply -f $jobFile
+    Assert-Exit "kubectl apply nasa-replay"
+    Write-Host "Watch pods: kubectl get pods -n $Namespace -l app=target-app -w"
+    kubectl wait -n $Namespace --for=condition=ready pod -l app=nasa-replay --timeout=180s
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "nasa-replay pod was not Ready within 180s; dumping pods"
+        kubectl get pods -n $Namespace -o wide
+        exit $LASTEXITCODE
+    }
+    kubectl logs -n $Namespace -l app=nasa-replay -f --tail=20
+    exit 0
+}
 $jobFile = Join-Path $root "k8s/06-loadgen-job.yaml"
 Write-Host "Applying in-cluster Locust job in namespace $Namespace"
 kubectl delete job loadgen -n $Namespace --ignore-not-found

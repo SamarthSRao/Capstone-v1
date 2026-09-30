@@ -146,10 +146,140 @@ func (g ForecastGuard) normalized() ForecastGuard {
 	return g
 }
 
-// actionableForecast is the arrival rate the actuator may scale on.
-// upperBound is the model's raw bound and is still what the dashboard shows.
-// A flat series keeps the actionable rate within FlatHeadroomRPS of live RPS.
-// A rising series trusts the bound at once and may project it across lead.
+// Rule names are logged on every scale action and returned on the status JSON.
+// idle-guard and slope describe the noisy upper bound. The forecast-* rules
+// describe the mean, which is allowed to add pods while live RPS is still flat.
+const (
+	ruleIdleGuard   = "idle-guard"
+	ruleSlope       = "slope"
+	rulePersistence = "forecast-persistence"
+	ruleMargin      = "forecast-margin"
+)
+
+// PrescaleConfig is the mean-based path. It does not cap that path with
+// FLAT_HEADROOM_RPS; that cap stays on the upper bound only.
+//
+// PersistTicks is how long the raw forecast mean must sit above current
+// capacity before it is trusted. MarginCapRPS is the most the smoothed
+// lead (mean minus live RPS) may add, and it has to stay well below the
+// per-pod rate or an idle mean near 70 RPS would clear 200. SmoothAlpha
+// is the EMA weight. A single spiked mean sample therefore cannot cross
+// a pod boundary from a quiet baseline.
+type PrescaleConfig struct {
+	PersistTicks int
+	MarginCapRPS float64
+	SmoothAlpha  float64
+}
+
+func (c PrescaleConfig) normalized() PrescaleConfig {
+	if c.PersistTicks < 1 {
+		c.PersistTicks = 3
+	}
+	if c.MarginCapRPS < 0 || math.IsNaN(c.MarginCapRPS) {
+		c.MarginCapRPS = 0
+	}
+	if c.SmoothAlpha <= 0 || c.SmoothAlpha > 1 || math.IsNaN(c.SmoothAlpha) {
+		c.SmoothAlpha = 0.2
+	}
+	return c
+}
+
+// PrescaleState is the memory across ticks: how long the mean has been
+// above capacity, and the smoothed mean and lead margin.
+type PrescaleState struct {
+	AboveCapacity int
+	MeanEMA       float64
+	MarginEMA     float64
+	primed        bool
+}
+
+// ScaleSignal is the arrival rate the actuator may turn into a replica count,
+// and which rule produced it.
+type ScaleSignal struct {
+	Lambda float64
+	Rule   string
+}
+
+// decideScaleRate combines the upper-bound guard with mean pre-scaling.
+//
+// The upper bound is still capped at live RPS + headroom while the slope is
+// flat, because Monte Carlo dropout redraws std every call. The forecast
+// mean is a different signal: once it has stayed above current capacity for
+// PersistTicks, or the smoothed mean plus a capped lead margin clears that
+// capacity, pods are added even if live RPS has not started climbing.
+// Capacity is the current fleet times the per-pod service rate.
+func decideScaleRate(upperBound, mean, currentRPS, slopePerSec, capacity float64, lead time.Duration, guard ForecastGuard, cfg PrescaleConfig, state *PrescaleState) ScaleSignal {
+	guard = guard.normalized()
+	cfg = cfg.normalized()
+	if state == nil {
+		state = &PrescaleState{}
+	}
+	if currentRPS < 0 || math.IsNaN(currentRPS) {
+		currentRPS = 0
+	}
+	if slopePerSec < 0 || math.IsNaN(slopePerSec) {
+		slopePerSec = 0
+	}
+	if math.IsNaN(mean) || mean < 0 {
+		mean = 0
+	}
+	if math.IsNaN(capacity) || capacity < 0 {
+		capacity = 0
+	}
+
+	upperLambda := actionableForecast(upperBound, currentRPS, slopePerSec, lead, guard)
+	upperRule := ruleIdleGuard
+	if slopePerSec >= guard.RisingSlope {
+		upperRule = ruleSlope
+	}
+
+	// Prime from live RPS, not from the first mean. A cold start on a
+	// spiked sample would otherwise look like a sustained forecast.
+	if !state.primed {
+		state.MeanEMA = currentRPS
+		state.MarginEMA = 0
+		state.primed = true
+	}
+	alpha := cfg.SmoothAlpha
+	state.MeanEMA = alpha*mean + (1-alpha)*state.MeanEMA
+	gap := mean - currentRPS
+	if gap < 0 {
+		gap = 0
+	}
+	if gap > cfg.MarginCapRPS {
+		gap = cfg.MarginCapRPS
+	}
+	state.MarginEMA = alpha*gap + (1-alpha)*state.MarginEMA
+
+	if mean > capacity {
+		state.AboveCapacity++
+	} else {
+		state.AboveCapacity = 0
+	}
+
+	meanOK := false
+	meanLambda := 0.0
+	meanRule := ""
+	if state.AboveCapacity >= cfg.PersistTicks {
+		meanLambda = leadAdjustedLambda(mean, currentRPS, slopePerSec, lead)
+		meanRule = rulePersistence
+		meanOK = true
+	} else if state.MeanEMA+state.MarginEMA > capacity && state.MarginEMA > 0 {
+		meanLambda = state.MeanEMA + state.MarginEMA
+		meanRule = ruleMargin
+		meanOK = true
+	}
+
+	if meanOK && meanLambda >= upperLambda {
+		return ScaleSignal{Lambda: meanLambda, Rule: meanRule}
+	}
+	return ScaleSignal{Lambda: upperLambda, Rule: upperRule}
+}
+
+// actionableForecast is the arrival rate the upper bound may scale on.
+// It is still what a flat series is capped to. The mean path does not call
+// this cap. A rising series trusts the bound at once and may project it
+// across lead.
 func actionableForecast(upperBound, currentRPS, slopePerSec float64, lead time.Duration, guard ForecastGuard) float64 {
 	guard = guard.normalized()
 	if currentRPS < 0 || math.IsNaN(currentRPS) {

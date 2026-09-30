@@ -53,7 +53,14 @@ out/
 
 # Data and Models
 *.csv
+# The NASA minute trace and the 10-minute demo window are inputs, not outputs.
+!services/load-predictor/data/*.csv
+!deploy/nasa_demo_window_10min.csv
 *.pth
+# NASA fine-tune only. The original checkpoints stay matched by the
+# services/load-predictor/models/* exception above this block's *.pth,
+# and this line re-includes the new directory.
+!services/load-predictor/models/nasa/*.pth
 *.pkl
 *.joblib
 *.model

@@ -111,6 +111,8 @@ type Orchestrator struct {
 	leadTime      time.Duration
 	scalePolicy   ScalePolicy
 	forecastGuard ForecastGuard
+	prescaleCfg   PrescaleConfig
+	prescaleState PrescaleState
 }
 
 func (o *Orchestrator) DecideScaling(history []float32, currentSLA float32, currentWasted float32) (int, *pb.PredictionResponse, error) {
@@ -263,6 +265,8 @@ type TargetStatus struct {
 	PredictedUpper  float32   `json:"predicted_upper"`
 	PredictedLower  float32   `json:"predicted_lower"`
 	RawMlMean       float32   `json:"raw_ml_mean"`
+	ForecastLeadRPS float64   `json:"forecast_lead_rps"`
+	ScaleRule       string    `json:"scale_rule"`
 	StdDev          float32   `json:"std_dev"`
 	ZScore          float32   `json:"z_score"`
 	ErrorRatio      float32   `json:"error_ratio"`
@@ -553,13 +557,17 @@ func startTargetAppMonitor(orch *Orchestrator) {
 			continue
 		}
 
-		// Act on the upper bound only when live RPS is rising. A flat series
-		// caps it near the observed rate so MC-dropout / z-score spikes at
-		// ~1 RPS cannot add a pod. The dashboard still shows the raw bound.
+		// Upper-bound noise is capped while RPS is flat. A forecast mean that
+		// stays above the current fleet's capacity is not: that is the
+		// pre-scale. scaleRule is idle-guard, slope, forecast-persistence,
+		// or forecast-margin.
+		scaleRule := ruleIdleGuard
 		if orch.capacityModel {
 			slope := recentSlope(history, 10)
-			lambda := actionableForecast(float64(predResp.UpperBound), currentRPS, slope, orch.leadTime, orch.forecastGuard)
-			servers = ReplicasForLoad(lambda, orch.serviceRate, orch.minReplicas, orch.maxReplicas)
+			capacity := float64(currentReplicas) * orch.serviceRate
+			signal := decideScaleRate(float64(predResp.UpperBound), float64(predResp.RawMlMean), currentRPS, slope, capacity, orch.leadTime, orch.forecastGuard, orch.prescaleCfg, &orch.prescaleState)
+			scaleRule = signal.Rule
+			servers = ReplicasForLoad(signal.Lambda, orch.serviceRate, orch.minReplicas, orch.maxReplicas)
 		}
 
 		decision := applyScalePolicy(currentReplicas, servers, now.Sub(lastScaleChange), orch.scalePolicy)
@@ -576,10 +584,11 @@ func startTargetAppMonitor(orch *Orchestrator) {
 				currentReplicas = updated
 				lastScaleChange = now
 				if decision.Direction == "up" {
-					eventMsg = fmt.Sprintf("Forecast ahead of load (%.0f RPS, upper %.0f): scaled %d -> %d replicas", currentRPS, predResp.UpperBound, from, currentReplicas)
+					eventMsg = fmt.Sprintf("rule=%s forecast %.0f live %.0f upper %.0f: scaled %d -> %d replicas", scaleRule, predResp.RawMlMean, currentRPS, predResp.UpperBound, from, currentReplicas)
 				} else {
-					eventMsg = fmt.Sprintf("Traffic subsided (%.0f RPS): stepped down %d -> %d replicas", currentRPS, from, currentReplicas)
+					eventMsg = fmt.Sprintf("rule=%s traffic %.0f RPS: stepped down %d -> %d replicas", scaleRule, currentRPS, from, currentReplicas)
 				}
+				log.Printf("[Target Monitor] %s", eventMsg)
 			}
 		}
 
@@ -604,6 +613,8 @@ func startTargetAppMonitor(orch *Orchestrator) {
 		targetStatus.PredictedUpper = predResp.UpperBound
 		targetStatus.PredictedLower = predResp.LowerBound
 		targetStatus.RawMlMean = predResp.RawMlMean
+		targetStatus.ForecastLeadRPS = float64(predResp.RawMlMean) - currentRPS
+		targetStatus.ScaleRule = scaleRule
 		targetStatus.StdDev = predResp.StdDev
 		targetStatus.ZScore = predResp.ZScore
 		targetStatus.ErrorRatio = predResp.ErrorRatio
@@ -715,6 +726,13 @@ func main() {
 		FlatHeadroomRPS: envFloat("FLAT_HEADROOM_RPS", 50),
 		RisingSlope:     envFloat("RISING_SLOPE_RPS", 2),
 	}.normalized()
+	// Margin cap stays far below one pod (200 RPS). An idle forecast mean
+	// near 70 plus this margin cannot clear current capacity by itself.
+	prescale := PrescaleConfig{
+		PersistTicks: envInt("PRESCALE_PERSIST_TICKS", 3),
+		MarginCapRPS: envFloat("PRESCALE_MARGIN_CAP_RPS", 40),
+		SmoothAlpha:  envFloat("PRESCALE_SMOOTH_ALPHA", 0.2),
+	}.normalized()
 	policy := ScalePolicy{
 		MinReplicas:            minReplicas,
 		MaxReplicas:            maxReplicas,
@@ -734,6 +752,7 @@ func main() {
 		leadTime:        leadTime,
 		scalePolicy:     policy,
 		forecastGuard:   guard,
+		prescaleCfg:     prescale,
 	}
 	if v := os.Getenv("SLA_THRESHOLD"); v != "" {
 		if parsed, perr := strconv.ParseFloat(v, 64); perr == nil && parsed > 0 && parsed < 1 {
@@ -741,8 +760,8 @@ func main() {
 		}
 	}
 
-	log.Printf("[Orchestrator] predictor=%s capacity_model=%v service_rate=%.0f rps/replica replicas=[%d,%d] lead=%s scale_down=%s step=%d flat_headroom=%.0f rising_slope=%.1f autonomous=%v",
-		predictorAddr, capacityModel, serviceRate, policy.MinReplicas, policy.MaxReplicas, leadTime, policy.ScaleDownStabilization, policy.ScaleDownStep, guard.FlatHeadroomRPS, guard.RisingSlope, autonomousScalerEnabled())
+	log.Printf("[Orchestrator] predictor=%s capacity_model=%v service_rate=%.0f rps/replica replicas=[%d,%d] lead=%s scale_down=%s step=%d flat_headroom=%.0f rising_slope=%.1f prescale_ticks=%d margin_cap=%.0f autonomous=%v",
+		predictorAddr, capacityModel, serviceRate, policy.MinReplicas, policy.MaxReplicas, leadTime, policy.ScaleDownStabilization, policy.ScaleDownStep, guard.FlatHeadroomRPS, guard.RisingSlope, prescale.PersistTicks, prescale.MarginCapRPS, autonomousScalerEnabled())
 
 	// On AKS this is the only GetPrediction caller, so the DQN sees one
 	// stream of SLA/waste feedback. Local compose leaves it off and uses /scale.

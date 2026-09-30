@@ -20,6 +20,11 @@ spec:
         - name: predictor
           image: capstone/predictor:latest
           imagePullPolicy: IfNotPresent
+          env:
+            # Horizon forecast trained on the compressed NASA trace.
+            # Delete this env to fall back to the original hourly weights.
+            - name: MODEL_DIR
+              value: /app/models/nasa
           ports:
             - containerPort: 50051
               name: grpc

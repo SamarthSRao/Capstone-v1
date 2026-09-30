@@ -28,6 +28,7 @@ from models.xgboost_residuals import XGBoostResidualModel
 from models.hybrid_mlp import HybridMLPFusion
 from rl_agent import RLAgent
 from bounds import uncertainty_bounds
+from nasa_trace import select_forecast_mean
 
 class PredictorService(predictor_pb2_grpc.PredictorServicer):
     def __init__(self):
@@ -50,14 +51,19 @@ class PredictorService(predictor_pb2_grpc.PredictorServicer):
         self.rl_agent = RLAgent(state_size=7, action_size=5)
         self.rl_agent.epsilon = 0.0 # Inference mode
         
-        # Load weights and stats
-        models_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), 'models'))
+        # Load weights and stats. MODEL_DIR selects a fine-tune (for example
+        # models/nasa from finetune_nasa.py). Unset, this is the original
+        # hourly checkpoint directory and nothing there is overwritten.
+        models_dir = os.environ.get('MODEL_DIR') or os.path.join(os.path.dirname(__file__), 'models')
+        models_dir = os.path.abspath(models_dir)
+        self.forecast_source = 'fusion'
         try:
             with open(os.path.join(models_dir, 'training_stats.json'), 'r') as f:
                 self.stats = json.load(f)
             self.mean_train = self.stats.get('mean_train', 0.0)
             self.std_train = self.stats.get('std_train', 1.0)
-            print("Loaded training stats.")
+            self.forecast_source = self.stats.get('forecast_source', 'fusion')
+            print("Loaded training stats from", models_dir, "forecast_source=", self.forecast_source)
         except Exception as e:
             print("Could not load training stats:", e)
             self.mean_train = 0.0
@@ -178,14 +184,20 @@ class PredictorService(predictor_pb2_grpc.PredictorServicer):
             xgb_residual = 0.0
             
         # --- Fusion ---
+        # The hourly ensemble is the default. A NASA fine-tune sets
+        # forecast_source=lstm in its own training_stats.json: the published
+        # mean is then the LSTM's horizon forecast. Wall-clock hour (what
+        # this request carries) is not the 1995 hour, so the seasonality
+        # model must not be blended into that mean.
         try:
             fusion_input = torch.FloatTensor([[lstm_mean, season_pred, season_pred + xgb_residual]]).to(self.device)
             self.fusion.eval()
             with torch.no_grad():
-                mean = float(self.fusion(fusion_input)[0][0])
+                fusion_mean = float(self.fusion(fusion_input)[0][0])
         except Exception:
-            mean = lstm_mean
-            
+            fusion_mean = lstm_mean
+        mean = select_forecast_mean(lstm_mean, fusion_mean, getattr(self, 'forecast_source', 'fusion'))
+
         # True ML inference only (no reactive overrides)
         mean = max(0.0, mean)
         raw_ml_mean = mean

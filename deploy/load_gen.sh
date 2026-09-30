@@ -10,18 +10,28 @@
 #
 #   ./deploy/load_gen.sh --url http://<NGINX-IP>:8090
 #
+# NASA morning, time-compressed to about 10 minutes and looped 3 times, so the
+# forecast can rise before live RPS crosses 200 per pod:
+#
+#   ./deploy/load_gen.sh --replay
+#
 # Re-running deletes the previous Job first. Jobs are immutable.
 
 set -euo pipefail
 
 NAMESPACE="${NAMESPACE:-capstone}"
 URL=""
+REPLAY=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --url)
       URL="${2:-}"
       shift 2
+      ;;
+    --replay)
+      REPLAY=1
+      shift
       ;;
     --namespace)
       NAMESPACE="${2:-}"
@@ -39,6 +49,18 @@ while [ $# -gt 0 ]; do
 done
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+if [ "$REPLAY" = "1" ]; then
+  echo "Applying NASA replay Job in namespace $NAMESPACE (about 10 minutes, looped 3 times)"
+  kubectl delete job nasa-replay -n "$NAMESPACE" --ignore-not-found
+  kubectl apply -f "$ROOT/k8s/07-nasa-replay-job.yaml"
+  echo "Following logs (Ctrl-C stops following; the Job keeps running)."
+  echo "Watch pods: kubectl get pods -n $NAMESPACE -l app=target-app -w"
+  echo "Scale rule: kubectl logs -n $NAMESPACE -l app=orchestrator --tail=20"
+  kubectl wait -n "$NAMESPACE" --for=condition=ready pod -l app=nasa-replay --timeout=180s || true
+  kubectl logs -n "$NAMESPACE" -l app=nasa-replay -f --tail=20 || true
+  exit 0
+fi
 
 if [ -n "$URL" ]; then
   if ! command -v curl >/dev/null 2>&1; then

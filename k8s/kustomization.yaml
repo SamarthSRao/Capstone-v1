@@ -4,8 +4,9 @@ kind: Kustomization
 # Local kind/minikube images are named capstone/<component>:latest and are
 # loaded into the cluster (imagePullPolicy IfNotPresent). AKS rewrites these
 # names to <acr>.azurecr.io/<component>:latest via a generated overlay in
-# deploy/deploy_aks.sh and deploy/deploy_aks.ps1. The load generator is
-# applied separately (k8s/06-loadgen-job.yaml) so a deploy does not start traffic.
+# deploy/deploy_aks.sh and deploy/deploy_aks.ps1. Load generators are
+# applied separately (k8s/06-loadgen-job.yaml, k8s/07-nasa-replay-job.yaml)
+# so a deploy does not start traffic.
 resources:
   - 00-namespace.yaml
   - 01-rbac.yaml

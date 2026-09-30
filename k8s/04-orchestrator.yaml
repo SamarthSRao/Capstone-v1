@@ -47,6 +47,15 @@ spec:
               value: "50"
             - name: RISING_SLOPE_RPS
               value: "2"
+            # Pre-scale on the forecast mean, not the noisy upper bound.
+            # Three ticks above current capacity, or a smoothed lead margin
+            # of at most 40 RPS (well under one 200 RPS pod).
+            - name: PRESCALE_PERSIST_TICKS
+              value: "3"
+            - name: PRESCALE_MARGIN_CAP_RPS
+              value: "40"
+            - name: PRESCALE_SMOOTH_ALPHA
+              value: "0.2"
             - name: CAPACITY_MODEL
               value: "true"
             # Warm floor. Never scale to zero; raise to 2 to keep a spare pod hot.
