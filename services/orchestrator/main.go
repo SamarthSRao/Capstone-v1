@@ -557,13 +557,14 @@ func startTargetAppMonitor(orch *Orchestrator) {
 			continue
 		}
 
-		// Upper-bound noise is capped while RPS is flat. A forecast mean that
-		// stays above the current fleet's capacity is not: that is the
-		// pre-scale. scaleRule is idle-guard, slope, forecast-persistence,
-		// or forecast-margin.
+		// Upper-bound noise stays inside the idle cap. A scale-up comes from
+		// the forecast mean, from live RPS once it crosses capacity, or from
+		// a slope that has held while the smoothed rate is already near
+		// capacity. scaleRule is idle-guard, slope, live-capacity,
+		// forecast-persistence, or forecast-margin.
 		scaleRule := ruleIdleGuard
 		if orch.capacityModel {
-			slope := recentSlope(history, 10)
+			slope := recentSlope(history, orch.prescaleCfg.SlopeWindow)
 			capacity := float64(currentReplicas) * orch.serviceRate
 			signal := decideScaleRate(float64(predResp.UpperBound), float64(predResp.RawMlMean), currentRPS, slope, capacity, orch.leadTime, orch.forecastGuard, orch.prescaleCfg, &orch.prescaleState)
 			scaleRule = signal.Rule
@@ -724,14 +725,21 @@ func main() {
 	// bound of a few hundred RPS cannot by itself request a second pod.
 	guard := ForecastGuard{
 		FlatHeadroomRPS: envFloat("FLAT_HEADROOM_RPS", 50),
-		RisingSlope:     envFloat("RISING_SLOPE_RPS", 2),
+		RisingSlope:     envFloat("RISING_SLOPE_RPS", 5),
+		RisingFraction:  envFloat("RISING_SLOPE_FRACTION", 0.01),
 	}.normalized()
-	// Margin cap stays far below one pod (200 RPS). An idle forecast mean
-	// near 70 plus this margin cannot clear current capacity by itself.
+	// Margin cap and slope headroom stay far below one pod (200 RPS).
+	// An idle forecast mean near 70 plus that margin cannot clear capacity,
+	// and a slope scale-up is sized from the live extrapolation, not the
+	// raw upper bound.
 	prescale := PrescaleConfig{
-		PersistTicks: envInt("PRESCALE_PERSIST_TICKS", 3),
-		MarginCapRPS: envFloat("PRESCALE_MARGIN_CAP_RPS", 40),
-		SmoothAlpha:  envFloat("PRESCALE_SMOOTH_ALPHA", 0.2),
+		PersistTicks:     envInt("PRESCALE_PERSIST_TICKS", 3),
+		MarginCapRPS:     envFloat("PRESCALE_MARGIN_CAP_RPS", 40),
+		SmoothAlpha:      envFloat("PRESCALE_SMOOTH_ALPHA", 0.2),
+		SlopeSustain:     envInt("SLOPE_SUSTAIN_TICKS", 3),
+		SlopeWindow:      envInt("SLOPE_WINDOW_TICKS", 15),
+		CapacityFraction: envFloat("CAPACITY_FRACTION", 0.70),
+		SlopeHeadroom:    envFloat("SLOPE_HEADROOM_RPS", 40),
 	}.normalized()
 	policy := ScalePolicy{
 		MinReplicas:            minReplicas,
@@ -760,8 +768,8 @@ func main() {
 		}
 	}
 
-	log.Printf("[Orchestrator] predictor=%s capacity_model=%v service_rate=%.0f rps/replica replicas=[%d,%d] lead=%s scale_down=%s step=%d flat_headroom=%.0f rising_slope=%.1f prescale_ticks=%d margin_cap=%.0f autonomous=%v",
-		predictorAddr, capacityModel, serviceRate, policy.MinReplicas, policy.MaxReplicas, leadTime, policy.ScaleDownStabilization, policy.ScaleDownStep, guard.FlatHeadroomRPS, guard.RisingSlope, prescale.PersistTicks, prescale.MarginCapRPS, autonomousScalerEnabled())
+	log.Printf("[Orchestrator] predictor=%s capacity_model=%v service_rate=%.0f rps/replica replicas=[%d,%d] lead=%s scale_down=%s step=%d flat_headroom=%.0f rising_slope=%.1f rising_frac=%.3f slope_sustain=%d slope_window=%d capacity_frac=%.2f slope_headroom=%.0f prescale_ticks=%d margin_cap=%.0f autonomous=%v",
+		predictorAddr, capacityModel, serviceRate, policy.MinReplicas, policy.MaxReplicas, leadTime, policy.ScaleDownStabilization, policy.ScaleDownStep, guard.FlatHeadroomRPS, guard.RisingSlope, guard.RisingFraction, prescale.SlopeSustain, prescale.SlopeWindow, prescale.CapacityFraction, prescale.SlopeHeadroom, prescale.PersistTicks, prescale.MarginCapRPS, autonomousScalerEnabled())
 
 	// On AKS this is the only GetPrediction caller, so the DQN sees one
 	// stream of SLA/waste feedback. Local compose leaves it off and uses /scale.

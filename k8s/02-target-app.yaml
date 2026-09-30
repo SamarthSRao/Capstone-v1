@@ -5,13 +5,21 @@ metadata:
   namespace: capstone
 data:
   nginx.conf: |
+    # One worker is enough on a 2 vCPU node. Access logs are off so 800 RPS
+    # is not spent formatting lines. Keepalive to the storefront avoids a
+    # new upstream TCP handshake per request.
+    worker_processes 1;
     events {
-        worker_connections 2048;
+        worker_connections 4096;
+        multi_accept on;
     }
     http {
+        access_log off;
+        keepalive_timeout 65;
         upstream target_backend {
             least_conn;
             server target-app:8080 max_fails=3 fail_timeout=5s;
+            keepalive 64;
         }
         server {
             listen 8090;
@@ -22,6 +30,8 @@ data:
             }
             location / {
                 proxy_pass http://target_backend;
+                proxy_http_version 1.1;
+                proxy_set_header Connection "";
                 proxy_set_header Host $host;
                 proxy_set_header X-Real-IP $remote_addr;
                 proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
@@ -150,12 +160,15 @@ spec:
               exec:
                 command: ["sh", "-c", "sleep 5"]
           resources:
+            # Requests stay small so this schedules beside the storefront on
+            # a 2 vCPU node. The limit is one core: proxying the replay peak
+            # is mostly that core, not the 50m request.
             requests:
               cpu: 50m
               memory: 64Mi
             limits:
-              cpu: 500m
-              memory: 128Mi
+              cpu: "1"
+              memory: 192Mi
           volumeMounts:
             - name: nginx-config
               mountPath: /etc/nginx/nginx.conf

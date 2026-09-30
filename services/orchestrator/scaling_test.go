@@ -136,33 +136,19 @@ func TestIdleUpperBoundSpikeDoesNotAddPods(t *testing.T) {
 	}
 }
 
-func TestRampTrustsUpperBoundImmediately(t *testing.T) {
-	guard := ForecastGuard{FlatHeadroomRPS: 50, RisingSlope: 2}
+func TestUpperBoundStaysCappedWhenSlopeIsOnlyJitter(t *testing.T) {
+	// A few RPS/s used to bypass the cap and size from the raw upper bound.
+	guard := ForecastGuard{FlatHeadroomRPS: 50, RisingSlope: 5}
 	const mu = 200.0
-	// Live rate has started climbing; the model upper bound is already ahead.
-	lambda := actionableForecast(1200, 40, 20, 30*time.Second, guard)
-	if lambda < 1200 {
-		t.Fatalf("rising traffic must keep the upper bound, got %.1f", lambda)
-	}
-	got := ReplicasForLoad(lambda, mu, 1, 10)
-	if got < 6 {
-		t.Fatalf("ramp replicas %d, want an immediate multi-pod scale-up", got)
-	}
-	decision := applyScalePolicy(1, got, 0, ScalePolicy{
-		MinReplicas:            1,
-		MaxReplicas:            10,
-		ScaleDownStabilization: 45 * time.Second,
-		ScaleDownStep:          1,
-	})
-	if decision.Direction != "up" || decision.Next != got {
-		t.Fatalf("scale-up delayed: %+v", decision)
-	}
-	// Slope at the threshold is enough. Just under it is still idle noise.
-	if at := actionableForecast(900, 30, 2, 30*time.Second, guard); at < 900 {
-		t.Fatalf("slope at threshold should trust the bound, got %.1f", at)
-	}
-	if under := actionableForecast(900, 5, 1.9, 30*time.Second, guard); under > 5+50 {
-		t.Fatalf("slope under threshold should be capped, got %.1f", under)
+	for _, slope := range []float64{2, 5, 20} {
+		lambda := actionableForecast(1200, 40, slope, 30*time.Second, guard)
+		got := ReplicasForLoad(lambda, mu, 1, 10)
+		if got != 1 {
+			t.Fatalf("slope %.0f upper 1200 -> lambda %.1f -> %d pods, want the idle cap", slope, lambda, got)
+		}
+		if lambda > 40+50 {
+			t.Fatalf("slope %.0f escaped the headroom cap: %.1f", slope, lambda)
+		}
 	}
 }
 
@@ -254,21 +240,88 @@ func TestSmoothedMarginPrescalesWhenMeanIsNearCapacity(t *testing.T) {
 	}
 }
 
-func TestRampStillScalesImmediatelyWithPrescale(t *testing.T) {
-	guard, cfg := prescaleFixture()
+func productionGuard() (ForecastGuard, PrescaleConfig) {
+	g := ForecastGuard{FlatHeadroomRPS: 50, RisingSlope: 5, RisingFraction: 0.01}.normalized()
+	c := PrescaleConfig{
+		PersistTicks:     3,
+		MarginCapRPS:     40,
+		SmoothAlpha:      0.2,
+		SlopeSustain:     3,
+		SlopeWindow:      15,
+		CapacityFraction: 0.70,
+		SlopeHeadroom:    40,
+	}.normalized()
+	return g, c
+}
+
+func TestJitterBelowCapacityDoesNotScale(t *testing.T) {
+	// Recorded failure: live RPS wandered through about 60-280, the slope
+	// cleared 2 RPS/s on most ticks, and the raw upper bound (400-680) added
+	// pods the fleet did not need. Two pods cover 280 RPS. The upper bound
+	// must not add a third.
+	guard, cfg := productionGuard()
+	const mu = 200.0
+	replicas := 2
+	state := &PrescaleState{}
+	hist := make([]float32, 24)
+	for i := range hist {
+		hist[i] = 160
+	}
+	uppers := []float64{400, 540, 680}
+	for tick := 0; tick < 180; tick++ {
+		// Fast oscillation inside [60, 280]. Net slope over 15s stays small
+		// except on the rises, and those rises are not sitting at 70% of a
+		// 400 RPS capacity with a slope that keeps climbing.
+		rps := 170 + 110*math.Sin(float64(tick)*1.3)
+		if rps < 60 {
+			rps = 60
+		}
+		if rps > 280 {
+			rps = 280
+		}
+		copy(hist, hist[1:])
+		hist[len(hist)-1] = float32(rps)
+		slope := recentSlope(hist, cfg.SlopeWindow)
+		capacity := float64(replicas) * mu
+		signal := decideScaleRate(uppers[tick%len(uppers)], 150, rps, slope, capacity, 30*time.Second, guard, cfg, state)
+		next := ReplicasForLoad(signal.Lambda, mu, 1, 10)
+		if next > replicas {
+			t.Fatalf("tick %d rps %.0f slope %.2f rule %s lambda %.0f scaled %d -> %d", tick, rps, slope, signal.Rule, signal.Lambda, replicas, next)
+		}
+	}
+}
+
+func TestSustainedSlopeFarBelowCapacityDoesNotUseUpperBound(t *testing.T) {
+	guard, cfg := productionGuard()
 	const mu = 200.0
 	state := &PrescaleState{}
-	// First tick of a real ramp. Persistence has not had time to count.
-	signal := decideScaleRate(1200, 50, 40, 20, mu, 30*time.Second, guard, cfg, state)
-	if signal.Rule != ruleSlope {
-		t.Fatalf("rule %s, want slope", signal.Rule)
+	for tick := 0; tick < 12; tick++ {
+		// Slope is real and held. Live RPS is 70, far under 70% of 200.
+		// Upper bound 650 would be four pods if it were trusted.
+		signal := decideScaleRate(650, 80, 70, 15, mu, 30*time.Second, guard, cfg, state)
+		got := ReplicasForLoad(signal.Lambda, mu, 1, 10)
+		if got != 1 {
+			t.Fatalf("tick %d rule %s lambda %.0f -> %d pods", tick, signal.Rule, signal.Lambda, got)
+		}
 	}
-	if signal.Lambda < 1200 {
-		t.Fatalf("ramp lambda %.1f, want the upper bound", signal.Lambda)
+}
+
+func TestLiveCrossScalesImmediatelyWithoutUpperBound(t *testing.T) {
+	guard, cfg := productionGuard()
+	const mu = 200.0
+	state := &PrescaleState{}
+	// First tick, no slope streak. Live is already over one pod. The upper
+	// bound is below the live rate, so the decision has to come from live RPS.
+	signal := decideScaleRate(100, 50, 250, 0, mu, 30*time.Second, guard, cfg, state)
+	if signal.Rule != ruleLiveCapacity {
+		t.Fatalf("rule %s, want live-capacity", signal.Rule)
 	}
 	got := ReplicasForLoad(signal.Lambda, mu, 1, 10)
-	if got < 6 {
-		t.Fatalf("ramp replicas %d", got)
+	if got < 2 {
+		t.Fatalf("live 250 did not add a pod: %+v -> %d", signal, got)
+	}
+	if got > 2 {
+		t.Fatalf("sized past the live rate into %d pods (lambda %.0f)", got, signal.Lambda)
 	}
 	decision := applyScalePolicy(1, got, 0, ScalePolicy{
 		MinReplicas:            1,
@@ -278,6 +331,66 @@ func TestRampStillScalesImmediatelyWithPrescale(t *testing.T) {
 	})
 	if decision.Direction != "up" || decision.Next != got {
 		t.Fatalf("scale-up delayed: %+v", decision)
+	}
+}
+
+func TestRampFrom50To600ScalesAtOrBeforeCapacity(t *testing.T) {
+	// 50 -> 600 RPS in 60s. The forecast mean tracks live RPS, so persistence
+	// cannot pre-scale; the slope rule or the live crossing must. A constant
+	// upper bound of 680 would ask for four pods on tick 1 if it were trusted.
+	guard, cfg := productionGuard()
+	const mu = 200.0
+	state := &PrescaleState{}
+	hist := make([]float32, 24)
+	for i := range hist {
+		hist[i] = 50
+	}
+	replicas := 1
+	rps := 50.0
+	step := (600.0 - 50.0) / 60.0
+	crossedAt := map[int]int{}
+	for tick := 0; tick < 61; tick++ {
+		copy(hist, hist[1:])
+		hist[len(hist)-1] = float32(rps)
+		slope := recentSlope(hist, cfg.SlopeWindow)
+		capacity := float64(replicas) * mu
+		signal := decideScaleRate(680, rps, rps, slope, capacity, 30*time.Second, guard, cfg, state)
+		next := ReplicasForLoad(signal.Lambda, mu, 1, 10)
+		if next > replicas {
+			replicas = next
+		}
+		// Pre-scale of one pod before the 200 RPS crossing is the slope
+		// rule. Four pods while live RPS is still under 200 is the raw
+		// upper bound (680) leaking back in.
+		if rps < 200 && replicas > 3 {
+			t.Fatalf("tick %d rps %.0f slope %.2f rule %s lambda %.0f already at %d pods", tick, rps, slope, signal.Rule, signal.Lambda, replicas)
+		}
+		for _, level := range []int{200, 400, 600} {
+			if _, seen := crossedAt[level]; !seen && rps >= float64(level) {
+				need := level/int(mu) + 1 // 200 -> 2, 400 -> 3, 600 saturated -> 4
+				if level < 600 {
+					need = level/int(mu) + 1
+				}
+				if level == 200 {
+					need = 2
+				} else if level == 400 {
+					need = 3
+				} else {
+					need = 4
+				}
+				if replicas < need {
+					t.Fatalf("rps %.0f crossed %d at tick %d with only %d pods (rule %s lambda %.0f slope %.2f)", rps, level, tick, replicas, signal.Rule, signal.Lambda, slope)
+				}
+				crossedAt[level] = tick
+			}
+		}
+		rps += step
+	}
+	// 600 RPS is four pods (saturated, so one spare). Looking 30s ahead
+	// while the ramp is still ~9 RPS/s asks for about 600+275+40, which
+	// is five pods. Six would mean the 680 upper bound was added on top.
+	if replicas < 4 || replicas > 5 {
+		t.Fatalf("ramp ended at %d pods; want 4 or 5 from the live slope, not the 680 upper bound", replicas)
 	}
 }
 

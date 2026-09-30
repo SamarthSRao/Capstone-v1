@@ -11,9 +11,12 @@
 
       .\deploy\load_gen.ps1 -Url http://<NGINX-IP>:8090
 
-    NASA morning, about 10 minutes looped 3 times:
+    NASA morning, about 10 minutes looped 3 times. Default 4 parallel pods.
+    Each logs achieved_rps next to target_rps. Override the count with
+    -ReplayParallelism or the REPLAY_PARALLELISM environment variable:
 
       .\deploy\load_gen.ps1 -Replay
+      .\deploy\load_gen.ps1 -Replay -ReplayParallelism 2
 
     ASCII only for Windows PowerShell 5.1.
 #>
@@ -21,7 +24,8 @@
 param (
     [string]$Url = "",
     [string]$Namespace = "capstone",
-    [switch]$Replay
+    [switch]$Replay,
+    [int]$ReplayParallelism = 0
 )
 
 $ErrorActionPreference = "Stop"
@@ -67,14 +71,34 @@ if ($Url) {
 
 $root = Split-Path -Parent $PSScriptRoot
 if ($Replay) {
+    $count = $ReplayParallelism
+    if ($count -lt 1) {
+        if ($env:REPLAY_PARALLELISM) {
+            $count = [int]$env:REPLAY_PARALLELISM
+        } else {
+            $count = 4
+        }
+    }
+    if ($count -lt 1 -or $count -gt 16) {
+        throw "ReplayParallelism must be from 1 to 16 (got $count)"
+    }
     $jobFile = Join-Path $root "k8s/07-nasa-replay-job.yaml"
-    Write-Host "Applying NASA replay Job in namespace $Namespace"
+    $content = [System.IO.File]::ReadAllText($jobFile)
+    $content = [regex]::Replace($content, 'parallelism: \d+ # replay-parallelism', "parallelism: $count # replay-parallelism")
+    $content = [regex]::Replace($content, 'completions: \d+ # replay-parallelism', "completions: $count # replay-parallelism")
+    $content = [regex]::Replace($content, 'value: "\d+" # replay-shards', "value: `"$count`" # replay-shards")
+    $content = [regex]::Replace($content, '- "\d+" # replay-shards', "- `"$count`" # replay-shards")
+    $rendered = Join-Path $env:TEMP "nasa-replay-job.yaml"
+    $utf8 = New-Object System.Text.UTF8Encoding $false
+    [System.IO.File]::WriteAllText($rendered, $content, $utf8)
+    Write-Host "Applying NASA replay Job in namespace $Namespace ($count parallel pods)"
     kubectl delete job nasa-replay -n $Namespace --ignore-not-found
     if ($LASTEXITCODE -ne 0) {
         Write-Host "WARNING: kubectl delete job returned $LASTEXITCODE (continuing)"
     }
-    kubectl apply -f $jobFile
+    kubectl apply -f $rendered
     Assert-Exit "kubectl apply nasa-replay"
+    Write-Host "Look for achieved_rps next to target_rps. The summary line is at the end of each pod."
     Write-Host "Watch pods: kubectl get pods -n $Namespace -l app=target-app -w"
     kubectl wait -n $Namespace --for=condition=ready pod -l app=nasa-replay --timeout=180s
     if ($LASTEXITCODE -ne 0) {
@@ -82,7 +106,7 @@ if ($Replay) {
         kubectl get pods -n $Namespace -o wide
         exit $LASTEXITCODE
     }
-    kubectl logs -n $Namespace -l app=nasa-replay -f --tail=20
+    kubectl logs -n $Namespace -l app=nasa-replay -f --tail=20 --prefix
     exit 0
 }
 $jobFile = Join-Path $root "k8s/06-loadgen-job.yaml"

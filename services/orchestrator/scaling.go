@@ -127,13 +127,18 @@ func recentSlope(history []float32, window int) float64 {
 // Both sit on the 200 RPS/pod boundary, so the actuator flapped 1 -> 2 and
 // sometimes 1 -> 3, then the 45s scale-down window brought the pod back.
 //
-// FlatHeadroomRPS is added to the live rate when traffic is not rising.
+// FlatHeadroomRPS is added to the live rate when no ramp rule is active.
 // It must stay below the per-pod service rate so that noise cannot cross
-// into a second pod. RisingSlope is the RPS-per-second corroboration that
-// a ramp is real; once it is met the raw upper bound is used immediately.
+// into a second pod.
+//
+// RisingSlope is the minimum RPS/s of a ramp. RisingFraction raises that
+// bar with capacity (1% of capacity per second at the default), so a
+// 2 RPS/s wiggle on a busy pod is not a ramp. Neither value, on its own,
+// unlocks the raw upper bound.
 type ForecastGuard struct {
 	FlatHeadroomRPS float64
 	RisingSlope     float64
+	RisingFraction  float64
 }
 
 func (g ForecastGuard) normalized() ForecastGuard {
@@ -141,19 +146,39 @@ func (g ForecastGuard) normalized() ForecastGuard {
 		g.FlatHeadroomRPS = 0
 	}
 	if g.RisingSlope <= 0 || math.IsNaN(g.RisingSlope) {
-		g.RisingSlope = 2
+		g.RisingSlope = 5
+	}
+	if g.RisingFraction < 0 || math.IsNaN(g.RisingFraction) {
+		g.RisingFraction = 0
 	}
 	return g
 }
 
+// slopeThreshold is the RPS/s a window must clear before a tick counts
+// toward a sustained ramp. The fraction term grows with the current fleet
+// so the same absolute jitter does not qualify on a larger capacity.
+func (g ForecastGuard) slopeThreshold(capacity float64) float64 {
+	g = g.normalized()
+	rel := 0.0
+	if capacity > 0 {
+		rel = g.RisingFraction * capacity
+	}
+	if rel > g.RisingSlope {
+		return rel
+	}
+	return g.RisingSlope
+}
+
 // Rule names are logged on every scale action and returned on the status JSON.
-// idle-guard and slope describe the noisy upper bound. The forecast-* rules
-// describe the mean, which is allowed to add pods while live RPS is still flat.
+// idle-guard is the capped upper bound. slope and live-capacity size from
+// the forecast mean and the live rate. The forecast-* rules are the mean
+// pre-scale, which may add pods while live RPS is still flat.
 const (
-	ruleIdleGuard   = "idle-guard"
-	ruleSlope       = "slope"
-	rulePersistence = "forecast-persistence"
-	ruleMargin      = "forecast-margin"
+	ruleIdleGuard    = "idle-guard"
+	ruleSlope        = "slope"
+	ruleLiveCapacity = "live-capacity"
+	rulePersistence  = "forecast-persistence"
+	ruleMargin       = "forecast-margin"
 )
 
 // PrescaleConfig is the mean-based path. It does not cap that path with
@@ -169,6 +194,17 @@ type PrescaleConfig struct {
 	PersistTicks int
 	MarginCapRPS float64
 	SmoothAlpha  float64
+	// SlopeSustain is how many consecutive ticks must clear the slope
+	// threshold. SlopeWindow is the history the monitor averages over;
+	// decideScaleRate itself is given the already-computed slope.
+	// CapacityFraction is the share of current capacity the smoothed live
+	// rate (or the forecast mean) must already have reached. SlopeHeadroom
+	// is added after max(mean, live extrapolated across pod start). It
+	// stays well under one pod.
+	SlopeSustain     int
+	SlopeWindow      int
+	CapacityFraction float64
+	SlopeHeadroom    float64
 }
 
 func (c PrescaleConfig) normalized() PrescaleConfig {
@@ -181,6 +217,18 @@ func (c PrescaleConfig) normalized() PrescaleConfig {
 	if c.SmoothAlpha <= 0 || c.SmoothAlpha > 1 || math.IsNaN(c.SmoothAlpha) {
 		c.SmoothAlpha = 0.2
 	}
+	if c.SlopeSustain < 1 {
+		c.SlopeSustain = 3
+	}
+	if c.SlopeWindow < 2 {
+		c.SlopeWindow = 15
+	}
+	if c.CapacityFraction <= 0 || c.CapacityFraction > 1 || math.IsNaN(c.CapacityFraction) {
+		c.CapacityFraction = 0.70
+	}
+	if c.SlopeHeadroom < 0 || math.IsNaN(c.SlopeHeadroom) {
+		c.SlopeHeadroom = 40
+	}
 	return c
 }
 
@@ -190,6 +238,8 @@ type PrescaleState struct {
 	AboveCapacity int
 	MeanEMA       float64
 	MarginEMA     float64
+	LiveEMA       float64
+	SlopeStreak   int
 	primed        bool
 }
 
@@ -200,13 +250,20 @@ type ScaleSignal struct {
 	Rule   string
 }
 
-// decideScaleRate combines the upper-bound guard with mean pre-scaling.
+// decideScaleRate combines the idle cap, mean pre-scaling, and a slope
+// rule that does not read the raw upper bound.
 //
-// The upper bound is still capped at live RPS + headroom while the slope is
-// flat, because Monte Carlo dropout redraws std every call. The forecast
-// mean is a different signal: once it has stayed above current capacity for
-// PersistTicks, or the smoothed mean plus a capped lead margin clears that
-// capacity, pods are added even if live RPS has not started climbing.
+// The upper bound is Monte Carlo dropout noise. It is only allowed through
+// the idle cap (live RPS + FlatHeadroomRPS). A slope-triggered scale-up
+// fires when three things are true together: the slope has cleared its
+// threshold for SlopeSustain ticks, the smoothed live rate or the forecast
+// mean is already at CapacityFraction of current capacity, and extrapolating
+// that slope across pod start (or the forecast mean, whichever is larger)
+// plus a small headroom would exceed capacity. The replica count then comes
+// from that extrapolation, not from the upper bound.
+//
+// Live RPS at or above current capacity scales on that same tick
+// (live-capacity), again from the live rate and the mean, not the upper bound.
 // Capacity is the current fleet times the per-pod service rate.
 func decideScaleRate(upperBound, mean, currentRPS, slopePerSec, capacity float64, lead time.Duration, guard ForecastGuard, cfg PrescaleConfig, state *PrescaleState) ScaleSignal {
 	guard = guard.normalized()
@@ -226,22 +283,21 @@ func decideScaleRate(upperBound, mean, currentRPS, slopePerSec, capacity float64
 	if math.IsNaN(capacity) || capacity < 0 {
 		capacity = 0
 	}
-
-	upperLambda := actionableForecast(upperBound, currentRPS, slopePerSec, lead, guard)
-	upperRule := ruleIdleGuard
-	if slopePerSec >= guard.RisingSlope {
-		upperRule = ruleSlope
+	if lead < 0 {
+		lead = 0
 	}
 
 	// Prime from live RPS, not from the first mean. A cold start on a
 	// spiked sample would otherwise look like a sustained forecast.
 	if !state.primed {
 		state.MeanEMA = currentRPS
+		state.LiveEMA = currentRPS
 		state.MarginEMA = 0
 		state.primed = true
 	}
 	alpha := cfg.SmoothAlpha
 	state.MeanEMA = alpha*mean + (1-alpha)*state.MeanEMA
+	state.LiveEMA = alpha*currentRPS + (1-alpha)*state.LiveEMA
 	gap := mean - currentRPS
 	if gap < 0 {
 		gap = 0
@@ -256,30 +312,79 @@ func decideScaleRate(upperBound, mean, currentRPS, slopePerSec, capacity float64
 	} else {
 		state.AboveCapacity = 0
 	}
+	if slopePerSec >= guard.slopeThreshold(capacity) {
+		state.SlopeStreak++
+	} else {
+		state.SlopeStreak = 0
+	}
 
-	meanOK := false
-	meanLambda := 0.0
-	meanRule := ""
+	// Idle cap. Slope is passed as 0 so a jittery rise cannot lift the
+	// ceiling; the upper bound still cannot pass live + headroom.
+	best := ScaleSignal{
+		Lambda: actionableForecast(upperBound, currentRPS, 0, lead, guard),
+		Rule:   ruleIdleGuard,
+	}
+	consider := func(lambda float64, rule string) {
+		if lambda > best.Lambda {
+			best = ScaleSignal{Lambda: lambda, Rule: rule}
+		}
+	}
+
 	if state.AboveCapacity >= cfg.PersistTicks {
-		meanLambda = leadAdjustedLambda(mean, currentRPS, slopePerSec, lead)
-		meanRule = rulePersistence
-		meanOK = true
+		// The mean itself, not the upper bound and not a one-window slope.
+		consider(mean, rulePersistence)
 	} else if state.MeanEMA+state.MarginEMA > capacity && state.MarginEMA > 0 {
-		meanLambda = state.MeanEMA + state.MarginEMA
-		meanRule = ruleMargin
-		meanOK = true
+		consider(state.MeanEMA+state.MarginEMA, ruleMargin)
 	}
 
-	if meanOK && meanLambda >= upperLambda {
-		return ScaleSignal{Lambda: meanLambda, Rule: meanRule}
+	if currentRPS < capacity && state.SlopeStreak >= cfg.SlopeSustain && capacity > 0 {
+		near := state.LiveEMA >= cfg.CapacityFraction*capacity || mean >= cfg.CapacityFraction*capacity
+		if near {
+			projected := extrapolateLive(currentRPS, mean, slopePerSec, lead) + cfg.SlopeHeadroom
+			if projected > capacity {
+				consider(projected, ruleSlope)
+			}
+		}
 	}
-	return ScaleSignal{Lambda: upperLambda, Rule: upperRule}
+
+	if capacity > 0 && currentRPS >= capacity {
+		rate := currentRPS
+		if mean > rate {
+			rate = mean
+		}
+		// A single spiked sample can clear capacity. Only a slope that has
+		// already held for SlopeSustain ticks may look further ahead.
+		if state.SlopeStreak >= cfg.SlopeSustain {
+			ahead := extrapolateLive(currentRPS, mean, slopePerSec, lead)
+			if ahead > rate {
+				rate = ahead
+			}
+		}
+		consider(rate+cfg.SlopeHeadroom, ruleLiveCapacity)
+	}
+	return best
 }
 
-// actionableForecast is the arrival rate the upper bound may scale on.
-// It is still what a flat series is capped to. The mean path does not call
-// this cap. A rising series trusts the bound at once and may project it
-// across lead.
+// extrapolateLive is max(forecast mean, live RPS carried forward by the
+// slope for the pod-start lead). The upper bound is not an input.
+func extrapolateLive(currentRPS, mean, slopePerSec float64, lead time.Duration) float64 {
+	projected := currentRPS + slopePerSec*lead.Seconds()
+	if projected < 0 || math.IsNaN(projected) {
+		projected = 0
+	}
+	if math.IsNaN(mean) || mean < 0 {
+		mean = 0
+	}
+	if mean > projected {
+		return mean
+	}
+	return projected
+}
+
+// actionableForecast caps the upper bound at live RPS + headroom.
+// A rising slope used to return the raw bound from here. Jitter of a few
+// RPS/s then sized the fleet from MC-dropout spikes (400-680) while live
+// RPS was still inside the pods already running. That bypass is gone.
 func actionableForecast(upperBound, currentRPS, slopePerSec float64, lead time.Duration, guard ForecastGuard) float64 {
 	guard = guard.normalized()
 	if currentRPS < 0 || math.IsNaN(currentRPS) {
@@ -289,9 +394,6 @@ func actionableForecast(upperBound, currentRPS, slopePerSec float64, lead time.D
 		slopePerSec = 0
 	}
 	projected := leadAdjustedLambda(upperBound, currentRPS, slopePerSec, lead)
-	if slopePerSec >= guard.RisingSlope {
-		return projected
-	}
 	ceiling := currentRPS + guard.FlatHeadroomRPS
 	if projected > ceiling {
 		return ceiling

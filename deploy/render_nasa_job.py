@@ -30,6 +30,12 @@ __SCRIPT__
   nasa_demo_window_10min.csv: |
 __CSV__
 ---
+# Indexed job: N pods run the same morning at the same time. Pod i sends
+# round(target)/N (remainder on the lower indexes) so the cluster sees the
+# full rate. Default 4 fits a 6 GB kind node. REPLAY_PARALLELISM in
+# deploy/load_gen.sh rewrites the lines marked replay-parallelism and
+# replay-shards before apply. Requests stay small so the pods still schedule
+# on a 2 vCPU node; limits are what a busy shard may use if the node has it.
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -38,6 +44,9 @@ metadata:
   labels:
     app: nasa-replay
 spec:
+  parallelism: 4 # replay-parallelism
+  completions: 4 # replay-parallelism
+  completionMode: Indexed
   backoffLimit: 1
   ttlSecondsAfterFinished: 600
   template:
@@ -58,13 +67,18 @@ spec:
             - /replay/nasa_demo_window_10min.csv
             - --loops
             - "3"
+            - --shards
+            - "4" # replay-shards
+          env:
+            - name: REPLAY_SHARDS
+              value: "4" # replay-shards
           resources:
             requests:
-              cpu: 100m
-              memory: 128Mi
+              cpu: 50m
+              memory: 64Mi
             limits:
-              cpu: "1"
-              memory: 512Mi
+              cpu: 400m
+              memory: 192Mi
           volumeMounts:
             - name: replay
               mountPath: /replay

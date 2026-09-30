@@ -17,14 +17,19 @@ Do not point this at a production subscription. The scripts create a resource gr
 
 Each target pod is treated as **200 requests/second**. The cap is 10, which fits a 1-node student pool if the node is a 2-vCPU size. Scale-down waits 45 seconds, then removes one pod per window.
 
-Three ways a scale-up is allowed. The orchestrator logs which one fired (`rule=...` on the orchestrator pod, and `scale_rule` on `/api/target/status`):
+The orchestrator logs which scale-up rule fired (`rule=...` on the orchestrator pod, and `scale_rule` on `/api/target/status`):
 
 - `forecast-persistence` — the forecast **mean** (not the upper bound) has stayed above the current fleet's capacity for `PRESCALE_PERSIST_TICKS` (default 3). This is the pre-scale. Live RPS can still be flat.
 - `forecast-margin` — a smoothed lead (mean minus live RPS, capped at `PRESCALE_MARGIN_CAP_RPS`, default 40) pushes the smoothed mean over current capacity. The cap is far below one pod, so an idle mean near 70 cannot clear 200.
-- `slope` — live RPS is rising at least `RISING_SLOPE_RPS` (default 2 RPS/s). The raw upper bound is used on that same tick and projected `FORECAST_LEAD_SECONDS` (default 30) forward.
-- `idle-guard` — none of the above. The noisy upper bound is capped at live RPS + `FLAT_HEADROOM_RPS` (default 50).
+- `slope` — a real ramp, not jitter. The rise must clear `max(RISING_SLOPE_RPS, RISING_SLOPE_FRACTION * capacity)` for `SLOPE_SUSTAIN_TICKS` ticks in a row. The slope is the change over `SLOPE_WINDOW_TICKS` seconds. The smoothed live RPS **or the forecast mean** must already be at `CAPACITY_FRACTION` of current capacity (default 70%). The size is `max(forecast mean, live RPS + slope * FORECAST_LEAD_SECONDS)` plus `SLOPE_HEADROOM_RPS`. The raw upper bound is not an input.
+- `live-capacity` — live RPS is already at or above what the ready pods can serve. Scale-up is immediate, from the live rate and the mean. A slope that has already held may look `FORECAST_LEAD_SECONDS` ahead; a one-tick spike does not.
+- `idle-guard` — none of the above. The noisy upper bound is capped at live RPS + `FLAT_HEADROOM_RPS` (default 50), including when the per-second change is a few RPS.
 
-At idle the upper bound is `mean + z * std` (the error term is zero while live RPS is below the mean). Monte Carlo dropout redraws `std` every tick, and that draw is also a DQN input, so `z` moves with it. The bound jumps through roughly 180-440 RPS with almost no traffic. That jump is what `idle-guard` ignores. The dashboard still shows it. The mean is what pre-scale trusts, and only after it holds.
+Defaults: `RISING_SLOPE_RPS=5`, `RISING_SLOPE_FRACTION=0.01`, `SLOPE_SUSTAIN_TICKS=3`, `SLOPE_WINDOW_TICKS=15`, `CAPACITY_FRACTION=0.70`, `SLOPE_HEADROOM_RPS=40`, `FLAT_HEADROOM_RPS=50`, `FORECAST_LEAD_SECONDS=30`. All of those are env vars on the orchestrator Deployment.
+
+At idle the upper bound is `mean + z * std` (the error term is zero while live RPS is below the mean). Monte Carlo dropout redraws `std` every tick, and that draw is also a DQN input, so `z` moves with it. The bound jumps through roughly 180-440 RPS with almost no traffic, and on the NASA morning it jumped through 400-680 while live RPS was still 60-280. That jump used to unlock a scale-up whenever the second-to-second change was at least 2 RPS, which jitter does constantly. It does not anymore. The dashboard still shows the raw bound. The mean is what pre-scale trusts, and only after it holds.
+
+Tradeoff: a very sharp ramp pre-scales a few seconds later than the old "any 2 RPS/s unlocks the upper bound" path, because the smoothed rate has to reach about 70% of the current pods and the rise has to hold for 3 seconds. A ramp that stays under that bar scales when live RPS actually crosses capacity, on that same tick.
 
 The original LSTM was trained on hourly samples and is served 24 seconds of live traffic, so it does not know this ramp. Pre-scale only leads if you load the NASA fine-tune (`MODEL_DIR`). Until then the mean will not clear 200 RPS ahead of the replay, and scale-up falls back to `slope`.
 
@@ -187,7 +192,7 @@ Rebuild the predictor image so `models/nasa` is in it, then set `MODEL_DIR=/app/
 
 ## Replay the morning
 
-About 10 minutes, looped 3 times (30 minutes). Have the dashboard and `kubectl get pods -l app=target-app -w` up first.
+About 10 minutes, looped 3 times (30 minutes). The target reaches about 681 RPS and the generator is built to offer at least 800. Have the dashboard and `kubectl get pods -l app=target-app -w` up first.
 
 ```bash
 ./deploy/load_gen.sh --replay
@@ -197,15 +202,21 @@ About 10 minutes, looped 3 times (30 minutes). Have the dashboard and `kubectl g
 .\deploy\load_gen.ps1 -Replay
 ```
 
-`k8s/06-loadgen-job.yaml` is still the short Locust spike. The replay is `k8s/07-nasa-replay-job.yaml` (python:3.12-slim, not part of `kubectl apply -k`).
+That starts an indexed Job, default **4** pods (`REPLAY_PARALLELISM`, or `--parallelism` / `-ReplayParallelism`). Each pod keeps HTTP connections open and sends `round(target) / N` of the rate (the remainder goes to the lower indexes). Requests are 50m CPU and 64Mi memory per pod, so four of them schedule on a 6 GB kind node and on a 2 vCPU AKS node. Limits are 400m / 192Mi. Set `REPLAY_PARALLELISM=2` if the node is already full.
+
+Each pod logs `target_rps`, `shard_target_rps`, and `achieved_rps` every 30 seconds, and a `summary` line at the end with `achieved_rps` and `offered_rps`. `kubectl logs` is prefixed with the pod name. One process with a new connection per request saturated around 180-260 RPS, which hid the 600 RPS peak. Four keep-alive shards are what clears 800 **offered**.
+
+`achieved_rps` is completed responses, which is also what nginx `stub_status` counts. Each target pod is budgeted at 200 RPS, so 800 RPS of completed traffic needs about four ready storefront pods. The Go storefront renders a small page and can do more than 200 RPS on a free core; nginx in front of it uses one worker, no access log, and a keepalive pool to the pods. A single 2 vCPU node that is also running the predictor, the orchestrator, nginx, and the generator pods will throttle before a sustained 800 of completed requests. Kind, where the node has spare CPU, is the rate check: read `achieved_rps` against `target_rps` in the replay logs. Until the scaler has added pods, achieved RPS flattens at whatever the current pods finish.
+
+`k8s/06-loadgen-job.yaml` is still the short Locust spike. The replay is `k8s/07-nasa-replay-job.yaml` (python:3.12-slim, not part of `kubectl apply -k`). Regenerate it with `python3 deploy/render_nasa_job.py` after editing `deploy/nasa_replay.py`.
 
 ## What to say, what to show
 
 1. **Idle, before the replay.** "One pod is the warm floor. The upper bound on the chart can jump even though almost nothing is arriving. That is dropout noise. Desired replicas stays at 1. The log line would say `rule=idle-guard`."
 2. **Start the replay.** "This is a real NASA morning, sped up 40 times. The orchestrator counts nginx requests, not the active-connection line."
 3. **Before live RPS crosses 200.** Point at the forecast-mean line sitting above the live line, and at desired replicas moving to 2 while live RPS is still under 200. "The mean stayed over one pod's capacity for a few seconds, so this is `rule=forecast-persistence`, not a reaction to the slope. The pod is requested before the load is being served." Orchestrator log: `kubectl logs -n capstone -l app=orchestrator --tail=30`.
-4. **If the ramp is already steep.** "`rule=slope` still scales on the same tick. We did not add a wait in front of a real rise."
-5. **At the top.** "Each pod is budgeted at 200 RPS, cap 10."
+4. **If the ramp is already steep and live RPS is near what the current pods can serve.** "`rule=slope` adds pods from the live rate carried forward 30 seconds, plus a small headroom. It does not use the upper bound. A wiggle of a few RPS per second while you are well under capacity does not count. If live RPS is already over capacity, `rule=live-capacity` adds the pod on that same tick."
+5. **At the top.** "Each pod is budgeted at 200 RPS, cap 10. The replay log's `achieved_rps` is what nginx actually finished, next to `target_rps`."
 6. **After the morning falls.** "Desired drops right away. The running count does not. Scale-down waits 45 seconds and then removes one pod at a time."
 7. **Close on the numbers.** Gateway RPS, the "forecast leads by" line, desired replicas, and `scale_rule`. Raw JSON: the dashboard's `/api/orchestrator/api/target/status` (`forecast_lead_rps`, `scale_rule`, `raw_ml_mean`, `current_rps`).
 

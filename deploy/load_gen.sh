@@ -14,7 +14,11 @@
 # forecast can rise before live RPS crosses 200 per pod:
 #
 #   ./deploy/load_gen.sh --replay
+#   REPLAY_PARALLELISM=2 ./deploy/load_gen.sh --replay
+#   ./deploy/load_gen.sh --replay --parallelism 4
 #
+# The replay is an indexed Job. Each pod sends target/N over keep-alive
+# connections and logs achieved_rps next to target_rps. Default N is 4.
 # Re-running deletes the previous Job first. Jobs are immutable.
 
 set -euo pipefail
@@ -22,6 +26,7 @@ set -euo pipefail
 NAMESPACE="${NAMESPACE:-capstone}"
 URL=""
 REPLAY=0
+REPLAY_PARALLELISM="${REPLAY_PARALLELISM:-4}"
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -32,6 +37,10 @@ while [ $# -gt 0 ]; do
     --replay)
       REPLAY=1
       shift
+      ;;
+    --parallelism)
+      REPLAY_PARALLELISM="${2:-}"
+      shift 2
       ;;
     --namespace)
       NAMESPACE="${2:-}"
@@ -51,14 +60,33 @@ done
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 if [ "$REPLAY" = "1" ]; then
-  echo "Applying NASA replay Job in namespace $NAMESPACE (about 10 minutes, looped 3 times)"
+  case "$REPLAY_PARALLELISM" in
+    ''|*[!0-9]*)
+      echo "REPLAY_PARALLELISM must be an integer (got: $REPLAY_PARALLELISM)" >&2
+      exit 1
+      ;;
+  esac
+  if [ "$REPLAY_PARALLELISM" -lt 1 ] || [ "$REPLAY_PARALLELISM" -gt 16 ]; then
+    echo "REPLAY_PARALLELISM must be from 1 to 16 (got: $REPLAY_PARALLELISM)" >&2
+    exit 1
+  fi
+  echo "Applying NASA replay Job in namespace $NAMESPACE ($REPLAY_PARALLELISM parallel pods, about 10 minutes, looped 3 times)"
+  rendered="$(mktemp)"
+  sed \
+    -e "s/parallelism: [0-9][0-9]* # replay-parallelism/parallelism: ${REPLAY_PARALLELISM} # replay-parallelism/" \
+    -e "s/completions: [0-9][0-9]* # replay-parallelism/completions: ${REPLAY_PARALLELISM} # replay-parallelism/" \
+    -e "s/value: \"[0-9][0-9]*\" # replay-shards/value: \"${REPLAY_PARALLELISM}\" # replay-shards/" \
+    -e "s/- \"[0-9][0-9]*\" # replay-shards/- \"${REPLAY_PARALLELISM}\" # replay-shards/" \
+    "$ROOT/k8s/07-nasa-replay-job.yaml" > "$rendered"
   kubectl delete job nasa-replay -n "$NAMESPACE" --ignore-not-found
-  kubectl apply -f "$ROOT/k8s/07-nasa-replay-job.yaml"
+  kubectl apply -f "$rendered"
+  rm -f "$rendered"
   echo "Following logs (Ctrl-C stops following; the Job keeps running)."
+  echo "Look for achieved_rps next to target_rps. The summary line is at the end of each pod."
   echo "Watch pods: kubectl get pods -n $NAMESPACE -l app=target-app -w"
   echo "Scale rule: kubectl logs -n $NAMESPACE -l app=orchestrator --tail=20"
   kubectl wait -n "$NAMESPACE" --for=condition=ready pod -l app=nasa-replay --timeout=180s || true
-  kubectl logs -n "$NAMESPACE" -l app=nasa-replay -f --tail=20 || true
+  kubectl logs -n "$NAMESPACE" -l app=nasa-replay -f --tail=20 --prefix || true
   exit 0
 fi
 

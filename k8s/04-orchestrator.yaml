@@ -39,14 +39,30 @@ spec:
             # Requests per second per pod (not per minute).
             - name: SERVICE_RATE_RPS
               value: "200"
-            # While RPS is flat, ignore upper-bound noise above live RPS + this.
+            # The noisy upper bound is always capped at live RPS + this.
             # 50 is below one pod, so an idle bound of a few hundred RPS stays
-            # at 1 replica. A rising slope (RISING_SLOPE_RPS) bypasses the cap
-            # and scales on the raw upper bound immediately.
+            # at 1 replica. A rising slope does not lift this cap.
             - name: FLAT_HEADROOM_RPS
               value: "50"
+            # Slope scale-up: the rise must clear max(RISING_SLOPE_RPS,
+            # RISING_SLOPE_FRACTION * current capacity) for SLOPE_SUSTAIN_TICKS
+            # consecutive ticks, measured over SLOPE_WINDOW_TICKS seconds, and
+            # the smoothed live RPS or the forecast mean must already be at
+            # CAPACITY_FRACTION of current capacity. The replica count is then
+            # max(forecast mean, live + slope * FORECAST_LEAD_SECONDS) plus
+            # SLOPE_HEADROOM_RPS. It is not the raw upper bound.
             - name: RISING_SLOPE_RPS
-              value: "2"
+              value: "5"
+            - name: RISING_SLOPE_FRACTION
+              value: "0.01"
+            - name: SLOPE_SUSTAIN_TICKS
+              value: "3"
+            - name: SLOPE_WINDOW_TICKS
+              value: "15"
+            - name: CAPACITY_FRACTION
+              value: "0.70"
+            - name: SLOPE_HEADROOM_RPS
+              value: "40"
             # Pre-scale on the forecast mean, not the noisy upper bound.
             # Three ticks above current capacity, or a smoothed lead margin
             # of at most 40 RPS (well under one 200 RPS pod).
