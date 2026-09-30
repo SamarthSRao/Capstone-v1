@@ -36,10 +36,17 @@ spec:
             # Dial target. The process used to ignore this and hardcode predictor:50051.
             - name: PREDICTOR_URL
               value: "predictor:50051"
-            # Requests per second per pod (not per minute). 200 keeps a
-            # ~300 RPS uncertainty band at 1-2 replicas on a student cluster.
+            # Requests per second per pod (not per minute).
             - name: SERVICE_RATE_RPS
               value: "200"
+            # While RPS is flat, ignore upper-bound noise above live RPS + this.
+            # 50 is below one pod, so an idle bound of a few hundred RPS stays
+            # at 1 replica. A rising slope (RISING_SLOPE_RPS) bypasses the cap
+            # and scales on the raw upper bound immediately.
+            - name: FLAT_HEADROOM_RPS
+              value: "50"
+            - name: RISING_SLOPE_RPS
+              value: "2"
             - name: CAPACITY_MODEL
               value: "true"
             # Warm floor. Never scale to zero; raise to 2 to keep a spare pod hot.

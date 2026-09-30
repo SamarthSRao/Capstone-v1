@@ -114,6 +114,58 @@ func TestServiceRateIsPerSecondNotPerMinute(t *testing.T) {
 	}
 }
 
+func TestIdleUpperBoundSpikeDoesNotAddPods(t *testing.T) {
+	// Kind observation: live RPS ~1, forecast mean ~72, std ~105, and the
+	// upper bound occasionally reading 178, 283, 285, or 438. Those are
+	// mean + z*std with the error term at zero (RPS is below the mean).
+	// 178 stays on 1 pod; 285 crosses into 2; 438 crosses into 3.
+	guard := ForecastGuard{FlatHeadroomRPS: 50, RisingSlope: 2}
+	const mu = 200.0
+	for _, upper := range []float64{178, 283, 285, 438} {
+		raw := ReplicasForLoad(upper, mu, 1, 10)
+		lambda := actionableForecast(upper, 1, 0, 30*time.Second, guard)
+		got := ReplicasForLoad(lambda, mu, 1, 10)
+		if got != 1 {
+			t.Fatalf("idle upper %.0f (raw replicas %d) -> actionable %.1f -> %d pods, want 1", upper, raw, lambda, got)
+		}
+	}
+	// A flat series whose raw bound would be a steady 2 pods still stays at 1.
+	lambda := actionableForecast(300, 1, 0.2, 30*time.Second, guard)
+	if got := ReplicasForLoad(lambda, mu, 1, 10); got != 1 {
+		t.Fatalf("sub-threshold slope still scaled to %d (lambda %.1f)", got, lambda)
+	}
+}
+
+func TestRampTrustsUpperBoundImmediately(t *testing.T) {
+	guard := ForecastGuard{FlatHeadroomRPS: 50, RisingSlope: 2}
+	const mu = 200.0
+	// Live rate has started climbing; the model upper bound is already ahead.
+	lambda := actionableForecast(1200, 40, 20, 30*time.Second, guard)
+	if lambda < 1200 {
+		t.Fatalf("rising traffic must keep the upper bound, got %.1f", lambda)
+	}
+	got := ReplicasForLoad(lambda, mu, 1, 10)
+	if got < 6 {
+		t.Fatalf("ramp replicas %d, want an immediate multi-pod scale-up", got)
+	}
+	decision := applyScalePolicy(1, got, 0, ScalePolicy{
+		MinReplicas:            1,
+		MaxReplicas:            10,
+		ScaleDownStabilization: 45 * time.Second,
+		ScaleDownStep:          1,
+	})
+	if decision.Direction != "up" || decision.Next != got {
+		t.Fatalf("scale-up delayed: %+v", decision)
+	}
+	// Slope at the threshold is enough. Just under it is still idle noise.
+	if at := actionableForecast(900, 30, 2, 30*time.Second, guard); at < 900 {
+		t.Fatalf("slope at threshold should trust the bound, got %.1f", at)
+	}
+	if under := actionableForecast(900, 5, 1.9, 30*time.Second, guard); under > 5+50 {
+		t.Fatalf("slope under threshold should be capped, got %.1f", under)
+	}
+}
+
 func TestLeadTimeProjection(t *testing.T) {
 	// Upper bound has not caught up, but RPS is rising 10/s. Over a 30s
 	// pod start we should provision for 50+300=350, not the stale upper bound.

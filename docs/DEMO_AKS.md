@@ -15,7 +15,9 @@ Do not point this at a production subscription. The scripts create a resource gr
 | Replica decision | Go orchestrator, `:8082` `/api/target/status` |
 | Dashboard | Static build, nginx proxies `/api/orchestrator/` to the orchestrator |
 
-Each target pod is treated as **200 requests/second**. A forecast around 200-300 RPS (including the model's uncertainty) stays at 1-2 pods. The cap is 10, which fits a 1-node student pool if the node is a 2-vCPU size. Scale-up has no cooldown. Scale-down waits 45 seconds, then removes one pod per window.
+Each target pod is treated as **200 requests/second**. The cap is 10, which fits a 1-node student pool if the node is a 2-vCPU size. Scale-up has no cooldown once requests per second are rising (default slope at least 2 RPS/s, `RISING_SLOPE_RPS`). Scale-down waits 45 seconds, then removes one pod per window.
+
+At idle the forecast mean sits near 70 RPS and the standard deviation near 100. The upper bound is `mean + z * std` (the error term is zero while live RPS is below the mean). Monte Carlo dropout redraws `std` every tick, and that value is also a DQN input, so `z` moves with it. The bound therefore jumps through roughly 180-440 RPS without any real traffic, which is enough to cross into a second or third pod. While RPS is flat the orchestrator caps the rate it will scale on at live RPS + `FLAT_HEADROOM_RPS` (default 50), so that noise stays on one pod. The dashboard still shows the raw upper bound. As soon as RPS is rising, the raw bound is used immediately and is projected 30 seconds forward.
 
 ## 1. Azure (AKS)
 
@@ -152,7 +154,7 @@ minikube service -n capstone nginx-lb --url
 
 About four minutes. Have the dashboard and `kubectl get pods -l app=target-app -w` visible before you start Locust.
 
-1. **Idle.** "One pod is the warm floor. The predictor is already publishing an upper bound, not a single guess. At a couple of hundred requests per second that upper bound is still one or two pods. We do not pin the deployment at the maximum just because the model is uncertain."
+1. **Idle.** "One pod is the warm floor. The upper bound on the chart can jump even though almost nothing is arriving. That is dropout noise in the uncertainty, not a traffic forecast. Desired replicas stays at 1 until requests per second actually turn up."
 2. **Start the load job.** "Locust is inside the cluster, hitting the storefront through nginx. The orchestrator reads nginx's request counter, not the active-connection line, so this RPS is real."
 3. **As the curve climbs.** "Desired replicas moves with the upper bound, and the slope is projected about 30 seconds forward. That is the pod start time. New pods show up in kubectl while requests per second is still rising. Readiness probes keep them out of the Service until `/health` passes."
 4. **At the top.** "Each pod is budgeted at 200 RPS. The count is that forecast divided across pods, plus one extra pod only when the fleet would be fully saturated. It will not jump to 10 unless the forecast actually needs 10."

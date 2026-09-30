@@ -117,6 +117,58 @@ func recentSlope(history []float32, window int) float64 {
 	return delta / steps
 }
 
+// ForecastGuard decides when a model upper bound is allowed to add pods.
+//
+// At idle the predictor's mean stays near 70 RPS while Monte Carlo dropout
+// makes std jump around ~100 RPS, and that noisy std is also an input to the
+// DQN, so z moves with it. The published bound is mean + z*std (the error
+// term is zero when live RPS is below the mean). With z around 2 that is
+// ~280 RPS, and a one-tick panic step or a fat std sample reaches ~440.
+// Both sit on the 200 RPS/pod boundary, so the actuator flapped 1 -> 2 and
+// sometimes 1 -> 3, then the 45s scale-down window brought the pod back.
+//
+// FlatHeadroomRPS is added to the live rate when traffic is not rising.
+// It must stay below the per-pod service rate so that noise cannot cross
+// into a second pod. RisingSlope is the RPS-per-second corroboration that
+// a ramp is real; once it is met the raw upper bound is used immediately.
+type ForecastGuard struct {
+	FlatHeadroomRPS float64
+	RisingSlope     float64
+}
+
+func (g ForecastGuard) normalized() ForecastGuard {
+	if g.FlatHeadroomRPS < 0 || math.IsNaN(g.FlatHeadroomRPS) {
+		g.FlatHeadroomRPS = 0
+	}
+	if g.RisingSlope <= 0 || math.IsNaN(g.RisingSlope) {
+		g.RisingSlope = 2
+	}
+	return g
+}
+
+// actionableForecast is the arrival rate the actuator may scale on.
+// upperBound is the model's raw bound and is still what the dashboard shows.
+// A flat series keeps the actionable rate within FlatHeadroomRPS of live RPS.
+// A rising series trusts the bound at once and may project it across lead.
+func actionableForecast(upperBound, currentRPS, slopePerSec float64, lead time.Duration, guard ForecastGuard) float64 {
+	guard = guard.normalized()
+	if currentRPS < 0 || math.IsNaN(currentRPS) {
+		currentRPS = 0
+	}
+	if slopePerSec < 0 || math.IsNaN(slopePerSec) {
+		slopePerSec = 0
+	}
+	projected := leadAdjustedLambda(upperBound, currentRPS, slopePerSec, lead)
+	if slopePerSec >= guard.RisingSlope {
+		return projected
+	}
+	ceiling := currentRPS + guard.FlatHeadroomRPS
+	if projected > ceiling {
+		return ceiling
+	}
+	return projected
+}
+
 // leadAdjustedLambda looks ahead across pod startup. The model returns one
 // upper bound; image pull and readiness take longer than that single step.
 // During a ramp we project the recent slope forward by lead and take the

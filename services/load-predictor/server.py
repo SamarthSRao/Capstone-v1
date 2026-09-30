@@ -27,6 +27,7 @@ except ImportError:
 from models.xgboost_residuals import XGBoostResidualModel
 from models.hybrid_mlp import HybridMLPFusion
 from rl_agent import RLAgent
+from bounds import uncertainty_bounds
 
 class PredictorService(predictor_pb2_grpc.PredictorServicer):
     def __init__(self):
@@ -225,15 +226,17 @@ class PredictorService(predictor_pb2_grpc.PredictorServicer):
             action = 2
             current_z_score = 2.0 + (error_ratio * 0.5)
         
-        # Calculate final bounds purely from ML mean + (dynamic_z * Bayesian_std_dev)
+        # upper = mean + z * (std + 0.5 * max(0, rps - mean)). See bounds.py.
+        # At idle, rps is below the mean, so the error term is zero and the
+        # bound is just mean + z*std. std is a fresh Monte Carlo dropout
+        # draw every call, and that draw is also the DQN's variance feature,
+        # so z moves with it. A single tick can therefore jump from ~180 to
+        # ~440 while the mean stays put. The orchestrator does not add pods
+        # for that jump unless live RPS is rising (ForecastGuard).
         std_dev = float(total_std)
-        
-        # If the error is massive, the variance inherently spikes.
-        # We also factor the prediction error into the standard deviation for instantaneous shocks.
-        adjusted_std = std_dev + (prediction_error * 0.5)
-        
-        upper_bound = mean + (current_z_score * adjusted_std)
-        lower_bound = max(0, mean - (current_z_score * adjusted_std))
+        upper_bound, lower_bound, _ = uncertainty_bounds(
+            mean, std_dev, current_z_score, float(history[-1])
+        )
         
         # The Orchestrator scales based on the upper_bound!
         mean = upper_bound  # We feed the uncertainty-adjusted bound as the target mean for scaling.

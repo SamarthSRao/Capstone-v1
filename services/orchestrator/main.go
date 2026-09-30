@@ -110,6 +110,7 @@ type Orchestrator struct {
 	maxReplicas   int
 	leadTime      time.Duration
 	scalePolicy   ScalePolicy
+	forecastGuard ForecastGuard
 }
 
 func (o *Orchestrator) DecideScaling(history []float32, currentSLA float32, currentWasted float32) (int, *pb.PredictionResponse, error) {
@@ -552,10 +553,12 @@ func startTargetAppMonitor(orch *Orchestrator) {
 			continue
 		}
 
-		// Project the forecast across pod startup when traffic is rising,
-		// then convert that arrival rate with the per-second capacity model.
+		// Act on the upper bound only when live RPS is rising. A flat series
+		// caps it near the observed rate so MC-dropout / z-score spikes at
+		// ~1 RPS cannot add a pod. The dashboard still shows the raw bound.
 		if orch.capacityModel {
-			lambda := leadAdjustedLambda(float64(predResp.UpperBound), currentRPS, recentSlope(history, 10), orch.leadTime)
+			slope := recentSlope(history, 10)
+			lambda := actionableForecast(float64(predResp.UpperBound), currentRPS, slope, orch.leadTime, orch.forecastGuard)
 			servers = ReplicasForLoad(lambda, orch.serviceRate, orch.minReplicas, orch.maxReplicas)
 		}
 
@@ -629,6 +632,19 @@ func envInt(key string, def int) int {
 	return n
 }
 
+func envFloat(key string, def float64) float64 {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return def
+	}
+	n, err := strconv.ParseFloat(v, 64)
+	if err != nil {
+		log.Printf("[Orchestrator] ignoring %s=%q (%v)", key, v, err)
+		return def
+	}
+	return n
+}
+
 func envBool(key string, def bool) bool {
 	switch strings.ToLower(strings.TrimSpace(os.Getenv(key))) {
 	case "1", "true", "yes", "y":
@@ -693,6 +709,12 @@ func main() {
 		maxReplicas = 2000 // classic GetRequiredServers has its own ceiling
 	}
 	leadTime := time.Duration(envInt("FORECAST_LEAD_SECONDS", 30)) * time.Second
+	// 50 RPS of headroom is under the 200 RPS pod size, so an idle upper
+	// bound of a few hundred RPS cannot by itself request a second pod.
+	guard := ForecastGuard{
+		FlatHeadroomRPS: envFloat("FLAT_HEADROOM_RPS", 50),
+		RisingSlope:     envFloat("RISING_SLOPE_RPS", 2),
+	}.normalized()
 	policy := ScalePolicy{
 		MinReplicas:            minReplicas,
 		MaxReplicas:            maxReplicas,
@@ -711,6 +733,7 @@ func main() {
 		maxReplicas:     policy.MaxReplicas,
 		leadTime:        leadTime,
 		scalePolicy:     policy,
+		forecastGuard:   guard,
 	}
 	if v := os.Getenv("SLA_THRESHOLD"); v != "" {
 		if parsed, perr := strconv.ParseFloat(v, 64); perr == nil && parsed > 0 && parsed < 1 {
@@ -718,8 +741,8 @@ func main() {
 		}
 	}
 
-	log.Printf("[Orchestrator] predictor=%s capacity_model=%v service_rate=%.0f rps/replica replicas=[%d,%d] lead=%s scale_down=%s step=%d autonomous=%v",
-		predictorAddr, capacityModel, serviceRate, policy.MinReplicas, policy.MaxReplicas, leadTime, policy.ScaleDownStabilization, policy.ScaleDownStep, autonomousScalerEnabled())
+	log.Printf("[Orchestrator] predictor=%s capacity_model=%v service_rate=%.0f rps/replica replicas=[%d,%d] lead=%s scale_down=%s step=%d flat_headroom=%.0f rising_slope=%.1f autonomous=%v",
+		predictorAddr, capacityModel, serviceRate, policy.MinReplicas, policy.MaxReplicas, leadTime, policy.ScaleDownStabilization, policy.ScaleDownStep, guard.FlatHeadroomRPS, guard.RisingSlope, autonomousScalerEnabled())
 
 	// On AKS this is the only GetPrediction caller, so the DQN sees one
 	// stream of SLA/waste feedback. Local compose leaves it off and uses /scale.
