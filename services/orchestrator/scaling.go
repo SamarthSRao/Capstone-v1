@@ -125,7 +125,7 @@ func recentSlope(history []float32, window int) float64 {
 // term is zero when live RPS is below the mean). With z around 2 that is
 // ~280 RPS, and a one-tick panic step or a fat std sample reaches ~440.
 // Both sit on the 200 RPS/pod boundary, so the actuator flapped 1 -> 2 and
-// sometimes 1 -> 3, then the 45s scale-down window brought the pod back.
+// sometimes 1 -> 3, then the scale-down window brought the pod back.
 //
 // FlatHeadroomRPS is added to the live rate when no ramp rule is active.
 // It must stay below the per-pod service rate so that noise cannot cross
@@ -199,12 +199,14 @@ type PrescaleConfig struct {
 	// decideScaleRate itself is given the already-computed slope.
 	// CapacityFraction is the share of current capacity the smoothed live
 	// rate (or the forecast mean) must already have reached. SlopeHeadroom
-	// is added after max(mean, live extrapolated across pod start). It
-	// stays well under one pod.
+	// is added after the capped projection. It stays well under one pod.
+	// SlopeSizeMargin caps that projection at the forecast mean plus this
+	// many RPS, so a noisy slope cannot size several pods past the mean.
 	SlopeSustain     int
 	SlopeWindow      int
 	CapacityFraction float64
 	SlopeHeadroom    float64
+	SlopeSizeMargin  float64
 }
 
 func (c PrescaleConfig) normalized() PrescaleConfig {
@@ -229,6 +231,9 @@ func (c PrescaleConfig) normalized() PrescaleConfig {
 	if c.SlopeHeadroom < 0 || math.IsNaN(c.SlopeHeadroom) {
 		c.SlopeHeadroom = 40
 	}
+	if c.SlopeSizeMargin <= 0 || math.IsNaN(c.SlopeSizeMargin) {
+		c.SlopeSizeMargin = 80
+	}
 	return c
 }
 
@@ -239,6 +244,7 @@ type PrescaleState struct {
 	MeanEMA       float64
 	MarginEMA     float64
 	LiveEMA       float64
+	SlopeEMA      float64
 	SlopeStreak   int
 	primed        bool
 }
@@ -255,12 +261,13 @@ type ScaleSignal struct {
 //
 // The upper bound is Monte Carlo dropout noise. It is only allowed through
 // the idle cap (live RPS + FlatHeadroomRPS). A slope-triggered scale-up
-// fires when three things are true together: the slope has cleared its
-// threshold for SlopeSustain ticks, the smoothed live rate or the forecast
-// mean is already at CapacityFraction of current capacity, and extrapolating
-// that slope across pod start (or the forecast mean, whichever is larger)
-// plus a small headroom would exceed capacity. The replica count then comes
-// from that extrapolation, not from the upper bound.
+// fires when three things are true together: the windowed slope has cleared
+// its threshold for SlopeSustain ticks, the smoothed live rate or the forecast
+// mean is already at CapacityFraction of current capacity, and the smoothed
+// slope carried across pod start (or the forecast mean, whichever is larger)
+// plus a small headroom would exceed capacity. Sizing uses an EMA of the
+// windowed slope, and when the forecast mean is present that projection is
+// capped at the mean plus SlopeSizeMargin. The raw upper bound is not an input.
 //
 // Live RPS at or above current capacity scales on that same tick
 // (live-capacity), again from the live rate and the mean, not the upper bound.
@@ -317,6 +324,11 @@ func decideScaleRate(upperBound, mean, currentRPS, slopePerSec, capacity float64
 	} else {
 		state.SlopeStreak = 0
 	}
+	// Size from the smoothed slope. A 15s window can still read a dip-then-spike
+	// as a steep ramp; the EMA keeps one noisy window from adding several pods.
+	// The streak above still uses the windowed slope, so a real ramp qualifies
+	// as soon as that window clears the threshold.
+	state.SlopeEMA = alpha*slopePerSec + (1-alpha)*state.SlopeEMA
 
 	// Idle cap. Slope is passed as 0 so a jittery rise cannot lift the
 	// ceiling; the upper bound still cannot pass live + headroom.
@@ -340,7 +352,7 @@ func decideScaleRate(upperBound, mean, currentRPS, slopePerSec, capacity float64
 	if currentRPS < capacity && state.SlopeStreak >= cfg.SlopeSustain && capacity > 0 {
 		near := state.LiveEMA >= cfg.CapacityFraction*capacity || mean >= cfg.CapacityFraction*capacity
 		if near {
-			projected := extrapolateLive(currentRPS, mean, slopePerSec, lead) + cfg.SlopeHeadroom
+			projected := slopeProjection(currentRPS, mean, state.SlopeEMA, lead, cfg) + cfg.SlopeHeadroom
 			if projected > capacity {
 				consider(projected, ruleSlope)
 			}
@@ -353,9 +365,10 @@ func decideScaleRate(upperBound, mean, currentRPS, slopePerSec, capacity float64
 			rate = mean
 		}
 		// A single spiked sample can clear capacity. Only a slope that has
-		// already held for SlopeSustain ticks may look further ahead.
+		// already held for SlopeSustain ticks may look further ahead, and
+		// that look-ahead is the smoothed slope, capped near the mean.
 		if state.SlopeStreak >= cfg.SlopeSustain {
-			ahead := extrapolateLive(currentRPS, mean, slopePerSec, lead)
+			ahead := slopeProjection(currentRPS, mean, state.SlopeEMA, lead, cfg)
 			if ahead > rate {
 				rate = ahead
 			}
@@ -363,6 +376,26 @@ func decideScaleRate(upperBound, mean, currentRPS, slopePerSec, capacity float64
 		consider(rate+cfg.SlopeHeadroom, ruleLiveCapacity)
 	}
 	return best
+}
+
+// slopeProjection is max(forecast mean, live RPS carried by the smoothed
+// slope for the pod-start lead). When the mean is available the result
+// cannot pass mean + SlopeSizeMargin, and it cannot pass below live RPS:
+// a lagging mean must not hide traffic that is already here. The upper
+// bound is not an input.
+func slopeProjection(currentRPS, mean, slopePerSec float64, lead time.Duration, cfg PrescaleConfig) float64 {
+	cfg = cfg.normalized()
+	projected := extrapolateLive(currentRPS, mean, slopePerSec, lead)
+	if mean > 0 && !math.IsNaN(mean) {
+		ceiling := mean + cfg.SlopeSizeMargin
+		if ceiling < currentRPS {
+			ceiling = currentRPS
+		}
+		if projected > ceiling {
+			projected = ceiling
+		}
+	}
+	return projected
 }
 
 // extrapolateLive is max(forecast mean, live RPS carried forward by the
@@ -465,6 +498,55 @@ func clampReplicas(n, minR, maxR int) int {
 		return maxR
 	}
 	return n
+}
+
+// demandTrack is one sample per second of max(forecast mean, live RPS).
+// Scale-down looks at the max over the stabilization window.
+type demandTrack struct {
+	samples []float64
+}
+
+func (d *demandTrack) push(mean, live float64, window int) float64 {
+	sample := live
+	if math.IsNaN(sample) || sample < 0 {
+		sample = 0
+	}
+	if !math.IsNaN(mean) && mean > sample {
+		sample = mean
+	}
+	if window < 1 {
+		window = 1
+	}
+	d.samples = append(d.samples, sample)
+	if len(d.samples) > window {
+		d.samples = d.samples[len(d.samples)-window:]
+	}
+	peak := 0.0
+	for _, s := range d.samples {
+		if s > peak {
+			peak = s
+		}
+	}
+	return peak
+}
+
+// limitScaleDown refuses a scale-down when the peak of forecast mean and
+// live RPS over the stabilization window still needs the pods that are
+// running. A dip inside that window then cannot drop a pod the next rise
+// would put straight back. Scale-up is unchanged. The step limit stays in
+// applyScalePolicy.
+func limitScaleDown(current, desired int, peak, mu float64, minR, maxR int) int {
+	if desired >= current {
+		return desired
+	}
+	need := ReplicasForLoad(peak, mu, minR, maxR)
+	if need >= current {
+		return current
+	}
+	if desired < need {
+		return need
+	}
+	return desired
 }
 
 // applyScalePolicy chooses the next replica count.

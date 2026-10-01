@@ -477,6 +477,7 @@ func startTargetAppMonitor(orch *Orchestrator) {
 	}
 	var fb feedbackWindow
 	fb.size = 30
+	var demand demandTrack
 	violations := 0
 	scrapeMisses := 0
 
@@ -569,6 +570,11 @@ func startTargetAppMonitor(orch *Orchestrator) {
 			signal := decideScaleRate(float64(predResp.UpperBound), float64(predResp.RawMlMean), currentRPS, slope, capacity, orch.leadTime, orch.forecastGuard, orch.prescaleCfg, &orch.prescaleState)
 			scaleRule = signal.Rule
 			servers = ReplicasForLoad(signal.Lambda, orch.serviceRate, orch.minReplicas, orch.maxReplicas)
+			// Hold the extra pod through a dip unless the whole stabilization
+			// window's forecast mean and live RPS fit in fewer pods.
+			window := int(orch.scalePolicy.ScaleDownStabilization / time.Second)
+			peak := demand.push(float64(predResp.RawMlMean), currentRPS, window)
+			servers = limitScaleDown(currentReplicas, servers, peak, orch.serviceRate, orch.minReplicas, orch.maxReplicas)
 		}
 
 		decision := applyScalePolicy(currentReplicas, servers, now.Sub(lastScaleChange), orch.scalePolicy)
@@ -720,7 +726,7 @@ func main() {
 	if !capacityModel && os.Getenv("MAX_REPLICAS") == "" {
 		maxReplicas = 2000 // classic GetRequiredServers has its own ceiling
 	}
-	leadTime := time.Duration(envInt("FORECAST_LEAD_SECONDS", 30)) * time.Second
+	leadTime := time.Duration(envInt("FORECAST_LEAD_SECONDS", 20)) * time.Second
 	// 50 RPS of headroom is under the 200 RPS pod size, so an idle upper
 	// bound of a few hundred RPS cannot by itself request a second pod.
 	guard := ForecastGuard{
@@ -740,11 +746,12 @@ func main() {
 		SlopeWindow:      envInt("SLOPE_WINDOW_TICKS", 15),
 		CapacityFraction: envFloat("CAPACITY_FRACTION", 0.70),
 		SlopeHeadroom:    envFloat("SLOPE_HEADROOM_RPS", 40),
+		SlopeSizeMargin:  envFloat("SLOPE_SIZE_MARGIN_RPS", 80),
 	}.normalized()
 	policy := ScalePolicy{
 		MinReplicas:            minReplicas,
 		MaxReplicas:            maxReplicas,
-		ScaleDownStabilization: time.Duration(envInt("SCALE_DOWN_STABILIZATION_SEC", 45)) * time.Second,
+		ScaleDownStabilization: time.Duration(envInt("SCALE_DOWN_STABILIZATION_SEC", 100)) * time.Second,
 		ScaleDownStep:          envInt("SCALE_DOWN_STEP", 1),
 	}
 	policy = normalizeScalePolicy(policy)
@@ -768,8 +775,8 @@ func main() {
 		}
 	}
 
-	log.Printf("[Orchestrator] predictor=%s capacity_model=%v service_rate=%.0f rps/replica replicas=[%d,%d] lead=%s scale_down=%s step=%d flat_headroom=%.0f rising_slope=%.1f rising_frac=%.3f slope_sustain=%d slope_window=%d capacity_frac=%.2f slope_headroom=%.0f prescale_ticks=%d margin_cap=%.0f autonomous=%v",
-		predictorAddr, capacityModel, serviceRate, policy.MinReplicas, policy.MaxReplicas, leadTime, policy.ScaleDownStabilization, policy.ScaleDownStep, guard.FlatHeadroomRPS, guard.RisingSlope, guard.RisingFraction, prescale.SlopeSustain, prescale.SlopeWindow, prescale.CapacityFraction, prescale.SlopeHeadroom, prescale.PersistTicks, prescale.MarginCapRPS, autonomousScalerEnabled())
+	log.Printf("[Orchestrator] predictor=%s capacity_model=%v service_rate=%.0f rps/replica replicas=[%d,%d] lead=%s scale_down=%s step=%d flat_headroom=%.0f rising_slope=%.1f rising_frac=%.3f slope_sustain=%d slope_window=%d capacity_frac=%.2f slope_headroom=%.0f slope_size_margin=%.0f prescale_ticks=%d margin_cap=%.0f autonomous=%v",
+		predictorAddr, capacityModel, serviceRate, policy.MinReplicas, policy.MaxReplicas, leadTime, policy.ScaleDownStabilization, policy.ScaleDownStep, guard.FlatHeadroomRPS, guard.RisingSlope, guard.RisingFraction, prescale.SlopeSustain, prescale.SlopeWindow, prescale.CapacityFraction, prescale.SlopeHeadroom, prescale.SlopeSizeMargin, prescale.PersistTicks, prescale.MarginCapRPS, autonomousScalerEnabled())
 
 	// On AKS this is the only GetPrediction caller, so the DQN sees one
 	// stream of SLA/waste feedback. Local compose leaves it off and uses /scale.

@@ -250,6 +250,7 @@ func productionGuard() (ForecastGuard, PrescaleConfig) {
 		SlopeWindow:      15,
 		CapacityFraction: 0.70,
 		SlopeHeadroom:    40,
+		SlopeSizeMargin:  80,
 	}.normalized()
 	return g, c
 }
@@ -349,21 +350,25 @@ func TestRampFrom50To600ScalesAtOrBeforeCapacity(t *testing.T) {
 	rps := 50.0
 	step := (600.0 - 50.0) / 60.0
 	crossedAt := map[int]int{}
+	arrivedAt := map[int]float64{}
 	for tick := 0; tick < 61; tick++ {
 		copy(hist, hist[1:])
 		hist[len(hist)-1] = float32(rps)
 		slope := recentSlope(hist, cfg.SlopeWindow)
 		capacity := float64(replicas) * mu
-		signal := decideScaleRate(680, rps, rps, slope, capacity, 30*time.Second, guard, cfg, state)
+		signal := decideScaleRate(680, rps, rps, slope, capacity, 20*time.Second, guard, cfg, state)
 		next := ReplicasForLoad(signal.Lambda, mu, 1, 10)
 		if next > replicas {
 			replicas = next
 		}
-		// Pre-scale of one pod before the 200 RPS crossing is the slope
-		// rule. Four pods while live RPS is still under 200 is the raw
-		// upper bound (680) leaking back in.
-		if rps < 200 && replicas > 3 {
-			t.Fatalf("tick %d rps %.0f slope %.2f rule %s lambda %.0f already at %d pods", tick, rps, slope, signal.Rule, signal.Lambda, replicas)
+		if _, seen := arrivedAt[replicas]; !seen {
+			arrivedAt[replicas] = rps
+		}
+		// Needed pods for the live rate, plus one. A noisy 30s slope used to
+		// jump well past that (4 -> 7 at ~612 RPS).
+		needNow := ReplicasForLoad(rps, mu, 1, 10)
+		if replicas > needNow+1 {
+			t.Fatalf("tick %d rps %.0f slope %.2f rule %s lambda %.0f at %d pods, need at most %d", tick, rps, slope, signal.Rule, signal.Lambda, replicas, needNow+1)
 		}
 		for _, level := range []int{200, 400, 600} {
 			if _, seen := crossedAt[level]; !seen && rps >= float64(level) {
@@ -386,11 +391,144 @@ func TestRampFrom50To600ScalesAtOrBeforeCapacity(t *testing.T) {
 		}
 		rps += step
 	}
-	// 600 RPS is four pods (saturated, so one spare). Looking 30s ahead
-	// while the ramp is still ~9 RPS/s asks for about 600+275+40, which
-	// is five pods. Six would mean the 680 upper bound was added on top.
 	if replicas < 4 || replicas > 5 {
-		t.Fatalf("ramp ended at %d pods; want 4 or 5 from the live slope, not the 680 upper bound", replicas)
+		t.Fatalf("ramp ended at %d pods; 600 RPS needs 4, and the slope cap allows at most one extra", replicas)
+	}
+	// Each extra pod has to be requested while live RPS is still under the
+	// capacity it is there to cover.
+	if got := arrivedAt[2]; got >= 200 {
+		t.Fatalf("second pod arrived at %.0f RPS, want it before 200", got)
+	}
+	if got := arrivedAt[3]; got >= 400 {
+		t.Fatalf("third pod arrived at %.0f RPS, want it before 400", got)
+	}
+	if got := arrivedAt[4]; got >= 600 {
+		t.Fatalf("fourth pod arrived at %.0f RPS, want it before 600", got)
+	}
+}
+
+func TestNoisySlopeAtPeakDoesNotOvershoot(t *testing.T) {
+	// Kind retest: live 612 RPS, slope rule sized max(mean, live+slope*30s)+40
+	// and jumped 4 -> 7. The forecast mean is near the live rate. A steep
+	// window slope must not add more than one pod past what 612 RPS needs.
+	guard, cfg := productionGuard()
+	const mu = 200.0
+	state := &PrescaleState{}
+	replicas := 4
+	for tick := 0; tick < 20; tick++ {
+		signal := decideScaleRate(900, 620, 612, 40, float64(replicas)*mu, 20*time.Second, guard, cfg, state)
+		next := ReplicasForLoad(signal.Lambda, mu, 1, 10)
+		if next > replicas {
+			replicas = next
+		}
+	}
+	need := ReplicasForLoad(612, mu, 1, 10)
+	if replicas > need+1 {
+		t.Fatalf("noisy slope sized %d pods at 612 RPS; need %d, allow at most one extra", replicas, need)
+	}
+	if replicas < need {
+		t.Fatalf("noisy slope left %d pods at 612 RPS; need %d", replicas, need)
+	}
+}
+
+func TestShortDipDoesNotCycleReplicas(t *testing.T) {
+	// Kind retest: 1 -> 2, then ~45s later a scale-down at 127-146 RPS, then
+	// another scale-up. The dip is shorter than the 100s stabilization window.
+	guard, cfg := productionGuard()
+	const mu = 200.0
+	policy := ScalePolicy{
+		MinReplicas:            1,
+		MaxReplicas:            10,
+		ScaleDownStabilization: 100 * time.Second,
+		ScaleDownStep:          1,
+	}
+	state := &PrescaleState{}
+	var demand demandTrack
+	replicas := 1
+	lastChange := 0
+	hist := make([]float32, 24)
+	for i := range hist {
+		hist[i] = 80
+	}
+	rps := 80.0
+	scaleUps := 0
+	for tick := 0; tick < 80; tick++ {
+		switch {
+		case tick < 20:
+			rps += 8
+		case tick < 65:
+			rps = 130 + float64((tick%5)*4)
+		default:
+			rps = 230
+		}
+		copy(hist, hist[1:])
+		hist[len(hist)-1] = float32(rps)
+		slope := recentSlope(hist, cfg.SlopeWindow)
+		mean := rps
+		if tick < 20 {
+			mean = rps + 40
+		}
+		capacity := float64(replicas) * mu
+		signal := decideScaleRate(680, mean, rps, slope, capacity, 20*time.Second, guard, cfg, state)
+		desired := ReplicasForLoad(signal.Lambda, mu, 1, 10)
+		peak := demand.push(mean, rps, 100)
+		desired = limitScaleDown(replicas, desired, peak, mu, 1, 10)
+		decision := applyScalePolicy(replicas, desired, time.Duration(tick-lastChange)*time.Second, policy)
+		if decision.Direction == "up" || decision.Direction == "down" {
+			if decision.Direction == "up" {
+				scaleUps++
+			}
+			replicas = decision.Next
+			lastChange = tick
+		}
+		if tick >= 20 && tick < 65 && replicas != 2 {
+			t.Fatalf("dip tick %d rps %.0f replicas %d rule %s", tick, rps, replicas, signal.Rule)
+		}
+	}
+	if replicas != 2 {
+		t.Fatalf("ended at %d replicas after the second rise", replicas)
+	}
+	if scaleUps != 1 {
+		t.Fatalf("scale-ups = %d, want one 1->2 and no second scale-up after the dip", scaleUps)
+	}
+}
+
+func TestScaleDownWaitsForWindowPeakToFit(t *testing.T) {
+	const mu = 200.0
+	policy := ScalePolicy{
+		MinReplicas:            1,
+		MaxReplicas:            10,
+		ScaleDownStabilization: 100 * time.Second,
+		ScaleDownStep:          1,
+	}
+	var demand demandTrack
+	replicas := 2
+	// Ten seconds at 220 RPS, which needs two pods, then a long sit at 140.
+	for tick := 0; tick < 10; tick++ {
+		demand.push(220, 220, 100)
+	}
+	for tick := 10; tick < 110; tick++ {
+		peak := demand.push(140, 140, 100)
+		desired := limitScaleDown(replicas, ReplicasForLoad(140, mu, 1, 10), peak, mu, 1, 10)
+		// Last change was the scale-up at tick 0.
+		decision := applyScalePolicy(replicas, desired, time.Duration(tick)*time.Second, policy)
+		if tick < 100 {
+			if decision.Direction == "down" || decision.Next != 2 {
+				t.Fatalf("tick %d scaled down inside 100s: %+v peak %.0f", tick, decision, peak)
+			}
+			continue
+		}
+		// The 220 RPS samples are still inside the 100-sample window until
+		// they age out, so the timer alone must not drop the pod.
+		if tick < 109 {
+			if decision.Next != 2 {
+				t.Fatalf("tick %d dropped a pod while the window peak is %.0f", tick, peak)
+			}
+			continue
+		}
+		if decision.Direction != "down" || decision.Next != 1 {
+			t.Fatalf("tick %d peak %.0f: %+v, want one step to 1", tick, peak, decision)
+		}
 	}
 }
 
