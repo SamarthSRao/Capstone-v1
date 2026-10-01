@@ -19,13 +19,13 @@ Each target pod is treated as **200 requests/second**. The cap is 10, which fits
 
 The orchestrator logs which scale-up rule fired (`rule=...` on the orchestrator pod, and `scale_rule` on `/api/target/status`):
 
-- `forecast-persistence` — the forecast **mean** (not the upper bound) has stayed above the current fleet's capacity for `PRESCALE_PERSIST_TICKS` (default 3). This is the pre-scale. Live RPS can still be flat.
-- `forecast-margin` — a smoothed lead (mean minus live RPS, capped at `PRESCALE_MARGIN_CAP_RPS`, default 40) pushes the smoothed mean over current capacity. The cap is far below one pod, so an idle mean near 70 cannot clear 200.
+- `forecast-persistence` — the forecast **mean** (not the upper bound) has reached `PRESCALE_CAPACITY_FRACTION` of current capacity (default **80%**, so about 160 RPS on one pod). It has to hold for `PRESCALE_PERSIST_TICKS` (default 3), unless a real rise is already in progress, in which case it fires on that tick. A mean under 200 used to wait forever; 172 RPS is enough when the line is 160.
+- `forecast-margin` — a smoothed lead (mean minus the median live RPS) pushes the smoothed mean over current capacity. The cap is the larger of `PRESCALE_MARGIN_CAP_RPS` (40) and `PRESCALE_MARGIN_FRACTION` of capacity (default 20%, which is 40 RPS on one pod and 80 on two). An idle mean near 70 still cannot clear 200.
 - `slope` — a real ramp, not jitter. The rise must clear `max(RISING_SLOPE_RPS, RISING_SLOPE_FRACTION * capacity)` for `SLOPE_SUSTAIN_TICKS` ticks in a row. The slope is the change over `SLOPE_WINDOW_TICKS` seconds, then smoothed with `PRESCALE_SMOOTH_ALPHA` before it is used to size. The smoothed live RPS **or the forecast mean** must already be at `CAPACITY_FRACTION` of current capacity (default 70%). The size is that smoothed slope carried `FORECAST_LEAD_SECONDS` forward, or the forecast mean, whichever is larger, capped at the mean plus `SLOPE_SIZE_MARGIN_RPS` when the mean is present, plus `SLOPE_HEADROOM_RPS`. The raw upper bound is not an input.
-- `live-capacity` — live RPS is already at or above what the ready pods can serve. Scale-up is immediate, from the live rate and the mean. A slope that has already held may look `FORECAST_LEAD_SECONDS` ahead, with the same cap near the mean; a one-tick spike does not.
+- `live-capacity` — the **median** of the last `LIVE_MEDIAN_TICKS` live samples (default 3) is already at or above what the ready pods can serve. Scale-up is immediate once that median crosses. One sample of 657 RPS while the neighbors are ~380 does not add a pod. A slope that has already held may look `FORECAST_LEAD_SECONDS` ahead, with the same cap near the mean.
 - `idle-guard` — none of the above. The noisy upper bound is capped at live RPS + `FLAT_HEADROOM_RPS` (default 50), including when the per-second change is a few RPS.
 
-Defaults: `RISING_SLOPE_RPS=5`, `RISING_SLOPE_FRACTION=0.01`, `SLOPE_SUSTAIN_TICKS=3`, `SLOPE_WINDOW_TICKS=15`, `CAPACITY_FRACTION=0.70`, `SLOPE_HEADROOM_RPS=40`, `SLOPE_SIZE_MARGIN_RPS=80`, `FLAT_HEADROOM_RPS=50`, `FORECAST_LEAD_SECONDS=20`, `SCALE_DOWN_STABILIZATION_SEC=100`, `SCALE_DOWN_STEP=1`. All of those are env vars on the orchestrator Deployment.
+Defaults: `RISING_SLOPE_RPS=5`, `RISING_SLOPE_FRACTION=0.01`, `SLOPE_SUSTAIN_TICKS=3`, `SLOPE_WINDOW_TICKS=15`, `CAPACITY_FRACTION=0.70` (slope may look ahead once the smoothed rate is here), `PRESCALE_CAPACITY_FRACTION=0.80` (mean or a rising live median requests the next pod), `PRESCALE_MARGIN_FRACTION=0.20`, `PRESCALE_MARGIN_CAP_RPS=40`, `LIVE_MEDIAN_TICKS=3`, `SLOPE_HEADROOM_RPS=40`, `SLOPE_SIZE_MARGIN_RPS=80`, `FLAT_HEADROOM_RPS=50`, `FORECAST_LEAD_SECONDS=20`, `SCALE_DOWN_STABILIZATION_SEC=100`, `SCALE_DOWN_STEP=1`. All of those are env vars on the orchestrator Deployment. A rising smoothed live rate uses the same 3-tick slope hold, so jitter that is not actually climbing does not pre-scale.
 
 Scale-down removes one pod after that 100 seconds, and only when the **maximum** of the forecast mean and live RPS across the same window fits in fewer pods. A dip of about 45 seconds at 130-150 RPS used to drop the second pod and then add it back. The longer window holds the extra pod through that dip. Tradeoff: after the morning actually falls, the extra pod stays for a bit longer than 45 seconds, and it stays until the busy sample has aged out of the window.
 
@@ -45,7 +45,17 @@ az account set --subscription "<student-subscription-name-or-id>"
 az account show --output table
 ```
 
-Quota check, registry, cluster, push, apply. Defaults are `eastus2` and `Standard_B2s` (2 vCPU, 1 node, autoscaler max 2). `Standard_D2s_v5` in `eastus` is a common student-quota failure; if `Standard_B2s` is restricted, rerun with `Standard_D2as_v5`.
+Quota check, registry, cluster, push, apply. This subscription (Azure for Students) may deploy only in `indiasouthcentral`, `centralindia`, `eastasia`, `koreacentral`, and `malaysiawest`. Each of those regions has **6 regional vCPUs** and **4 vCPUs of the Standard BS family**.
+
+The default is **two** `Standard_B2ms` nodes (2 vCPU and 8 GiB each). That is the whole BS-family quota, so the cluster is fixed at 2 nodes: no cluster autoscaler, auto-upgrade channel `none`, node-pool max surge **0**. A surge node would be a third VM (6 vCPU of BS family) and Azure would deny it. Two nodes are started up front so the target-app range is schedulable without waiting for a scale-out that quota will not allow.
+
+`Standard_B2s` is the same 2 vCPU and the same BS quota, but only **4 GiB** of RAM. After kube reserves memory, allocatable is under 3 GiB, which does not leave room for system pods and the predictor (the image is on the order of 4 GB, and the pod limit is 1 GiB). Use `Standard_B2ms`. It spends the same 2 vCPU of BS-family quota per node.
+
+`MAX_REPLICAS` stays **10**. Each target pod requests 50m CPU and 64Mi memory. Two 2-vCPU nodes have about 1900m allocatable each (about 3800m together). System DaemonSets are on the order of a few hundred millicores per node. The fixed pods request 200m (predictor) + 50m (orchestrator) + 50m (nginx) + 20m (dashboard). That leaves well over 500m, which is 10 target pods. Their CPU **limits** (500m each) will share the 4 vCPUs and throttle if every pod is busy at once; the requests are what decide whether they schedule. B2ms memory (8 GiB, allocatable a bit over 6 GiB per node) holds the predictor limit plus 10 x 64Mi. B2s does not.
+
+The script runs `az provider show` for `Microsoft.Compute`, `Microsoft.Network`, `Microsoft.ContainerRegistry`, and `Microsoft.ContainerService`, and `az vm list-usage` / `az vm list-skus` before it creates anything. It also runs `az acr check-name` so a registry name that already exists in another subscription fails before the build.
+
+Cost: two B2ms nodes for as long as the resource group exists. Delete it when the demo is over. There is no separate "stop the cluster and keep the quota" path that frees the 4 vCPUs; the nodes have to go.
 
 ```bash
 chmod +x deploy/deploy_aks.sh deploy/load_gen.sh
@@ -61,14 +71,24 @@ Same flow on Windows PowerShell 5.1 (ASCII script, stops on a failed `az`/`kubec
 Overrides, bash then PowerShell:
 
 ```bash
-./deploy/deploy_aks.sh capstone-rg eastus2 capstone-aks Standard_D2as_v5
+./deploy/deploy_aks.sh capstone-rg centralindia capstone-aks Standard_B2ms
 ```
 
 ```powershell
-.\deploy\deploy_aks.ps1 -ResourceGroup capstone-rg -Location eastus2 -ClusterName capstone-aks -NodeSize Standard_D2as_v5 -NodeCount 1 -MaxNodes 2
+.\deploy\deploy_aks.ps1 -ResourceGroup capstone-rg -Location centralindia -ClusterName capstone-aks -NodeSize Standard_B2ms -NodeCount 2
 ```
 
-The script refuses to continue when the size is not offered, when the size is restricted in that region, or when the family or regional vCPU quota cannot fit the initial node.
+The script refuses to continue when the size is not offered, when the size is restricted in that region, when the family or regional vCPU quota cannot fit the two nodes, or when the ACR name is already taken outside this resource group.
+
+Tear down (cluster, registry, load balancers, and the public IPs):
+
+```bash
+az group delete --name capstone-rg --yes --no-wait
+```
+
+```powershell
+az group delete --name capstone-rg --yes --no-wait
+```
 
 When it finishes, note the two addresses it prints:
 
@@ -216,7 +236,7 @@ Each pod logs `target_rps`, `shard_target_rps`, and `achieved_rps` every 30 seco
 
 1. **Idle, before the replay.** "One pod is the warm floor. The upper bound on the chart can jump even though almost nothing is arriving. That is dropout noise. Desired replicas stays at 1. The log line would say `rule=idle-guard`."
 2. **Start the replay.** "This is a real NASA morning, sped up 40 times. The orchestrator counts nginx requests, not the active-connection line."
-3. **Before live RPS crosses 200.** Point at the forecast-mean line sitting above the live line, and at desired replicas moving to 2 while live RPS is still under 200. "The mean stayed over one pod's capacity for a few seconds, so this is `rule=forecast-persistence`, not a reaction to the slope. The pod is requested before the load is being served." Orchestrator log: `kubectl logs -n capstone -l app=orchestrator --tail=30`.
+3. **Before live RPS crosses 200, around 160.** Point at desired replicas moving to 2 while live RPS is still near 80% of one pod. "The forecast mean, or a live rate that has actually been rising, reached about 160 RPS. That is `rule=forecast-persistence` or `rule=slope`. The pod is requested before the load fills the one we have." Orchestrator log: `kubectl logs -n capstone -l app=orchestrator --tail=30`.
 4. **If the ramp is already steep and live RPS is near what the current pods can serve.** "`rule=slope` adds pods from the smoothed rise carried forward 20 seconds, and it will not size past the forecast mean by more than a small margin. It does not use the upper bound. A wiggle of a few RPS per second while you are well under capacity does not count. If live RPS is already over capacity, `rule=live-capacity` adds the pod on that same tick."
 5. **At the top.** "Each pod is budgeted at 200 RPS, cap 10. The replay log's `achieved_rps` is what nginx actually finished, next to `target_rps`."
 6. **After the morning falls.** "Desired drops right away. The running count does not. Scale-down waits 100 seconds, checks that the busiest live rate and forecast in that window fit in fewer pods, and then removes one pod."

@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"math"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -202,11 +203,20 @@ type PrescaleConfig struct {
 	// is added after the capped projection. It stays well under one pod.
 	// SlopeSizeMargin caps that projection at the forecast mean plus this
 	// many RPS, so a noisy slope cannot size several pods past the mean.
+	// PrescaleFraction is the share of current capacity (default 80%) at
+	// which the forecast mean, or a rising smoothed live rate, requests
+	// the next pod. It is earlier than waiting for the mean to clear 100%.
+	// MarginFraction raises the lead-margin cap with capacity (20% of the
+	// current fleet). LiveMedianTicks is the short window whose median is
+	// the live rate used for sizing, so one sample cannot set the replica count.
 	SlopeSustain     int
 	SlopeWindow      int
 	CapacityFraction float64
 	SlopeHeadroom    float64
 	SlopeSizeMargin  float64
+	PrescaleFraction float64
+	MarginFraction   float64
+	LiveMedianTicks  int
 }
 
 func (c PrescaleConfig) normalized() PrescaleConfig {
@@ -234,6 +244,15 @@ func (c PrescaleConfig) normalized() PrescaleConfig {
 	if c.SlopeSizeMargin <= 0 || math.IsNaN(c.SlopeSizeMargin) {
 		c.SlopeSizeMargin = 80
 	}
+	if c.PrescaleFraction <= 0 || c.PrescaleFraction > 1 || math.IsNaN(c.PrescaleFraction) {
+		c.PrescaleFraction = 0.80
+	}
+	if c.MarginFraction <= 0 || c.MarginFraction > 1 || math.IsNaN(c.MarginFraction) {
+		c.MarginFraction = 0.20
+	}
+	if c.LiveMedianTicks < 1 {
+		c.LiveMedianTicks = 3
+	}
 	return c
 }
 
@@ -246,14 +265,17 @@ type PrescaleState struct {
 	LiveEMA       float64
 	SlopeEMA      float64
 	SlopeStreak   int
+	FractionTicks int
+	liveSamples   []float64
 	primed        bool
 }
 
 // ScaleSignal is the arrival rate the actuator may turn into a replica count,
 // and which rule produced it.
 type ScaleSignal struct {
-	Lambda float64
-	Rule   string
+	Lambda    float64
+	Rule      string
+	SizingRPS float64
 }
 
 // decideScaleRate combines the idle cap, mean pre-scaling, and a slope
@@ -269,8 +291,15 @@ type ScaleSignal struct {
 // windowed slope, and when the forecast mean is present that projection is
 // capped at the mean plus SlopeSizeMargin. The raw upper bound is not an input.
 //
+// The forecast mean requests the next pod once it has sat at
+// PrescaleFraction of capacity (default 80%) for PersistTicks, or on
+// the same tick if a real rise is already underway. A rising smoothed
+// live rate (the median of the last few samples, not one spike) does
+// the same when the mean is behind. Idle noise does not: the mean has
+// to hold, or the live median has to be rising for SlopeSustain ticks.
+//
 // Live RPS at or above current capacity scales on that same tick
-// (live-capacity), again from the live rate and the mean, not the upper bound.
+// (live-capacity) once the median, not a single sample, has crossed.
 // Capacity is the current fleet times the per-pod service rate.
 func decideScaleRate(upperBound, mean, currentRPS, slopePerSec, capacity float64, lead time.Duration, guard ForecastGuard, cfg PrescaleConfig, state *PrescaleState) ScaleSignal {
 	guard = guard.normalized()
@@ -303,14 +332,22 @@ func decideScaleRate(upperBound, mean, currentRPS, slopePerSec, capacity float64
 		state.primed = true
 	}
 	alpha := cfg.SmoothAlpha
+	sizingLive := state.pushLiveMedian(currentRPS, cfg.LiveMedianTicks)
 	state.MeanEMA = alpha*mean + (1-alpha)*state.MeanEMA
 	state.LiveEMA = alpha*currentRPS + (1-alpha)*state.LiveEMA
-	gap := mean - currentRPS
+	marginCap := cfg.MarginCapRPS
+	if capacity > 0 {
+		proportional := cfg.MarginFraction * capacity
+		if proportional > marginCap {
+			marginCap = proportional
+		}
+	}
+	gap := mean - sizingLive
 	if gap < 0 {
 		gap = 0
 	}
-	if gap > cfg.MarginCapRPS {
-		gap = cfg.MarginCapRPS
+	if gap > marginCap {
+		gap = marginCap
 	}
 	state.MarginEMA = alpha*gap + (1-alpha)*state.MarginEMA
 
@@ -330,37 +367,70 @@ func decideScaleRate(upperBound, mean, currentRPS, slopePerSec, capacity float64
 	// as soon as that window clears the threshold.
 	state.SlopeEMA = alpha*slopePerSec + (1-alpha)*state.SlopeEMA
 
-	// Idle cap. Slope is passed as 0 so a jittery rise cannot lift the
-	// ceiling; the upper bound still cannot pass live + headroom.
+	// Idle cap. The median live rate is the ceiling, so one sample of 657 RPS
+	// cannot size the fleet. Slope is passed as 0 so a jittery rise cannot
+	// lift the cap either.
 	best := ScaleSignal{
-		Lambda: actionableForecast(upperBound, currentRPS, 0, lead, guard),
-		Rule:   ruleIdleGuard,
+		Lambda:    actionableForecast(upperBound, sizingLive, 0, lead, guard),
+		Rule:      ruleIdleGuard,
+		SizingRPS: sizingLive,
 	}
 	consider := func(lambda float64, rule string) {
 		if lambda > best.Lambda {
-			best = ScaleSignal{Lambda: lambda, Rule: rule}
+			best = ScaleSignal{Lambda: lambda, Rule: rule, SizingRPS: sizingLive}
 		}
+	}
+
+	fractionLine := 0.0
+	if capacity > 0 {
+		fractionLine = cfg.PrescaleFraction * capacity
+	}
+	if capacity > 0 && mean >= fractionLine {
+		state.FractionTicks++
+	} else {
+		state.FractionTicks = 0
 	}
 
 	if state.AboveCapacity >= cfg.PersistTicks {
 		// The mean itself, not the upper bound and not a one-window slope.
 		consider(mean, rulePersistence)
+	} else if capacity > 0 && mean >= fractionLine && (state.FractionTicks >= cfg.PersistTicks || state.SlopeStreak >= cfg.SlopeSustain) {
+		// 80% of the current pods, held or confirmed by a rise. Size at
+		// least at the pod boundary so this requests the next pod, and at
+		// the mean when the mean is already higher.
+		rate := mean
+		if capacity > rate {
+			rate = capacity
+		}
+		consider(rate, rulePersistence)
 	} else if state.MeanEMA+state.MarginEMA > capacity && state.MarginEMA > 0 {
 		consider(state.MeanEMA+state.MarginEMA, ruleMargin)
 	}
 
-	if currentRPS < capacity && state.SlopeStreak >= cfg.SlopeSustain && capacity > 0 {
+	if sizingLive < capacity && state.SlopeStreak >= cfg.SlopeSustain && capacity > 0 {
 		near := state.LiveEMA >= cfg.CapacityFraction*capacity || mean >= cfg.CapacityFraction*capacity
 		if near {
-			projected := slopeProjection(currentRPS, mean, state.SlopeEMA, lead, cfg) + cfg.SlopeHeadroom
+			projected := slopeProjection(sizingLive, mean, state.SlopeEMA, lead, cfg) + cfg.SlopeHeadroom
 			if projected > capacity {
 				consider(projected, ruleSlope)
 			}
 		}
+		// Mean can sit under 80% on a real ramp. The median live rate, once
+		// it is there and the rise has held, still requests the next pod.
+		if sizingLive >= fractionLine {
+			rate := sizingLive
+			if mean > rate {
+				rate = mean
+			}
+			if capacity > rate {
+				rate = capacity
+			}
+			consider(rate, ruleSlope)
+		}
 	}
 
-	if capacity > 0 && currentRPS >= capacity {
-		rate := currentRPS
+	if capacity > 0 && sizingLive >= capacity {
+		rate := sizingLive
 		if mean > rate {
 			rate = mean
 		}
@@ -368,7 +438,7 @@ func decideScaleRate(upperBound, mean, currentRPS, slopePerSec, capacity float64
 		// already held for SlopeSustain ticks may look further ahead, and
 		// that look-ahead is the smoothed slope, capped near the mean.
 		if state.SlopeStreak >= cfg.SlopeSustain {
-			ahead := slopeProjection(currentRPS, mean, state.SlopeEMA, lead, cfg)
+			ahead := slopeProjection(sizingLive, mean, state.SlopeEMA, lead, cfg)
 			if ahead > rate {
 				rate = ahead
 			}
@@ -376,6 +446,33 @@ func decideScaleRate(upperBound, mean, currentRPS, slopePerSec, capacity float64
 		consider(rate+cfg.SlopeHeadroom, ruleLiveCapacity)
 	}
 	return best
+}
+
+func (s *PrescaleState) pushLiveMedian(sample float64, window int) float64 {
+	if window < 1 {
+		window = 3
+	}
+	if math.IsNaN(sample) || sample < 0 {
+		sample = 0
+	}
+	s.liveSamples = append(s.liveSamples, sample)
+	if len(s.liveSamples) > window {
+		s.liveSamples = s.liveSamples[len(s.liveSamples)-window:]
+	}
+	return medianRPS(s.liveSamples)
+}
+
+func medianRPS(values []float64) float64 {
+	n := len(values)
+	if n == 0 {
+		return 0
+	}
+	tmp := append([]float64(nil), values...)
+	sort.Float64s(tmp)
+	if n%2 == 1 {
+		return tmp[n/2]
+	}
+	return (tmp[n/2-1] + tmp[n/2]) / 2
 }
 
 // slopeProjection is max(forecast mean, live RPS carried by the smoothed

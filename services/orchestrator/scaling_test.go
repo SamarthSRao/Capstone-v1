@@ -216,9 +216,12 @@ func TestPersistentMeanScalesBeforeLiveCrossesCapacity(t *testing.T) {
 }
 
 func TestSmoothedMarginPrescalesWhenMeanIsNearCapacity(t *testing.T) {
-	// Mean stays just under capacity, so the persistence counter never trips.
-	// The smoothed lead margin is what crosses the line, after more than one tick.
+	// Mean stays just under capacity and under a 99% pre-scale line, so the
+	// 80% persistence path is not what crosses. The smoothed lead margin is,
+	// after more than one tick. The default fraction is 0.80; this test pins
+	// it high so the margin path still has a case of its own.
 	guard, cfg := prescaleFixture()
+	cfg.PrescaleFraction = 0.99
 	const mu = 200.0
 	state := &PrescaleState{}
 	fired := -1
@@ -396,14 +399,45 @@ func TestRampFrom50To600ScalesAtOrBeforeCapacity(t *testing.T) {
 	}
 	// Each extra pod has to be requested while live RPS is still under the
 	// capacity it is there to cover.
-	if got := arrivedAt[2]; got >= 200 {
-		t.Fatalf("second pod arrived at %.0f RPS, want it before 200", got)
+	if got := arrivedAt[2]; got > 170 {
+		t.Fatalf("second pod arrived at %.0f RPS, want it by about 160 (80%% of one pod)", got)
 	}
 	if got := arrivedAt[3]; got >= 400 {
 		t.Fatalf("third pod arrived at %.0f RPS, want it before 400", got)
 	}
 	if got := arrivedAt[4]; got >= 600 {
 		t.Fatalf("fourth pod arrived at %.0f RPS, want it before 600", got)
+	}
+}
+
+func TestOneSampleBurstDoesNotSetReplicaCount(t *testing.T) {
+	// Kind retest: one tick at 657 RPS while the recent samples were ~380
+	// jumped 3 -> 4 through the idle-guard ceiling (live + headroom).
+	// The median of a few ticks must ignore that sample. A run of ticks
+	// that really sits at 657 still scales on the tick the median crosses.
+	guard, cfg := productionGuard()
+	const mu = 200.0
+	state := &PrescaleState{}
+	replicas := 3
+	for tick := 0; tick < 5; tick++ {
+		signal := decideScaleRate(900, 380, 380, 0, float64(replicas)*mu, 20*time.Second, guard, cfg, state)
+		next := ReplicasForLoad(signal.Lambda, mu, 1, 10)
+		if next > replicas {
+			t.Fatalf("baseline tick %d scaled to %d rule %s lambda %.0f", tick, next, signal.Rule, signal.Lambda)
+		}
+	}
+	signal := decideScaleRate(900, 380, 657, 0, float64(replicas)*mu, 20*time.Second, guard, cfg, state)
+	if next := ReplicasForLoad(signal.Lambda, mu, 1, 10); next > 3 {
+		t.Fatalf("one sample of 657 scaled 3 -> %d rule %s lambda %.0f", next, signal.Rule, signal.Lambda)
+	}
+	for tick := 0; tick < 2; tick++ {
+		signal = decideScaleRate(900, 400, 657, 0, float64(replicas)*mu, 20*time.Second, guard, cfg, state)
+		if next := ReplicasForLoad(signal.Lambda, mu, 1, 10); next > replicas {
+			replicas = next
+		}
+	}
+	if replicas != 4 {
+		t.Fatalf("sustained 657 RPS ended at %d pods, want 4 (rule %s lambda %.0f)", replicas, signal.Rule, signal.Lambda)
 	}
 }
 

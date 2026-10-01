@@ -75,6 +75,18 @@ spec:
               value: "3"
             - name: PRESCALE_MARGIN_CAP_RPS
               value: "40"
+            # The margin cap is at least this fraction of current capacity
+            # (20% of one pod is 40 RPS, same as the floor above; two pods
+            # raise it to 80). Pre-scale also fires at 80% of capacity, from
+            # the forecast mean or from a rising median of live RPS.
+            - name: PRESCALE_MARGIN_FRACTION
+              value: "0.20"
+            - name: PRESCALE_CAPACITY_FRACTION
+              value: "0.80"
+            # Live RPS used for sizing is the median of this many ticks.
+            # One sample cannot add a pod; a sustained crossing still does.
+            - name: LIVE_MEDIAN_TICKS
+              value: "3"
             - name: PRESCALE_SMOOTH_ALPHA
               value: "0.2"
             - name: CAPACITY_MODEL
@@ -82,6 +94,10 @@ spec:
             # Warm floor. Never scale to zero; raise to 2 to keep a spare pod hot.
             - name: MIN_REPLICAS
               value: "1"
+            # 10 target pods request 10 x 50m = 500m CPU. Two 2-vCPU nodes
+            # have about 3800m allocatable after kube reservation. System
+            # pods, the predictor (200m), orchestrator (50m), nginx (50m),
+            # and dashboard (20m) leave room for that. See docs/DEMO_AKS.md.
             - name: MAX_REPLICAS
               value: "10"
             # Pods need about 10-20s to become Ready. The slope look-ahead is

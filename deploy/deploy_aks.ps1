@@ -12,23 +12,30 @@
       7. Apply k8s/ with images rewritten to <acr>.azurecr.io/<name>:latest
       8. Print the LoadBalancer addresses
 
-    Azure for Students often rejects eastus and Standard_D2s_v5.
-    Defaults are eastus2 and Standard_B2s. Pass -Location and -NodeSize to override.
+    Azure for Students on this subscription allows only these regions:
+    indiasouthcentral, centralindia, eastasia, koreacentral, malaysiawest.
+    Quota in each region is 6 regional vCPUs and 4 vCPUs of the Standard BS
+    family, so two 2-vCPU nodes and no third node for an upgrade surge.
+
+    Standard_B2s is 4 GiB and does not fit the predictor next to system pods.
+    The default is Standard_B2ms (2 vCPU, 8 GiB, same BS family). The cluster
+    is a fixed 2 nodes: no cluster autoscaler, auto-upgrade none, max surge 0.
+
+    Tear down when the demo is over:
+      az group delete --name capstone-rg --yes --no-wait
 
     Does not start load. After the IPs print, run:
-      ./deploy/load_gen.ps1
+      .\deploy\load_gen.ps1
 
     ASCII only so Windows PowerShell 5.1 does not mis-read a UTF-8 file without a BOM.
 #>
 [CmdletBinding()]
 param (
     [string]$ResourceGroup = "capstone-rg",
-    [string]$Location      = "eastus2",
+    [string]$Location      = "indiasouthcentral",
     [string]$ClusterName   = "capstone-aks",
-    [string]$NodeSize      = "Standard_B2s",
-    [int]$NodeCount        = 1,
-    [int]$MinNodes         = 1,
-    [int]$MaxNodes         = 2,
+    [string]$NodeSize      = "Standard_B2ms",
+    [int]$NodeCount        = 2,
     [string]$AcrName       = ""
 )
 
@@ -73,13 +80,13 @@ function Invoke-QuotaPreflight {
     $skus = @($skuJson | ConvertFrom-Json)
     $sku = $skus | Where-Object { $_.name -eq $NodeSize } | Select-Object -First 1
     if (-not $sku) {
-        throw "VM size $NodeSize is not offered in $Location. Try Standard_B2s or Standard_D2as_v5, and a region such as eastus2."
+        throw "VM size $NodeSize is not offered in $Location. Student regions: indiasouthcentral, centralindia, eastasia, koreacentral, malaysiawest. Use Standard_B2ms."
     }
     if ($sku.restrictions) {
         foreach ($restriction in @($sku.restrictions)) {
             $reason = $restriction.reasonCode
             if ($reason -and $reason -ne "None") {
-                throw "VM size $NodeSize is restricted in $Location ($reason). Azure for Students often blocks Standard_D2s_v5 in eastus. Re-run with -Location eastus2 -NodeSize Standard_B2s or Standard_D2as_v5."
+                throw "VM size $NodeSize is restricted in $Location ($reason). Stay on a student region and Standard_B2ms (BS family, 2 vCPU, 8 GiB)."
             }
         }
     }
@@ -105,19 +112,17 @@ function Invoke-QuotaPreflight {
         if ($remaining -lt $Need) {
             $msg = "quota $Name has $remaining vCPUs left but this request needs $Need"
             if ($Fatal) {
-                throw "ERROR: $msg. Lower -NodeCount / -MaxNodes, pick a smaller size, or request a quota increase."
+                throw "ERROR: $msg. Lower -NodeCount or use Standard_B2ms. BS-family quota is 4 vCPU (two nodes, no surge)."
             }
-            Write-Host "WARNING: $msg. The initial node fits; autoscaler growth may be denied."
+            Write-Host "WARNING: $msg."
         }
     }
 
     $need = $NodeCount * $vcpus
     if ($family) { Test-OneQuota -Name $family -Need $need -Fatal $true }
     Test-OneQuota -Name "cores" -Need $need -Fatal $true
-    if ($family -and $MaxNodes -gt $NodeCount) {
-        Test-OneQuota -Name $family -Need ($MaxNodes * $vcpus) -Fatal $false
-    }
-    Write-Host "Preflight OK: $NodeSize ($vcpus vCPU) x $NodeCount node(s), family $family"
+    Write-Host "Preflight OK: $NodeSize ($vcpus vCPU) x $NodeCount fixed node(s), family $family"
+    Write-Host "No surge node is requested. A third node would exceed a 4 vCPU BS-family quota."
 }
 
 Write-Host "=========================================================="
@@ -126,7 +131,16 @@ Write-Host "=========================================================="
 Write-Host "Resource group: $ResourceGroup"
 Write-Host "Location:       $Location"
 Write-Host "Cluster:        $ClusterName"
-Write-Host "Node size:      $NodeSize  (count $NodeCount, autoscaler $MinNodes-$MaxNodes)"
+Write-Host "Node size:      $NodeSize  (fixed count $NodeCount, max surge 0, no autoscaler)"
+$allowed = @("indiasouthcentral", "centralindia", "eastasia", "koreacentral", "malaysiawest")
+if ($allowed -notcontains $Location) {
+    Write-Host "WARNING: $Location is not one of the regions this student subscription allows:"
+    Write-Host "  indiasouthcentral, centralindia, eastasia, koreacentral, malaysiawest"
+}
+if ($NodeSize -eq "Standard_B2s") {
+    Write-Host "WARNING: Standard_B2s has 4 GiB RAM. The predictor does not fit next to system pods."
+    Write-Host "         Use Standard_B2ms (8 GiB, 2 vCPU, same BS-family quota)."
+}
 
 Write-Host ""
 Write-Host "[1/8] Checking Azure CLI login..."
@@ -172,8 +186,21 @@ $AcrName = ($AcrName.ToLower() -replace "[^a-z0-9]", "")
 if ($AcrName.Length -lt 5 -or $AcrName.Length -gt 50) {
     throw "ACR name '$AcrName' must be 5-50 alphanumeric characters."
 }
+# Names are global. check-name catches a collision in another subscription.
+$acrAvailable = az acr check-name --name $AcrName --query nameAvailable -o tsv
+Assert-Exit "az acr check-name"
+$acrReason = az acr check-name --name $AcrName --query reason -o tsv
 az acr show --name $AcrName --resource-group $ResourceGroup -o none 2>$null
-if ($LASTEXITCODE -eq 0) {
+$acrInGroup = ($LASTEXITCODE -eq 0)
+if ($acrAvailable -ne "true") {
+    if ($acrInGroup) {
+        Write-Host "ACR $AcrName already exists in $ResourceGroup; reusing it"
+    } else {
+        if (-not $acrReason) { $acrReason = "taken" }
+        throw "ACR name '$AcrName' is not available ($acrReason). Set -AcrName to another 5-50 character name and re-run."
+    }
+}
+if ($acrInGroup) {
     Write-Host "ACR $AcrName already exists"
 } else {
     az acr create --name $AcrName --resource-group $ResourceGroup --sku Basic --admin-enabled false --output table
@@ -203,19 +230,27 @@ if ($LASTEXITCODE -eq 0) {
     az aks update --resource-group $ResourceGroup --name $ClusterName --attach-acr $AcrName --output table
     Assert-Exit "az aks update --attach-acr"
 } else {
+    # Fixed node count. Autoscaler is off: the BS-family quota is 4 vCPU,
+    # which is exactly these two nodes.
     az aks create `
         --resource-group $ResourceGroup `
         --name $ClusterName `
         --node-count $NodeCount `
         --node-vm-size $NodeSize `
-        --enable-cluster-autoscaler `
-        --min-count $MinNodes `
-        --max-count $MaxNodes `
+        --auto-upgrade-channel none `
         --attach-acr $AcrName `
         --generate-ssh-keys `
         --output table
     Assert-Exit "az aks create"
 }
+# A surge node during an upgrade would be a third VM and would exceed the
+# 4 vCPU BS-family quota. 0 disables that extra node. Auto-upgrade stays off.
+$pool = az aks nodepool list --resource-group $ResourceGroup --cluster-name $ClusterName --query "[0].name" -o tsv
+Assert-Exit "az aks nodepool list"
+az aks nodepool update --resource-group $ResourceGroup --cluster-name $ClusterName --name $pool --max-surge 0 --output table
+Assert-Exit "az aks nodepool update --max-surge 0"
+az aks update --resource-group $ResourceGroup --name $ClusterName --auto-upgrade-channel none --output table
+Assert-Exit "az aks update --auto-upgrade-channel none"
 
 Write-Host ""
 Write-Host "[7/8] Configuring kubectl and applying manifests..."
@@ -355,6 +390,9 @@ Write-Host ""
 Write-Host "Generate the demo spike (in-cluster Locust):"
 Write-Host "  .\deploy\load_gen.ps1"
 Write-Host ""
-Write-Host "Watch replicas. Scale-up is immediate; scale-down steps one pod every 45s:"
+Write-Host "Watch replicas. Scale-up is immediate; scale-down waits 100s, then one pod:"
 Write-Host "  kubectl get pods -n capstone -l app=target-app -w"
+Write-Host ""
+Write-Host "Tear down when the demo is over (deletes the cluster, registry, and IPs):"
+Write-Host "  az group delete --name $ResourceGroup --yes --no-wait"
 Write-Host "=========================================================="

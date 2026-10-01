@@ -11,14 +11,28 @@
 #   7. Apply k8s/ with the images rewritten to <acr>.azurecr.io/<name>:latest
 #   8. Print the LoadBalancer addresses
 #
-# Student subscriptions often cannot use eastus + Standard_D2s_v5.
-# Defaults are eastus2 and Standard_B2s (2 vCPU). Override if quota says so.
+# Azure for Students on this subscription allows only:
+#   indiasouthcentral, centralindia, eastasia, koreacentral, malaysiawest
+# Quota in each region: 6 regional vCPUs, and 4 vCPUs of the Standard BS
+# family. That is two 2-vCPU nodes and no third node for an upgrade surge.
+#
+# Standard_B2s is 2 vCPU and 4 GiB. Allocatable memory is under 3 GiB after
+# kube and the system pods, which is not enough for the predictor image
+# alongside the rest of the stack. The default is Standard_B2ms (2 vCPU,
+# 8 GiB, same BS family, so two nodes are still 4 vCPU).
+#
+# The cluster is a fixed 2 nodes. Cluster autoscaler is off, auto-upgrade
+# is none, and the node pool max surge is 0. A surge node would ask for
+# 6 vCPU of BS family and the create or upgrade would be denied.
 #
 #   ./deploy/deploy_aks.sh
-#   ./deploy/deploy_aks.sh my-rg eastus2 my-aks Standard_D2as_v5
+#   ./deploy/deploy_aks.sh my-rg centralindia my-aks Standard_B2ms
 #
 # Env overrides (win over defaults, lose to positional args when those are set):
-#   RESOURCE_GROUP LOCATION CLUSTER_NAME NODE_SIZE NODE_COUNT MIN_NODES MAX_NODES ACR_NAME
+#   RESOURCE_GROUP LOCATION CLUSTER_NAME NODE_SIZE NODE_COUNT ACR_NAME
+#
+# Tear the whole thing down (registry, cluster, and the public IPs):
+#   az group delete --name capstone-rg --yes --no-wait
 #
 # This script does not start the load generator. After the IPs print, run:
 #   ./deploy/load_gen.sh
@@ -26,12 +40,10 @@
 set -euo pipefail
 
 RESOURCE_GROUP="${1:-${RESOURCE_GROUP:-capstone-rg}}"
-LOCATION="${2:-${LOCATION:-eastus2}}"
+LOCATION="${2:-${LOCATION:-indiasouthcentral}}"
 CLUSTER_NAME="${3:-${CLUSTER_NAME:-capstone-aks}}"
-NODE_SIZE="${4:-${NODE_SIZE:-Standard_B2s}}"
-NODE_COUNT="${NODE_COUNT:-1}"
-MIN_NODES="${MIN_NODES:-1}"
-MAX_NODES="${MAX_NODES:-2}"
+NODE_SIZE="${4:-${NODE_SIZE:-Standard_B2ms}}"
+NODE_COUNT="${NODE_COUNT:-2}"
 ACR_NAME="${ACR_NAME:-}"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -43,7 +55,20 @@ echo "=========================================================="
 echo "Resource group: $RESOURCE_GROUP"
 echo "Location:       $LOCATION"
 echo "Cluster:        $CLUSTER_NAME"
-echo "Node size:      $NODE_SIZE  (count $NODE_COUNT, autoscaler $MIN_NODES-$MAX_NODES)"
+echo "Node size:      $NODE_SIZE  (fixed count $NODE_COUNT, max surge 0, no autoscaler)"
+case "$LOCATION" in
+  indiasouthcentral|centralindia|eastasia|koreacentral|malaysiawest) ;;
+  *)
+    echo "WARNING: $LOCATION is not one of the regions this student subscription allows:"
+    echo "  indiasouthcentral, centralindia, eastasia, koreacentral, malaysiawest"
+    ;;
+esac
+case "$NODE_SIZE" in
+  Standard_B2s|standard_b2s)
+    echo "WARNING: Standard_B2s has 4 GiB RAM. The predictor does not fit next to system pods."
+    echo "         Use Standard_B2ms (8 GiB, 2 vCPU, same BS-family quota)."
+    ;;
+esac
 
 echo
 echo "[1/8] Checking Azure CLI login..."
@@ -86,17 +111,17 @@ preflight_quota() {
   usage_file="$(mktemp)"
   az vm list-skus --location "$LOCATION" --size "$NODE_SIZE" -o json >"$sku_file"
   az vm list-usage --location "$LOCATION" -o json >"$usage_file"
-  python3 - "$sku_file" "$usage_file" "$NODE_SIZE" "$NODE_COUNT" "$MAX_NODES" <<'PY'
+  python3 - "$sku_file" "$usage_file" "$NODE_SIZE" "$NODE_COUNT" <<'PY'
 import json, sys
-sku_path, usage_path, size, nodes, max_nodes = sys.argv[1:]
+sku_path, usage_path, size, nodes = sys.argv[1:]
 nodes = int(nodes)
-max_nodes = int(max_nodes)
 skus = json.load(open(sku_path))
 sku = next((s for s in skus if s.get("name") == size), None)
 if sku is None:
     sys.exit(
         "ERROR: VM size %s is not offered in this region.\n"
-        "Try Standard_B2s or Standard_D2as_v5, and a region such as eastus2."
+        "Student regions: indiasouthcentral, centralindia, eastasia, koreacentral, malaysiawest.\n"
+        "Use Standard_B2ms (8 GiB). Standard_B2s is 4 GiB and will not fit the predictor."
         % size
     )
 for restriction in sku.get("restrictions") or []:
@@ -104,8 +129,7 @@ for restriction in sku.get("restrictions") or []:
     if reason and reason != "None":
         sys.exit(
             "ERROR: %s is restricted in this region (%s).\n"
-            "Azure for Students often blocks Standard_D2s_v5 in eastus.\n"
-            "Re-run with: eastus2 Standard_B2s   or   eastus2 Standard_D2as_v5"
+            "Stay on a student region and Standard_B2ms (BS family, 2 vCPU, 8 GiB)."
             % (size, reason)
         )
 vcpus = 2
@@ -134,7 +158,8 @@ def check(name, need, fatal):
         if fatal:
             sys.exit(
                 "ERROR: " + msg + ".\n"
-                "Lower NODE_COUNT / MAX_NODES, pick a smaller size, or request a quota increase."
+                "Lower NODE_COUNT, pick Standard_B2ms, or request a quota increase.\n"
+                "This subscription's BS-family quota is 4 vCPU, which is two nodes and no surge."
             )
         print("WARNING: " + msg + ". The initial node fits; autoscaler growth may be denied.")
 
@@ -142,9 +167,8 @@ need = nodes * vcpus
 if family:
     check(family, need, True)
 check("cores", need, True)
-if family and max_nodes > nodes:
-    check(family, max_nodes * vcpus, False)
-print("Preflight OK: %s (%d vCPU) x %d node(s), family %s" % (size, vcpus, nodes, family or "unknown"))
+print("Preflight OK: %s (%d vCPU) x %d fixed node(s), family %s" % (size, vcpus, nodes, family or "unknown"))
+print("No surge node is requested. A third node would be %d more vCPU and exceeds a 4 vCPU BS-family quota." % vcpus)
 PY
   rm -f "$sku_file" "$usage_file"
 }
@@ -177,6 +201,19 @@ ACR_NAME="$(echo "$ACR_NAME" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9')"
 if [ "${#ACR_NAME}" -lt 5 ] || [ "${#ACR_NAME}" -gt 50 ]; then
   echo "ERROR: ACR name '$ACR_NAME' must be 5-50 alphanumeric characters."
   exit 1
+fi
+# Names are global. check-name catches a collision in another subscription
+# before az acr create fails halfway through the deploy.
+acr_available="$(az acr check-name --name "$ACR_NAME" --query nameAvailable -o tsv)"
+acr_reason="$(az acr check-name --name "$ACR_NAME" --query reason -o tsv)"
+if [ "$acr_available" != "true" ]; then
+  if az acr show --name "$ACR_NAME" --resource-group "$RESOURCE_GROUP" >/dev/null 2>&1; then
+    echo "ACR $ACR_NAME already exists in $RESOURCE_GROUP; reusing it"
+  else
+    echo "ERROR: ACR name '$ACR_NAME' is not available (${acr_reason:-taken})."
+    echo "Set ACR_NAME to another 5-50 character alphanumeric name and re-run."
+    exit 1
+  fi
 fi
 if az acr show --name "$ACR_NAME" --resource-group "$RESOURCE_GROUP" >/dev/null 2>&1; then
   echo "ACR $ACR_NAME already exists"
@@ -213,18 +250,32 @@ if az aks show --resource-group "$RESOURCE_GROUP" --name "$CLUSTER_NAME" >/dev/n
     --attach-acr "$ACR_NAME" \
     --output table
 else
+  # Fixed node count. Autoscaler is off on purpose: the BS-family quota
+  # is 4 vCPU, which is exactly these two nodes.
   az aks create \
     --resource-group "$RESOURCE_GROUP" \
     --name "$CLUSTER_NAME" \
     --node-count "$NODE_COUNT" \
     --node-vm-size "$NODE_SIZE" \
-    --enable-cluster-autoscaler \
-    --min-count "$MIN_NODES" \
-    --max-count "$MAX_NODES" \
+    --auto-upgrade-channel none \
     --attach-acr "$ACR_NAME" \
     --generate-ssh-keys \
     --output table
 fi
+# A surge node during an upgrade would be a third VM and would exceed the
+# 4 vCPU BS-family quota. 0 disables that extra node. Auto-upgrade stays off.
+pool="$(az aks nodepool list --resource-group "$RESOURCE_GROUP" --cluster-name "$CLUSTER_NAME" --query '[0].name' -o tsv)"
+az aks nodepool update \
+  --resource-group "$RESOURCE_GROUP" \
+  --cluster-name "$CLUSTER_NAME" \
+  --name "$pool" \
+  --max-surge 0 \
+  --output table
+az aks update \
+  --resource-group "$RESOURCE_GROUP" \
+  --name "$CLUSTER_NAME" \
+  --auto-upgrade-channel none \
+  --output table
 
 echo
 echo "[7/8] Configuring kubectl and applying manifests..."
@@ -345,6 +396,9 @@ echo
 echo "Generate the demo spike (in-cluster Locust, hits nginx directly):"
 echo "  ./deploy/load_gen.sh"
 echo
-echo "Watch replicas. Scale-up is immediate; scale-down steps one pod every 45s:"
+echo "Watch replicas. Scale-up is immediate; scale-down waits 100s, then one pod:"
 echo "  kubectl get pods -n capstone -l app=target-app -w"
+echo
+echo "Tear down when the demo is over (deletes the cluster, registry, and IPs):"
+echo "  az group delete --name $RESOURCE_GROUP --yes --no-wait"
 echo "=========================================================="

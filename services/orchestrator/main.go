@@ -573,7 +573,7 @@ func startTargetAppMonitor(orch *Orchestrator) {
 			// Hold the extra pod through a dip unless the whole stabilization
 			// window's forecast mean and live RPS fit in fewer pods.
 			window := int(orch.scalePolicy.ScaleDownStabilization / time.Second)
-			peak := demand.push(float64(predResp.RawMlMean), currentRPS, window)
+			peak := demand.push(float64(predResp.RawMlMean), signal.SizingRPS, window)
 			servers = limitScaleDown(currentReplicas, servers, peak, orch.serviceRate, orch.minReplicas, orch.maxReplicas)
 		}
 
@@ -742,6 +742,9 @@ func main() {
 		PersistTicks:     envInt("PRESCALE_PERSIST_TICKS", 3),
 		MarginCapRPS:     envFloat("PRESCALE_MARGIN_CAP_RPS", 40),
 		SmoothAlpha:      envFloat("PRESCALE_SMOOTH_ALPHA", 0.2),
+		PrescaleFraction: envFloat("PRESCALE_CAPACITY_FRACTION", 0.80),
+		MarginFraction:   envFloat("PRESCALE_MARGIN_FRACTION", 0.20),
+		LiveMedianTicks:  envInt("LIVE_MEDIAN_TICKS", 3),
 		SlopeSustain:     envInt("SLOPE_SUSTAIN_TICKS", 3),
 		SlopeWindow:      envInt("SLOPE_WINDOW_TICKS", 15),
 		CapacityFraction: envFloat("CAPACITY_FRACTION", 0.70),
@@ -775,8 +778,8 @@ func main() {
 		}
 	}
 
-	log.Printf("[Orchestrator] predictor=%s capacity_model=%v service_rate=%.0f rps/replica replicas=[%d,%d] lead=%s scale_down=%s step=%d flat_headroom=%.0f rising_slope=%.1f rising_frac=%.3f slope_sustain=%d slope_window=%d capacity_frac=%.2f slope_headroom=%.0f slope_size_margin=%.0f prescale_ticks=%d margin_cap=%.0f autonomous=%v",
-		predictorAddr, capacityModel, serviceRate, policy.MinReplicas, policy.MaxReplicas, leadTime, policy.ScaleDownStabilization, policy.ScaleDownStep, guard.FlatHeadroomRPS, guard.RisingSlope, guard.RisingFraction, prescale.SlopeSustain, prescale.SlopeWindow, prescale.CapacityFraction, prescale.SlopeHeadroom, prescale.SlopeSizeMargin, prescale.PersistTicks, prescale.MarginCapRPS, autonomousScalerEnabled())
+	log.Printf("[Orchestrator] predictor=%s capacity_model=%v service_rate=%.0f rps/replica replicas=[%d,%d] lead=%s scale_down=%s step=%d flat_headroom=%.0f rising_slope=%.1f rising_frac=%.3f slope_sustain=%d slope_window=%d capacity_frac=%.2f prescale_frac=%.2f margin_frac=%.2f live_median=%d slope_headroom=%.0f slope_size_margin=%.0f prescale_ticks=%d margin_cap=%.0f autonomous=%v",
+		predictorAddr, capacityModel, serviceRate, policy.MinReplicas, policy.MaxReplicas, leadTime, policy.ScaleDownStabilization, policy.ScaleDownStep, guard.FlatHeadroomRPS, guard.RisingSlope, guard.RisingFraction, prescale.SlopeSustain, prescale.SlopeWindow, prescale.CapacityFraction, prescale.PrescaleFraction, prescale.MarginFraction, prescale.LiveMedianTicks, prescale.SlopeHeadroom, prescale.SlopeSizeMargin, prescale.PersistTicks, prescale.MarginCapRPS, autonomousScalerEnabled())
 
 	// On AKS this is the only GetPrediction caller, so the DQN sees one
 	// stream of SLA/waste feedback. Local compose leaves it off and uses /scale.
