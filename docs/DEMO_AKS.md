@@ -47,7 +47,7 @@ az account show --output table
 
 Quota check, registry, cluster, push, apply. This subscription (Azure for Students) may deploy only in `indiasouthcentral`, `centralindia`, `eastasia`, `koreacentral`, and `malaysiawest`. Each of those regions has **6 regional vCPUs** and **4 vCPUs of the Standard BS family**.
 
-The default is **two** `Standard_B2ms` nodes (2 vCPU and 8 GiB each). That is the whole BS-family quota, so the cluster is fixed at 2 nodes: no cluster autoscaler, auto-upgrade channel `none`, node-pool max surge **0**. A surge node would be a third VM (6 vCPU of BS family) and Azure would deny it. Two nodes are started up front so the target-app range is schedulable without waiting for a scale-out that quota will not allow.
+The default is **two** `Standard_B2ms` nodes (2 vCPU and 8 GiB each). That is the whole BS-family quota, so the cluster is fixed at 2 nodes: no cluster autoscaler, auto-upgrade channel `none`, node-pool `--max-surge 0` with `--max-unavailable 1`. AKS rejects a node pool whose max surge is 0 unless max unavailable is greater than 0. A surge node would be a third VM (6 vCPU of BS family) and Azure would deny it. Two nodes are started up front so the target-app range is schedulable without waiting for a scale-out that quota will not allow.
 
 `Standard_B2s` is the same 2 vCPU and the same BS quota, but only **4 GiB** of RAM. After kube reserves memory, allocatable is under 3 GiB, which does not leave room for system pods and the predictor (the image is on the order of 4 GB, and the pod limit is 1 GiB). Use `Standard_B2ms`. It spends the same 2 vCPU of BS-family quota per node.
 

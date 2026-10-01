@@ -19,7 +19,8 @@
 
     Standard_B2s is 4 GiB and does not fit the predictor next to system pods.
     The default is Standard_B2ms (2 vCPU, 8 GiB, same BS family). The cluster
-    is a fixed 2 nodes: no cluster autoscaler, auto-upgrade none, max surge 0.
+    is a fixed 2 nodes: no cluster autoscaler, auto-upgrade none, max surge 0,
+    max unavailable 1 (AKS rejects maxSurge 0 unless maxUnavailable is > 0).
 
     Tear down when the demo is over:
       az group delete --name capstone-rg --yes --no-wait
@@ -131,7 +132,7 @@ Write-Host "=========================================================="
 Write-Host "Resource group: $ResourceGroup"
 Write-Host "Location:       $Location"
 Write-Host "Cluster:        $ClusterName"
-Write-Host "Node size:      $NodeSize  (fixed count $NodeCount, max surge 0, no autoscaler)"
+Write-Host "Node size:      $NodeSize  (fixed count $NodeCount, max surge 0, max unavailable 1, no autoscaler)"
 $allowed = @("indiasouthcentral", "centralindia", "eastasia", "koreacentral", "malaysiawest")
 if ($allowed -notcontains $Location) {
     Write-Host "WARNING: $Location is not one of the regions this student subscription allows:"
@@ -244,11 +245,12 @@ if ($LASTEXITCODE -eq 0) {
     Assert-Exit "az aks create"
 }
 # A surge node during an upgrade would be a third VM and would exceed the
-# 4 vCPU BS-family quota. 0 disables that extra node. Auto-upgrade stays off.
+# 4 vCPU BS-family quota. max-surge 0 disables that extra node. AKS requires
+# max-unavailable > 0 when max-surge is 0. Auto-upgrade stays off.
 $pool = az aks nodepool list --resource-group $ResourceGroup --cluster-name $ClusterName --query "[0].name" -o tsv
 Assert-Exit "az aks nodepool list"
-az aks nodepool update --resource-group $ResourceGroup --cluster-name $ClusterName --name $pool --max-surge 0 --output table
-Assert-Exit "az aks nodepool update --max-surge 0"
+az aks nodepool update --resource-group $ResourceGroup --cluster-name $ClusterName --name $pool --max-surge 0 --max-unavailable 1 --output table
+Assert-Exit "az aks nodepool update --max-surge 0 --max-unavailable 1"
 az aks update --resource-group $ResourceGroup --name $ClusterName --auto-upgrade-channel none --output table
 Assert-Exit "az aks update --auto-upgrade-channel none"
 

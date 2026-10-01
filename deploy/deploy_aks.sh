@@ -22,8 +22,9 @@
 # 8 GiB, same BS family, so two nodes are still 4 vCPU).
 #
 # The cluster is a fixed 2 nodes. Cluster autoscaler is off, auto-upgrade
-# is none, and the node pool max surge is 0. A surge node would ask for
-# 6 vCPU of BS family and the create or upgrade would be denied.
+# is none, and the node pool max surge is 0 with max unavailable 1. AKS
+# rejects maxSurge=0 unless maxUnavailable is greater than 0. A surge node
+# would ask for 6 vCPU of BS family and the create or upgrade would be denied.
 #
 #   ./deploy/deploy_aks.sh
 #   ./deploy/deploy_aks.sh my-rg centralindia my-aks Standard_B2ms
@@ -55,7 +56,7 @@ echo "=========================================================="
 echo "Resource group: $RESOURCE_GROUP"
 echo "Location:       $LOCATION"
 echo "Cluster:        $CLUSTER_NAME"
-echo "Node size:      $NODE_SIZE  (fixed count $NODE_COUNT, max surge 0, no autoscaler)"
+echo "Node size:      $NODE_SIZE  (fixed count $NODE_COUNT, max surge 0, max unavailable 1, no autoscaler)"
 case "$LOCATION" in
   indiasouthcentral|centralindia|eastasia|koreacentral|malaysiawest) ;;
   *)
@@ -263,13 +264,15 @@ else
     --output table
 fi
 # A surge node during an upgrade would be a third VM and would exceed the
-# 4 vCPU BS-family quota. 0 disables that extra node. Auto-upgrade stays off.
+# 4 vCPU BS-family quota. max-surge 0 disables that extra node. AKS requires
+# max-unavailable > 0 when max-surge is 0. Auto-upgrade stays off.
 pool="$(az aks nodepool list --resource-group "$RESOURCE_GROUP" --cluster-name "$CLUSTER_NAME" --query '[0].name' -o tsv)"
 az aks nodepool update \
   --resource-group "$RESOURCE_GROUP" \
   --cluster-name "$CLUSTER_NAME" \
   --name "$pool" \
   --max-surge 0 \
+  --max-unavailable 1 \
   --output table
 az aks update \
   --resource-group "$RESOURCE_GROUP" \
