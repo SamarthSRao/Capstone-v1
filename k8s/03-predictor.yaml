@@ -53,15 +53,16 @@ spec:
               exec:
                 command: ["sh", "-c", "sleep 5"]
           resources:
-            # 512Mi is the schedule request. The image is about 4 GB and the
-            # process wants the 1Gi limit. A Standard_B2s node (4 GiB) does
-            # not have that left after system pods; the demo uses B2ms (8 GiB).
+            # 1Gi is the schedule request. The image is about 4 GB on disk
+            # and the process wants the 1536Mi limit. A Standard_B2s node
+            # (4 GiB, under 3 GiB allocatable) does not have that left after
+            # system pods; the demo uses B2ms (about 6 GB allocatable).
             requests:
               cpu: 200m
-              memory: 512Mi
+              memory: 1Gi
             limits:
               cpu: "1"
-              memory: 1Gi
+              memory: 1536Mi
 ---
 apiVersion: v1
 kind: Service
