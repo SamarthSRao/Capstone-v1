@@ -28,7 +28,7 @@ except ImportError:
 from models.xgboost_residuals import XGBoostResidualModel
 from models.hybrid_mlp import HybridMLPFusion
 from rl_agent import RLAgent
-from bounds import uncertainty_bounds
+from bounds import clamp_z_score, uncertainty_bounds
 from nasa_trace import select_forecast_mean
 
 log = logging.getLogger("predictor")
@@ -255,7 +255,14 @@ class PredictorService(predictor_pb2_grpc.PredictorServicer):
         else:
             action = 2
             current_z_score = 2.0 + (error_ratio * 0.5)
-        
+
+        # The agent still steps inside [0, 10]. Publish a clamped z, and put
+        # idle or flat traffic back at 1.96 so a checkpoint saved at 10 cannot
+        # stick. The next tick starts from that published value.
+        current_z_score = clamp_z_score(current_z_score, history)
+        if hasattr(self, 'rl_agent') and self.rl_agent is not None:
+            self.rl_agent.current_z_score = current_z_score
+
         # upper = mean + z * (std + 0.5 * max(0, rps - mean)). See bounds.py.
         # At idle, rps is below the mean, so the error term is zero and the
         # bound is just mean + z*std. std is a fresh Monte Carlo dropout
