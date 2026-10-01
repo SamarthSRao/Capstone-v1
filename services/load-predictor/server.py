@@ -7,6 +7,7 @@ import pandas as pd
 from datetime import datetime
 import json
 import joblib
+import logging
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -29,6 +30,13 @@ from models.hybrid_mlp import HybridMLPFusion
 from rl_agent import RLAgent
 from bounds import uncertainty_bounds
 from nasa_trace import select_forecast_mean
+
+log = logging.getLogger("predictor")
+if not log.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter("%(levelname)s %(name)s %(message)s"))
+    log.addHandler(_handler)
+    log.setLevel(logging.INFO)
 
 class PredictorService(predictor_pb2_grpc.PredictorServicer):
     def __init__(self):
@@ -94,11 +102,21 @@ class PredictorService(predictor_pb2_grpc.PredictorServicer):
         except Exception as e:
             print("Could not load Fusion MLP weights:", e)
 
+        self.rl_loaded = False
+        self.rl_checkpoint_error = ""
+        rl_path = os.path.join(models_dir, 'rl_agent_checkpoint.pth')
         try:
-            self.rl_agent.load(os.path.join(models_dir, 'rl_agent_checkpoint.pth'))
+            self.rl_agent.load(rl_path)
+            self.rl_loaded = True
             print("Loaded trained RL Agent.")
         except Exception as e:
-            print("Could not load RL Agent, using default initialized weights. Error:", e)
+            self.rl_checkpoint_error = f"{rl_path}: {e}"
+            log.error(
+                "Could not load RL Agent from %s. The process is still up with a "
+                "random DQN, and /health reports the failure so the pod is not Ready. Error: %s",
+                rl_path,
+                e,
+            )
 
         self.last_state = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
         # current_z_score is one value for the whole process. Concurrent
@@ -285,8 +303,18 @@ def serve():
                 self.send_response(404)
                 self.end_headers()
                 return
-            body = b'{"status":"ok"}'
-            self.send_response(200)
+            if service.rl_loaded:
+                payload = {"status": "ok", "rl_checkpoint": "loaded"}
+                code = 200
+            else:
+                payload = {
+                    "status": "error",
+                    "rl_checkpoint": "missing",
+                    "error": service.rl_checkpoint_error or "RL checkpoint was not loaded",
+                }
+                code = 503
+            body = json.dumps(payload).encode()
+            self.send_response(code)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
