@@ -10,6 +10,9 @@ Usage (from Capstone-v1):
     python scripts/prep_load_test_stock.py
     python scripts/prep_load_test_stock.py --stock 5000000
     python scripts/prep_load_test_stock.py --full-reset   # truncate + re-seed + restock
+
+scripts/demo_rehearsal.py calls this automatically before checkout so steps
+9-10 are not failed by an empty catalog. Run it yourself before Locust.
 """
 from __future__ import annotations
 

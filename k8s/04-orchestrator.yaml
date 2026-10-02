@@ -16,12 +16,14 @@ spec:
         app: orchestrator
     spec:
       serviceAccountName: orchestrator-sa
+      terminationGracePeriodSeconds: 15
       containers:
         - name: orchestrator
           image: capstone/orchestrator:latest
           imagePullPolicy: IfNotPresent
           ports:
-            - containerPort: 8082
+            - name: http
+              containerPort: 8082
           env:
             - name: KUBERNETES_ENABLED
               value: "true"
@@ -30,13 +32,107 @@ spec:
             - name: K8S_DEPLOYMENT
               value: "target-app"
             - name: TARGET_METRICS_URL
-              value: "http://nginx-lb:8090/stub_status"
+              value: "http://nginx-metrics:8091/stub_status"
+            # Dial target. The process used to ignore this and hardcode predictor:50051.
             - name: PREDICTOR_URL
               value: "predictor:50051"
+            # Requests per second per pod (not per minute).
+            - name: SERVICE_RATE_RPS
+              value: "200"
+            # The noisy upper bound is always capped at live RPS + this.
+            # 50 is below one pod, so an idle bound of a few hundred RPS stays
+            # at 1 replica. A rising slope does not lift this cap.
+            - name: FLAT_HEADROOM_RPS
+              value: "50"
+            # Slope scale-up: the rise must clear max(RISING_SLOPE_RPS,
+            # RISING_SLOPE_FRACTION * current capacity) for SLOPE_SUSTAIN_TICKS
+            # consecutive ticks, measured over SLOPE_WINDOW_TICKS seconds, and
+            # the smoothed live RPS or the forecast mean must already be at
+            # CAPACITY_FRACTION of current capacity. The replica count is then
+            # The size is the smoothed slope carried FORECAST_LEAD_SECONDS
+            # forward, or the forecast mean, whichever is larger, then capped
+            # at the mean plus SLOPE_SIZE_MARGIN_RPS, plus SLOPE_HEADROOM_RPS.
+            # It is not the raw upper bound.
+            - name: RISING_SLOPE_RPS
+              value: "5"
+            - name: RISING_SLOPE_FRACTION
+              value: "0.01"
+            - name: SLOPE_SUSTAIN_TICKS
+              value: "3"
+            - name: SLOPE_WINDOW_TICKS
+              value: "15"
+            - name: CAPACITY_FRACTION
+              value: "0.70"
+            - name: SLOPE_HEADROOM_RPS
+              value: "40"
+            # Noisy slopes cannot size past the forecast mean by more than this.
+            - name: SLOPE_SIZE_MARGIN_RPS
+              value: "80"
+            # Pre-scale on the forecast mean, not the noisy upper bound.
+            # Three ticks above current capacity, or a smoothed lead margin
+            # of at most 40 RPS (well under one 200 RPS pod).
+            - name: PRESCALE_PERSIST_TICKS
+              value: "3"
+            - name: PRESCALE_MARGIN_CAP_RPS
+              value: "40"
+            # The margin cap is at least this fraction of current capacity
+            # (20% of one pod is 40 RPS, same as the floor above; two pods
+            # raise it to 80). Pre-scale also fires at 80% of capacity, from
+            # the forecast mean or from a rising median of live RPS.
+            - name: PRESCALE_MARGIN_FRACTION
+              value: "0.20"
+            - name: PRESCALE_CAPACITY_FRACTION
+              value: "0.80"
+            # Live RPS used for sizing is the median of this many ticks.
+            # One sample cannot add a pod; a sustained crossing still does.
+            - name: LIVE_MEDIAN_TICKS
+              value: "3"
+            - name: PRESCALE_SMOOTH_ALPHA
+              value: "0.2"
+            - name: CAPACITY_MODEL
+              value: "true"
+            # Warm floor. Never scale to zero; raise to 2 to keep a spare pod hot.
+            - name: MIN_REPLICAS
+              value: "1"
+            # 10 target pods request 10 x 50m = 500m CPU. Two 2-vCPU nodes
+            # have about 3800m allocatable after kube reservation. System
+            # pods, the predictor (200m), orchestrator (50m), nginx (50m),
+            # and dashboard (20m) leave room for that. See docs/DEMO_AKS.md.
+            - name: MAX_REPLICAS
+              value: "10"
+            # Pods need about 10-20s to become Ready. The slope look-ahead is
+            # this long, then capped near the forecast mean so a noisy slope
+            # cannot add several extra pods.
+            - name: FORECAST_LEAD_SECONDS
+              value: "20"
+            # Scale-up is immediate. Scale-down waits out dips in the replay
+            # (a 45s wait was shorter than those dips), then drops one pod,
+            # and only if the max of forecast mean and live RPS over this
+            # window fits in fewer pods.
+            - name: SCALE_DOWN_STABILIZATION_SEC
+              value: "100"
+            - name: SCALE_DOWN_STEP
+              value: "1"
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+            failureThreshold: 40
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
           resources:
             requests:
-              cpu: 100m
-              memory: 128Mi
+              cpu: 50m
+              memory: 64Mi
             limits:
               cpu: 500m
               memory: 256Mi

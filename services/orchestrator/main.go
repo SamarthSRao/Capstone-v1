@@ -100,9 +100,19 @@ func GetRequiredServers(lambda float64, mu float64, targetWaitProb float64) int 
 
 type Orchestrator struct {
 	predictorClient pb.PredictorClient
-	serviceRate     float64 // mu: requests per minute per server
-	slaThreshold    float64 // max probability of waiting
-	simulatorURL    string
+	// serviceRate is mu in requests per second per replica. It is not a
+	// per-minute figure; lambda from the predictor is also requests/second.
+	serviceRate   float64
+	slaThreshold  float64 // max probability of waiting (classic Erlang-C path)
+	simulatorURL  string
+	capacityModel bool // AKS path: ceil(lambda/mu) with a one-pod margin
+	minReplicas   int
+	maxReplicas   int
+	leadTime      time.Duration
+	scalePolicy   ScalePolicy
+	forecastGuard ForecastGuard
+	prescaleCfg   PrescaleConfig
+	prescaleState PrescaleState
 }
 
 func (o *Orchestrator) DecideScaling(history []float32, currentSLA float32, currentWasted float32) (int, *pb.PredictionResponse, error) {
@@ -119,9 +129,17 @@ func (o *Orchestrator) DecideScaling(history []float32, currentSLA float32, curr
 		return 0, nil, err
 	}
 
-	// Use the Upper Bound (mean + z_score*std) tuned by RL agent
+	// Use the Upper Bound (mean + z_score*std) tuned by RL agent.
+	// The autonomous monitor may further project this across pod startup;
+	// see leadAdjustedLambda. This function stays a pure function of the
+	// prediction so /scale (simulator) and the monitor can share it.
 	lambda := float64(resp.UpperBound)
-	c := GetRequiredServers(lambda, o.serviceRate, o.slaThreshold)
+	var c int
+	if o.capacityModel {
+		c = ReplicasForLoad(lambda, o.serviceRate, o.minReplicas, o.maxReplicas)
+	} else {
+		c = GetRequiredServers(lambda, o.serviceRate, o.slaThreshold)
+	}
 
 	return c, resp, nil
 }
@@ -231,30 +249,52 @@ func (o *Orchestrator) scaleZopdevDeployment(envID string, deploymentName string
 	return nil
 }
 
-// TargetStatus tracks live metrics and scaling status of the open-source target web app
+// TargetStatus tracks live metrics and scaling status of the target web app.
+// Field names match the keys the dashboard already reads from the simulator
+// (current_rps, predicted_upper, rl_action as an int, rl_action_label) plus
+// the replica pair the AKS demo needs.
 type TargetStatus struct {
-	TargetName     string    `json:"target_name"`
-	CurrentRPS     float64   `json:"current_rps"`
-	ActiveReplicas int       `json:"active_replicas"`
-	PredictedMean  float32   `json:"predicted_mean"`
-	PredictedUpper float32   `json:"predicted_upper"`
-	RLAction       string    `json:"rl_action"`
-	SLAReliability float64   `json:"sla_reliability"`
-	LastScaleEvent string    `json:"last_scale_event"`
-	UpdatedAt      time.Time `json:"updated_at"`
+	TargetName      string    `json:"target_name"`
+	Live            bool      `json:"live"`
+	Status          string    `json:"status"`
+	CurrentRPS      float64   `json:"current_rps"`
+	ActiveReplicas  int       `json:"active_replicas"`
+	DesiredReplicas int       `json:"desired_replicas"`
+	Scaling         string    `json:"scaling"`
+	PredictedMean   float32   `json:"predicted_mean"`
+	PredictedUpper  float32   `json:"predicted_upper"`
+	PredictedLower  float32   `json:"predicted_lower"`
+	RawMlMean       float32   `json:"raw_ml_mean"`
+	ForecastLeadRPS float64   `json:"forecast_lead_rps"`
+	ScaleRule       string    `json:"scale_rule"`
+	StdDev          float32   `json:"std_dev"`
+	ZScore          float32   `json:"z_score"`
+	ErrorRatio      float32   `json:"error_ratio"`
+	RLAction        int32     `json:"rl_action"`
+	RLActionLabel   string    `json:"rl_action_label"`
+	SLAReliability  float64   `json:"sla_reliability"`
+	SLAViolations   int       `json:"violations"`
+	LastScaleEvent  string    `json:"last_scale_event"`
+	UpdatedAt       time.Time `json:"updated_at"`
 }
 
 var (
 	targetMu     sync.RWMutex
 	targetStatus = TargetStatus{
-		TargetName:     "Online Boutique (Open-Source Store)",
-		CurrentRPS:     0,
-		ActiveReplicas: 1,
-		SLAReliability: 100.0,
-		LastScaleEvent: "System initialized at baseline (1 replica)",
-		UpdatedAt:      time.Now(),
+		TargetName:      "Online Boutique (Open-Source Store)",
+		Live:            false,
+		Status:          "IDLE",
+		CurrentRPS:      0,
+		ActiveReplicas:  1,
+		DesiredReplicas: 1,
+		Scaling:         "hold",
+		SLAReliability:  100.0,
+		LastScaleEvent:  "System initialized at baseline (1 replica)",
+		UpdatedAt:       time.Now(),
 	}
-	lastScaleDownTime = time.Now()
+	// Last successful scale (up or down). Scale-down is blocked until
+	// ScaleDownStabilization has elapsed; scale-up is not.
+	lastScaleChange = time.Now()
 )
 
 // scaleDockerTargetApp physically scales the open-source target-app containers via Docker CLI or socket
@@ -263,58 +303,102 @@ func scaleDockerTargetApp(replicas int) error {
 	cmd := exec.Command("docker", "compose", "up", "-d", "--scale", fmt.Sprintf("target-app=%d", replicas), "--no-recreate")
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		log.Printf("[Orchestrator Docker Actuator] Docker command output / notice: %s (%v)", string(output), err)
-	} else {
-		log.Printf("[Orchestrator Docker Actuator] Docker scale executed successfully: %s", string(output))
+		log.Printf("[Orchestrator Docker Actuator] Docker command failed: %s (%v)", string(output), err)
+		return fmt.Errorf("docker scale: %w", err)
 	}
+	log.Printf("[Orchestrator Docker Actuator] Docker scale executed successfully: %s", string(output))
 	return nil
+}
+
+func k8sTarget() (namespace, deployment string) {
+	namespace = os.Getenv("K8S_NAMESPACE")
+	if namespace == "" {
+		namespace = "capstone"
+	}
+	deployment = os.Getenv("K8S_DEPLOYMENT")
+	if deployment == "" {
+		deployment = "target-app"
+	}
+	return namespace, deployment
+}
+
+// inClusterClient returns an HTTP client authenticated with the pod service
+// account. ok is false when the process is not running inside a cluster.
+func inClusterClient() (client *http.Client, hostport, token string, ok bool) {
+	tokenBytes, err := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/token")
+	if err != nil {
+		return nil, "", "", false
+	}
+	k8sHost := os.Getenv("KUBERNETES_SERVICE_HOST")
+	k8sPort := os.Getenv("KUBERNETES_SERVICE_PORT")
+	if k8sHost == "" {
+		k8sHost = "kubernetes.default.svc"
+		k8sPort = "443"
+	}
+	caCert, err := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/ca.crt")
+	caCertPool := x509.NewCertPool()
+	if err == nil {
+		caCertPool.AppendCertsFromPEM(caCert)
+	}
+	client = &http.Client{
+		Timeout: 5 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{RootCAs: caCertPool},
+		},
+	}
+	return client, k8sHost + ":" + k8sPort, string(tokenBytes), true
+}
+
+func deploymentScaleURL(hostport, namespace, deployment string) string {
+	return fmt.Sprintf("https://%s/apis/apps/v1/namespaces/%s/deployments/%s/scale", hostport, namespace, deployment)
+}
+
+// getKubernetesReplicas reads spec.replicas from the live Deployment so a
+// failed scale, a manual edit, or a restart cannot leave the loop believing
+// a replica count it never applied.
+func getKubernetesReplicas() (int, error) {
+	namespace, deployment := k8sTarget()
+	if client, hostport, token, ok := inClusterClient(); ok {
+		req, err := http.NewRequest(http.MethodGet, deploymentScaleURL(hostport, namespace, deployment), nil)
+		if err != nil {
+			return 0, err
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
+		resp, err := client.Do(req)
+		if err != nil {
+			return 0, err
+		}
+		defer resp.Body.Close()
+		buf := new(bytes.Buffer)
+		buf.ReadFrom(resp.Body)
+		if resp.StatusCode >= 300 {
+			return 0, fmt.Errorf("k8s api get scale failed with status %d: %s", resp.StatusCode, buf.String())
+		}
+		return parseDeploymentScale(buf.Bytes())
+	}
+
+	cmd := exec.Command("kubectl", "get", "deployment", deployment, "-n", namespace, "-o", "json")
+	out, err := cmd.Output()
+	if err != nil {
+		return 0, err
+	}
+	return parseDeploymentScale(out)
 }
 
 // scaleKubernetesDeployment scales the target Kubernetes deployment via in-cluster service account or kubectl
 func scaleKubernetesDeployment(replicas int) error {
-	namespace := os.Getenv("K8S_NAMESPACE")
-	if namespace == "" {
-		namespace = "capstone"
-	}
-	deployment := os.Getenv("K8S_DEPLOYMENT")
-	if deployment == "" {
-		deployment = "target-app"
-	}
+	namespace, deployment := k8sTarget()
 
 	log.Printf("[Orchestrator K8s Actuator] >>> PROACTIVELY SCALING K8S DEPLOYMENT %s/%s TO %d PODS <<<", namespace, deployment, replicas)
 
-	tokenBytes, err := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/token")
-	if err == nil {
-		// In-cluster execution using Kubernetes REST API
-		k8sHost := os.Getenv("KUBERNETES_SERVICE_HOST")
-		k8sPort := os.Getenv("KUBERNETES_SERVICE_PORT")
-		if k8sHost == "" {
-			k8sHost = "kubernetes.default.svc"
-			k8sPort = "443"
-		}
-
-		caCert, err := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/ca.crt")
-		caCertPool := x509.NewCertPool()
-		if err == nil {
-			caCertPool.AppendCertsFromPEM(caCert)
-		}
-
-		tr := &http.Transport{
-			TLSClientConfig: &tls.Config{
-				RootCAs: caCertPool,
-			},
-		}
-		client := &http.Client{Transport: tr, Timeout: 5 * time.Second}
-
-		url := fmt.Sprintf("https://%s:%s/apis/apps/v1/namespaces/%s/deployments/%s/scale", k8sHost, k8sPort, namespace, deployment)
+	if client, hostport, token, ok := inClusterClient(); ok {
 		payload := fmt.Sprintf(`{"spec":{"replicas":%d}}`, replicas)
-
-		req, err := http.NewRequest("PATCH", url, bytes.NewBufferString(payload))
+		req, err := http.NewRequest(http.MethodPatch, deploymentScaleURL(hostport, namespace, deployment), bytes.NewBufferString(payload))
 		if err != nil {
 			return err
 		}
 		req.Header.Set("Content-Type", "application/merge-patch+json")
-		req.Header.Set("Authorization", "Bearer "+string(tokenBytes))
+		req.Header.Set("Authorization", "Bearer "+token)
 
 		resp, err := client.Do(req)
 		if err != nil {
@@ -338,7 +422,7 @@ func scaleKubernetesDeployment(replicas int) error {
 	cmd := exec.Command("kubectl", "scale", fmt.Sprintf("deployment/%s", deployment), fmt.Sprintf("--replicas=%d", replicas), "-n", namespace)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		log.Printf("[Orchestrator K8s Actuator] kubectl scale notice: %s (%v)", string(out), err)
+		log.Printf("[Orchestrator K8s Actuator] kubectl scale failed: %s (%v)", string(out), err)
 		return err
 	}
 	log.Printf("[Orchestrator K8s Actuator] kubectl scale success: %s", string(out))
@@ -353,110 +437,240 @@ func scaleTargetApp(replicas int) error {
 	return scaleDockerTargetApp(replicas)
 }
 
-// startTargetAppMonitor polls live HTTP traffic from Nginx or target app metrics and autonomously adapts
+// autonomousScalerEnabled is true on AKS/kind, where this process is the only
+// caller of GetPrediction. The DQN z-score is one piece of process-wide state
+// inside the predictor. Leaving the monitor running next to the simulator's
+// POST /scale (local docker compose) steps that state twice per tick, so the
+// monitor stays off unless Kubernetes mode or an explicit metrics URL is set.
+func autonomousScalerEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("AUTONOMOUS_SCALER"))) {
+	case "false", "0", "no":
+		return false
+	case "true", "1", "yes":
+		return true
+	}
+	if os.Getenv("KUBERNETES_ENABLED") == "true" || os.Getenv("TARGET_METRICS_URL") != "" || os.Getenv("KUBERNETES_SERVICE_HOST") != "" {
+		return true
+	}
+	return false
+}
+
+// startTargetAppMonitor polls nginx stub_status and scales the target Deployment.
+// One tick is one second: that is also the history sample period.
 func startTargetAppMonitor(orch *Orchestrator) {
 	metricsURL := os.Getenv("TARGET_METRICS_URL")
 	if metricsURL == "" {
-		metricsURL = "http://nginx-lb:8090/stub_status"
+		metricsURL = "http://nginx-metrics:8091/stub_status"
 	}
 
-	log.Printf("[Target Monitor] Starting live traffic monitor for: %s", metricsURL)
+	log.Printf("[Target Monitor] Starting live traffic monitor for: %s (service rate %.0f RPS/pod, scale-down every %s by %d)",
+		metricsURL, orch.serviceRate, orch.scalePolicy.ScaleDownStabilization, orch.scalePolicy.ScaleDownStep)
 
 	client := &http.Client{Timeout: 1500 * time.Millisecond}
 	history := make([]float32, 24)
-	for i := range history {
-		history[i] = 50.0 // Baseline
-	}
-
 	var lastTotalReqs int64 = -1
-	currentReplicas := 1
+	var lastSample time.Time
+	seeded := false
+	currentReplicas := orch.minReplicas
+	if currentReplicas < 1 {
+		currentReplicas = 1
+	}
+	var fb feedbackWindow
+	fb.size = 30
+	var demand demandTrack
+	violations := 0
+	scrapeMisses := 0
+
+	targetMu.Lock()
+	targetStatus.Live = true
+	targetStatus.Status = "LIVE"
+	targetStatus.ActiveReplicas = currentReplicas
+	targetStatus.DesiredReplicas = currentReplicas
+	targetMu.Unlock()
 
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 
-	for range ticker.C {
+	for now := range ticker.C {
 		resp, err := client.Get(metricsURL)
-		var currentRPS float64 = 0.0
-
-		if err == nil && resp.StatusCode == 200 {
-			buf := new(bytes.Buffer)
-			buf.ReadFrom(resp.Body)
-			resp.Body.Close()
-			bodyStr := buf.String()
-
-			// Parse Nginx stub_status:
-			// Active connections: 1
-			// server accepts handled requests
-			//  10 10 250
-			lines := strings.Split(bodyStr, "\n")
-			for _, line := range lines {
-				fields := strings.Fields(line)
-				if len(fields) == 3 {
-					if reqs, parseErr := strconv.ParseInt(fields[2], 10, 64); parseErr == nil {
-						if lastTotalReqs >= 0 {
-							diff := reqs - lastTotalReqs
-							if diff >= 0 {
-								currentRPS = float64(diff)
-							}
-						}
-						lastTotalReqs = reqs
-						break
-					}
-				}
+		if err != nil || resp.StatusCode != 200 {
+			if resp != nil {
+				resp.Body.Close()
 			}
-		} else if resp != nil {
-			resp.Body.Close()
+			// A missed scrape is not zero traffic. Pushing 0 would make the
+			// forecast collapse and would step the RL agent on a lie.
+			scrapeMisses++
+			if scrapeMisses == 1 || scrapeMisses%15 == 0 {
+				log.Printf("[Target Monitor] metrics scrape failed (%d): %v", scrapeMisses, err)
+			}
+			continue
 		}
+		scrapeMisses = 0
+		buf := new(bytes.Buffer)
+		buf.ReadFrom(resp.Body)
+		resp.Body.Close()
 
-		// Shift sliding history window
-		copy(history, history[1:])
-		history[len(history)-1] = float32(currentRPS)
-
-		// Decide scaling using HybridTimeNet (Bayesian LSTM + Erlang-C + RL)
-		servers, predResp, predErr := orch.DecideScaling(history, 0.0, 0.0)
-		if predErr != nil {
+		total, ok := parseStubStatusRequests(buf.String())
+		if !ok {
+			log.Printf("[Target Monitor] stub_status had no request counter")
 			continue
 		}
 
-		// Clamp servers to realistic range [1, 10]
-		if servers < 1 {
-			servers = 1
+		// The first scrape only records the counter. A zero-length delta is
+		// not a traffic sample, and a history of zeros makes the model
+		// invent a surge before the demo starts.
+		if lastSample.IsZero() {
+			lastTotalReqs = total
+			lastSample = now
+			continue
 		}
-		if servers > 10 {
-			servers = 10
+		currentRPS := requestsPerSecond(lastTotalReqs, total, now.Sub(lastSample))
+		lastTotalReqs = total
+		lastSample = now
+
+		if !seeded {
+			for i := range history {
+				history[i] = float32(currentRPS)
+			}
+			seeded = true
+		} else {
+			copy(history, history[1:])
+			history[len(history)-1] = float32(currentRPS)
 		}
 
-		// Autonomous scaling logic with cooldown
-		now := time.Now()
-		scaleTriggered := false
-		var eventMsg string
+		// Resync from the Deployment before deciding. spec.replicas is what
+		// we last asked for (or what a human set); do not invent a count.
+		if live, syncErr := getKubernetesReplicas(); syncErr != nil {
+			log.Printf("[Target Monitor] replica resync skipped: %v", syncErr)
+		} else if live >= 1 {
+			currentReplicas = live
+		}
 
-		if servers > currentReplicas {
-			// Proactive scale up: Immediate!
-			scaleTargetApp(servers)
-			eventMsg = fmt.Sprintf("Proactive surge detected (%.0f RPS): Scaled from %d -> %d replicas", currentRPS, currentReplicas, servers)
-			currentReplicas = servers
-			scaleTriggered = true
-		} else if servers < currentReplicas && now.Sub(lastScaleDownTime) > 15*time.Second {
-			// Scale down: Graceful cooldown (15s)
-			scaleTargetApp(servers)
-			eventMsg = fmt.Sprintf("Traffic subsided (%.0f RPS): Scaled down from %d -> %d replicas", currentRPS, currentReplicas, servers)
-			currentReplicas = servers
-			lastScaleDownTime = now
-			scaleTriggered = true
+		slaInst, wasteInst := capacityFeedback(currentRPS, currentReplicas, orch.serviceRate)
+		if slaInst > 0 {
+			violations++
+		}
+		slaAvg, wasteAvg := fb.push(float64(slaInst), float64(wasteInst))
+
+		servers, predResp, predErr := orch.DecideScaling(history, slaAvg, wasteAvg)
+		if predErr != nil {
+			log.Printf("[Target Monitor] prediction failed: %v", predErr)
+			continue
+		}
+
+		// Upper-bound noise stays inside the idle cap. A scale-up comes from
+		// the forecast mean, from live RPS once it crosses capacity, or from
+		// a slope that has held while the smoothed rate is already near
+		// capacity. scaleRule is idle-guard, slope, live-capacity,
+		// forecast-persistence, or forecast-margin.
+		scaleRule := ruleIdleGuard
+		if orch.capacityModel {
+			slope := recentSlope(history, orch.prescaleCfg.SlopeWindow)
+			capacity := float64(currentReplicas) * orch.serviceRate
+			signal := decideScaleRate(float64(predResp.UpperBound), float64(predResp.RawMlMean), currentRPS, slope, capacity, orch.leadTime, orch.forecastGuard, orch.prescaleCfg, &orch.prescaleState)
+			scaleRule = signal.Rule
+			servers = ReplicasForLoad(signal.Lambda, orch.serviceRate, orch.minReplicas, orch.maxReplicas)
+			// Hold the extra pod through a dip unless the whole stabilization
+			// window's forecast mean and live RPS fit in fewer pods.
+			window := int(orch.scalePolicy.ScaleDownStabilization / time.Second)
+			peak := demand.push(float64(predResp.RawMlMean), signal.SizingRPS, window)
+			servers = limitScaleDown(currentReplicas, servers, peak, orch.serviceRate, orch.minReplicas, orch.maxReplicas)
+		}
+
+		decision := applyScalePolicy(currentReplicas, servers, now.Sub(lastScaleChange), orch.scalePolicy)
+		eventMsg := ""
+		if decision.Direction == "up" || decision.Direction == "down" {
+			from := currentReplicas
+			if scaleErr := scaleTargetApp(decision.Next); scaleErr != nil {
+				eventMsg = fmt.Sprintf("Scale %s %d -> %d failed: %v", decision.Direction, from, decision.Next, scaleErr)
+				log.Printf("[Target Monitor] %s", eventMsg)
+				decision.Direction = "hold"
+				decision.Next = from
+			} else {
+				updated, _ := replicaCountAfterScale(from, decision.Next, nil)
+				currentReplicas = updated
+				lastScaleChange = now
+				if decision.Direction == "up" {
+					eventMsg = fmt.Sprintf("rule=%s forecast %.0f live %.0f upper %.0f: scaled %d -> %d replicas", scaleRule, predResp.RawMlMean, currentRPS, predResp.UpperBound, from, currentReplicas)
+				} else {
+					eventMsg = fmt.Sprintf("rule=%s traffic %.0f RPS: stepped down %d -> %d replicas", scaleRule, currentRPS, from, currentReplicas)
+				}
+				log.Printf("[Target Monitor] %s", eventMsg)
+			}
+		}
+
+		reliability := 100 * (1 - float64(slaAvg))
+		if reliability < 0 {
+			reliability = 0
 		}
 
 		targetMu.Lock()
+		targetStatus.Live = true
+		targetStatus.Status = "LIVE"
 		targetStatus.CurrentRPS = currentRPS
 		targetStatus.ActiveReplicas = currentReplicas
-		targetStatus.PredictedMean = predResp.Mean
+		targetStatus.DesiredReplicas = decision.Next
+		if decision.Direction == "hold" && servers != currentReplicas {
+			// Forecast wants a different size, but the stabilization window
+			// or a failed call is holding the live count.
+			targetStatus.DesiredReplicas = servers
+		}
+		targetStatus.Scaling = decision.Direction
+		targetStatus.PredictedMean = predResp.RawMlMean
 		targetStatus.PredictedUpper = predResp.UpperBound
-		targetStatus.RLAction = rlActionLabel(predResp.RlAction)
-		if scaleTriggered {
+		targetStatus.PredictedLower = predResp.LowerBound
+		targetStatus.RawMlMean = predResp.RawMlMean
+		targetStatus.ForecastLeadRPS = float64(predResp.RawMlMean) - currentRPS
+		targetStatus.ScaleRule = scaleRule
+		targetStatus.StdDev = predResp.StdDev
+		targetStatus.ZScore = predResp.ZScore
+		targetStatus.ErrorRatio = predResp.ErrorRatio
+		targetStatus.RLAction = predResp.RlAction
+		targetStatus.RLActionLabel = rlActionLabel(predResp.RlAction)
+		targetStatus.SLAReliability = reliability
+		targetStatus.SLAViolations = violations
+		if eventMsg != "" {
 			targetStatus.LastScaleEvent = eventMsg
 		}
 		targetStatus.UpdatedAt = now
 		targetMu.Unlock()
+	}
+}
+
+func envInt(key string, def int) int {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		log.Printf("[Orchestrator] ignoring %s=%q (%v)", key, v, err)
+		return def
+	}
+	return n
+}
+
+func envFloat(key string, def float64) float64 {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return def
+	}
+	n, err := strconv.ParseFloat(v, 64)
+	if err != nil {
+		log.Printf("[Orchestrator] ignoring %s=%q (%v)", key, v, err)
+		return def
+	}
+	return n
+}
+
+func envBool(key string, def bool) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(key))) {
+	case "1", "true", "yes", "y":
+		return true
+	case "0", "false", "no", "n":
+		return false
+	default:
+		return def
 	}
 }
 
@@ -466,38 +680,120 @@ func main() {
 		simulatorURL = "http://simulator:8083"
 	}
 
-	// Connect to Predictor Service with Retry Logic
+	// PREDICTOR_URL was previously ignored; grpc.Dial was hardcoded.
+	predictorAddr := normalizePredictorTarget(os.Getenv("PREDICTOR_URL"))
+
+	// Connect to Predictor Service with Retry Logic.
+	// A single readiness RPC steps the DQN z-score once at boot. After that,
+	// only one controller (the monitor on AKS, or POST /scale for the local
+	// simulator) should keep calling GetPrediction.
 	var conn *grpc.ClientConn
 	var err error
 	for i := 0; i < 30; i++ {
-		conn, err = grpc.Dial("predictor:50051", grpc.WithTransportCredentials(insecure.NewCredentials()))
+		conn, err = grpc.Dial(predictorAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 		if err == nil {
 			client := pb.NewPredictorClient(conn)
 			_, err = client.GetPrediction(context.Background(), &pb.PredictionRequest{History: []float32{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}})
 			if err == nil {
 				break
 			}
+			conn.Close()
 		}
-		fmt.Printf("Predictor not ready, retrying in 3s... (%v)\n", err)
+		fmt.Printf("Predictor not ready at %s, retrying in 3s... (%v)\n", predictorAddr, err)
 		time.Sleep(3 * time.Second)
 	}
 	if err != nil {
-		log.Fatalf("could not connect to predictor after 90s: %v", err)
+		log.Fatalf("could not connect to predictor %s after 90s: %v", predictorAddr, err)
 	}
 	defer conn.Close()
 	client := pb.NewPredictorClient(conn)
 
+	k8sMode := os.Getenv("KUBERNETES_ENABLED") == "true" || os.Getenv("KUBERNETES_SERVICE_HOST") != ""
+	capacityModel := envBool("CAPACITY_MODEL", k8sMode)
+	// Classic simulator path: 50 RPS per server (Erlang-C search, uncapped here).
+	// AKS path: 200 RPS per pod so uncertainty of ~300 RPS stays at 1-2 replicas.
+	serviceRate := 50.0
+	if capacityModel {
+		serviceRate = 200.0
+	}
+	if v := os.Getenv("SERVICE_RATE_RPS"); v != "" {
+		if parsed, perr := strconv.ParseFloat(v, 64); perr == nil && parsed > 0 {
+			serviceRate = parsed
+		}
+	}
+	minReplicas := envInt("MIN_REPLICAS", 1)
+	maxReplicas := envInt("MAX_REPLICAS", 10)
+	if !capacityModel && os.Getenv("MAX_REPLICAS") == "" {
+		maxReplicas = 2000 // classic GetRequiredServers has its own ceiling
+	}
+	leadTime := time.Duration(envInt("FORECAST_LEAD_SECONDS", 20)) * time.Second
+	// 50 RPS of headroom is under the 200 RPS pod size, so an idle upper
+	// bound of a few hundred RPS cannot by itself request a second pod.
+	guard := ForecastGuard{
+		FlatHeadroomRPS: envFloat("FLAT_HEADROOM_RPS", 50),
+		RisingSlope:     envFloat("RISING_SLOPE_RPS", 5),
+		RisingFraction:  envFloat("RISING_SLOPE_FRACTION", 0.01),
+	}.normalized()
+	// Margin cap and slope headroom stay far below one pod (200 RPS).
+	// An idle forecast mean near 70 plus that margin cannot clear capacity,
+	// and a slope scale-up is sized from the live extrapolation, not the
+	// raw upper bound.
+	prescale := PrescaleConfig{
+		PersistTicks:     envInt("PRESCALE_PERSIST_TICKS", 3),
+		MarginCapRPS:     envFloat("PRESCALE_MARGIN_CAP_RPS", 40),
+		SmoothAlpha:      envFloat("PRESCALE_SMOOTH_ALPHA", 0.2),
+		PrescaleFraction: envFloat("PRESCALE_CAPACITY_FRACTION", 0.80),
+		MarginFraction:   envFloat("PRESCALE_MARGIN_FRACTION", 0.20),
+		LiveMedianTicks:  envInt("LIVE_MEDIAN_TICKS", 3),
+		SlopeSustain:     envInt("SLOPE_SUSTAIN_TICKS", 3),
+		SlopeWindow:      envInt("SLOPE_WINDOW_TICKS", 15),
+		CapacityFraction: envFloat("CAPACITY_FRACTION", 0.70),
+		SlopeHeadroom:    envFloat("SLOPE_HEADROOM_RPS", 40),
+		SlopeSizeMargin:  envFloat("SLOPE_SIZE_MARGIN_RPS", 80),
+	}.normalized()
+	policy := ScalePolicy{
+		MinReplicas:            minReplicas,
+		MaxReplicas:            maxReplicas,
+		ScaleDownStabilization: time.Duration(envInt("SCALE_DOWN_STABILIZATION_SEC", 100)) * time.Second,
+		ScaleDownStep:          envInt("SCALE_DOWN_STEP", 1),
+	}
+	policy = normalizeScalePolicy(policy)
+
 	orch := &Orchestrator{
 		predictorClient: client,
-		serviceRate:     50.0, // Each server handles 50 RPS
-		slaThreshold:    0.01, // 1% target wait probability
+		serviceRate:     serviceRate,
+		slaThreshold:    0.01,
 		simulatorURL:    simulatorURL,
+		capacityModel:   capacityModel,
+		minReplicas:     policy.MinReplicas,
+		maxReplicas:     policy.MaxReplicas,
+		leadTime:        leadTime,
+		scalePolicy:     policy,
+		forecastGuard:   guard,
+		prescaleCfg:     prescale,
+	}
+	if v := os.Getenv("SLA_THRESHOLD"); v != "" {
+		if parsed, perr := strconv.ParseFloat(v, 64); perr == nil && parsed > 0 && parsed < 1 {
+			orch.slaThreshold = parsed
+		}
 	}
 
-	// Start background autonomous monitor for open-source target web application
-	go startTargetAppMonitor(orch)
+	log.Printf("[Orchestrator] predictor=%s capacity_model=%v service_rate=%.0f rps/replica replicas=[%d,%d] lead=%s scale_down=%s step=%d flat_headroom=%.0f rising_slope=%.1f rising_frac=%.3f slope_sustain=%d slope_window=%d capacity_frac=%.2f prescale_frac=%.2f margin_frac=%.2f live_median=%d slope_headroom=%.0f slope_size_margin=%.0f prescale_ticks=%d margin_cap=%.0f autonomous=%v",
+		predictorAddr, capacityModel, serviceRate, policy.MinReplicas, policy.MaxReplicas, leadTime, policy.ScaleDownStabilization, policy.ScaleDownStep, guard.FlatHeadroomRPS, guard.RisingSlope, guard.RisingFraction, prescale.SlopeSustain, prescale.SlopeWindow, prescale.CapacityFraction, prescale.PrescaleFraction, prescale.MarginFraction, prescale.LiveMedianTicks, prescale.SlopeHeadroom, prescale.SlopeSizeMargin, prescale.PersistTicks, prescale.MarginCapRPS, autonomousScalerEnabled())
 
-	// Expose target application status for frontend and presentation
+	// On AKS this is the only GetPrediction caller, so the DQN sees one
+	// stream of SLA/waste feedback. Local compose leaves it off and uses /scale.
+	if autonomousScalerEnabled() {
+		go startTargetAppMonitor(orch)
+	}
+
+	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"status":"ok"}`))
+	})
+
+	// Expose target application status for the dashboard (same-origin via nginx).
 	http.HandleFunc("/api/target/status", func(w http.ResponseWriter, r *http.Request) {
 		targetMu.RLock()
 		defer targetMu.RUnlock()

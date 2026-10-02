@@ -1,0 +1,44 @@
+{
+  "mean_train": 115.21266234277532,
+  "std_train": 94.78847876073904,
+  "seq_length": 24,
+  "horizon_steps": 30,
+  "forecast_source": "lstm",
+  "compression_seconds": 40,
+  "scale": 142.21218961625283,
+  "target_peak_rps": 750.0,
+  "train_peak_rps": 360.94808126410834,
+  "epochs": 6,
+  "holdout_dates": [
+    "1995-07-13",
+    "1995-07-20",
+    "1995-08-10",
+    "1995-08-17"
+  ],
+  "mae": 37.8626010336367,
+  "rmse": 56.8096534240413,
+  "median_lead_seconds": {
+    "200": 23.5,
+    "400": 18.0,
+    "600": 24.0
+  },
+  "false_prescale_rate": 0.0,
+  "baseline_hourly_weights": {
+    "mae": 62.53639550956182,
+    "rmse": 97.00925335492869,
+    "median_lead_seconds": {
+      "200": -6.0,
+      "400": null,
+      "600": null
+    },
+    "false_prescale_rate": 0.0,
+    "note": "Same architecture, original hourly weights, original mean/std. Not retrained."
+  },
+  "oracle_shift_lead_seconds": {
+    "200": 27.0,
+    "400": 15.0,
+    "600": 27.0
+  },
+  "base_weights": "models/lstm_weights.pth",
+  "note": "6 epochs on CPU. Rising windows up-weighted and a 1.5-2.6x copy added so the mean can exceed the 361 RPS training-day peak. Original lstm_weights.pth was not overwritten."
+}

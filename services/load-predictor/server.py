@@ -7,6 +7,7 @@ import pandas as pd
 from datetime import datetime
 import json
 import joblib
+import logging
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -18,15 +19,22 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../h
 import predictor_pb2
 import predictor_pb2_grpc
 
-# Import models
+# Import models. neural_prophet is not imported: the seasonality model is
+# the joblib regressor, and importing neuralprophet pulled an unused package
+# into startup.
 from models.lstm import BayesianLSTM
-try:
-    from models.neural_prophet import WorkloadNeuralProphet
-except ImportError:
-    WorkloadNeuralProphet = None
 from models.xgboost_residuals import XGBoostResidualModel
 from models.hybrid_mlp import HybridMLPFusion
 from rl_agent import RLAgent
+from bounds import clamp_z_score, uncertainty_bounds
+from nasa_trace import select_forecast_mean
+
+log = logging.getLogger("predictor")
+if not log.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter("%(levelname)s %(name)s %(message)s"))
+    log.addHandler(_handler)
+    log.setLevel(logging.INFO)
 
 class PredictorService(predictor_pb2_grpc.PredictorServicer):
     def __init__(self):
@@ -49,14 +57,19 @@ class PredictorService(predictor_pb2_grpc.PredictorServicer):
         self.rl_agent = RLAgent(state_size=7, action_size=5)
         self.rl_agent.epsilon = 0.0 # Inference mode
         
-        # Load weights and stats
-        models_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), 'models'))
+        # Load weights and stats. MODEL_DIR selects a fine-tune (for example
+        # models/nasa from finetune_nasa.py). Unset, this is the original
+        # hourly checkpoint directory and nothing there is overwritten.
+        models_dir = os.environ.get('MODEL_DIR') or os.path.join(os.path.dirname(__file__), 'models')
+        models_dir = os.path.abspath(models_dir)
+        self.forecast_source = 'fusion'
         try:
             with open(os.path.join(models_dir, 'training_stats.json'), 'r') as f:
                 self.stats = json.load(f)
             self.mean_train = self.stats.get('mean_train', 0.0)
             self.std_train = self.stats.get('std_train', 1.0)
-            print("Loaded training stats.")
+            self.forecast_source = self.stats.get('forecast_source', 'fusion')
+            print("Loaded training stats from", models_dir, "forecast_source=", self.forecast_source)
         except Exception as e:
             print("Could not load training stats:", e)
             self.mean_train = 0.0
@@ -87,13 +100,29 @@ class PredictorService(predictor_pb2_grpc.PredictorServicer):
         except Exception as e:
             print("Could not load Fusion MLP weights:", e)
 
+        self.rl_loaded = False
+        self.rl_checkpoint_error = ""
+        rl_path = os.path.join(models_dir, 'rl_agent_checkpoint.pth')
         try:
-            self.rl_agent.load(os.path.join(models_dir, 'rl_agent_checkpoint.pth'))
+            self.rl_agent.load(rl_path)
+            self.rl_loaded = True
             print("Loaded trained RL Agent.")
         except Exception as e:
-            print("Could not load RL Agent, using default initialized weights. Error:", e)
+            self.rl_checkpoint_error = f"{rl_path}: {e}"
+            log.error(
+                "Could not load RL Agent from %s. The process is still up with a "
+                "random DQN, and /health reports the failure so the pod is not Ready. Error: %s",
+                rl_path,
+                e,
+            )
 
         self.last_state = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+        # current_z_score is one value for the whole process. Concurrent
+        # GetPrediction calls (monitor + /scale) would race and step it twice
+        # per tick. The lock makes each step atomic. Callers should still
+        # avoid having two controllers: the orchestrator only runs its
+        # autonomous loop on Kubernetes, and uses POST /scale for the simulator.
+        self._predict_lock = threading.Lock()
 
     def reset_rl(self):
         if hasattr(self, 'rl_agent') and self.rl_agent is not None:
@@ -101,6 +130,12 @@ class PredictorService(predictor_pb2_grpc.PredictorServicer):
         return 1.96
 
     def GetPrediction(self, request, context):
+        # Serialize RL z-score updates. MC dropout itself is read-only, but
+        # step_z_score mutates shared agent state.
+        with self._predict_lock:
+            return self._predict_locked(request, context)
+
+    def _predict_locked(self, request, context):
         history = np.array(request.history)
         if len(history) < 24:
             # Fallback if not enough data
@@ -165,14 +200,20 @@ class PredictorService(predictor_pb2_grpc.PredictorServicer):
             xgb_residual = 0.0
             
         # --- Fusion ---
+        # The hourly ensemble is the default. A NASA fine-tune sets
+        # forecast_source=lstm in its own training_stats.json: the published
+        # mean is then the LSTM's horizon forecast. Wall-clock hour (what
+        # this request carries) is not the 1995 hour, so the seasonality
+        # model must not be blended into that mean.
         try:
             fusion_input = torch.FloatTensor([[lstm_mean, season_pred, season_pred + xgb_residual]]).to(self.device)
             self.fusion.eval()
             with torch.no_grad():
-                mean = float(self.fusion(fusion_input)[0][0])
+                fusion_mean = float(self.fusion(fusion_input)[0][0])
         except Exception:
-            mean = lstm_mean
-            
+            fusion_mean = lstm_mean
+        mean = select_forecast_mean(lstm_mean, fusion_mean, getattr(self, 'forecast_source', 'fusion'))
+
         # True ML inference only (no reactive overrides)
         mean = max(0.0, mean)
         raw_ml_mean = mean
@@ -212,16 +253,27 @@ class PredictorService(predictor_pb2_grpc.PredictorServicer):
         else:
             action = 2
             current_z_score = 2.0 + (error_ratio * 0.5)
-        
-        # Calculate final bounds purely from ML mean + (dynamic_z * Bayesian_std_dev)
+
+        # The agent still steps inside [0, 10]. Publish a clamped z, and put
+        # idle or flat traffic back at 1.96 so a checkpoint saved at 10 cannot
+        # stick. The next tick starts from that published value.
+        current_z_score = clamp_z_score(current_z_score, history)
+        if hasattr(self, 'rl_agent') and self.rl_agent is not None:
+            self.rl_agent.current_z_score = current_z_score
+
+        # upper = mean + z * (std + 0.5 * max(0, rps - mean)). See bounds.py.
+        # At idle, rps is below the mean, so the error term is zero and the
+        # bound is just mean + z*std. std is a fresh Monte Carlo dropout
+        # draw every call, and that draw is also the DQN's variance feature,
+        # so z moves with it. A single tick can therefore jump from ~180 to
+        # ~440 while the mean stays put. The orchestrator does not add pods
+        # for that jump unless live RPS is rising (ForecastGuard).
+        # When the recent window is idle (<=5 RPS), the std term inside the
+        # upper bound is capped at 5. The published std_dev stays the raw draw.
         std_dev = float(total_std)
-        
-        # If the error is massive, the variance inherently spikes.
-        # We also factor the prediction error into the standard deviation for instantaneous shocks.
-        adjusted_std = std_dev + (prediction_error * 0.5)
-        
-        upper_bound = mean + (current_z_score * adjusted_std)
-        lower_bound = max(0, mean - (current_z_score * adjusted_std))
+        upper_bound, lower_bound, _ = uncertainty_bounds(
+            mean, std_dev, current_z_score, float(history[-1]), history
+        )
         
         # The Orchestrator scales based on the upper_bound!
         mean = upper_bound  # We feed the uncertainty-adjusted bound as the target mean for scaling.
@@ -252,6 +304,28 @@ def serve():
             self.send_header("Access-Control-Allow-Methods", "POST, OPTIONS")
             self.send_header("Access-Control-Allow-Headers", "Content-Type")
             self.end_headers()
+
+        def do_GET(self):
+            if self.path not in ("/health", "/healthz", "/ready"):
+                self.send_response(404)
+                self.end_headers()
+                return
+            if service.rl_loaded:
+                payload = {"status": "ok", "rl_checkpoint": "loaded"}
+                code = 200
+            else:
+                payload = {
+                    "status": "error",
+                    "rl_checkpoint": "missing",
+                    "error": service.rl_checkpoint_error or "RL checkpoint was not loaded",
+                }
+                code = 503
+            body = json.dumps(payload).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
 
         def do_POST(self):
             if self.path != "/reset":

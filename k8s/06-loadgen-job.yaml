@@ -1,0 +1,77 @@
+# Not part of kustomization.yaml. Apply it when you want the demo spike:
+#   kubectl delete job loadgen -n capstone --ignore-not-found
+#   kubectl apply -f k8s/06-loadgen-job.yaml
+# Locust file is duplicated in deploy/locustfile.py for laptop runs.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: loadgen-script
+  namespace: capstone
+data:
+  locustfile.py: |
+    from locust import HttpUser, LoadTestShape, constant, task
+
+    class Browser(HttpUser):
+        wait_time = constant(0.01)
+
+        @task
+        def home(self):
+            self.client.get("/")
+
+    class DemoShape(LoadTestShape):
+        stages = [
+            (25, 2, 1),
+            (55, 12, 4),
+            (120, 36, 8),
+            (170, 6, 6),
+            (210, 1, 2),
+        ]
+
+        def tick(self):
+            run_time = self.get_run_time()
+            for duration, users, spawn_rate in self.stages:
+                if run_time < duration:
+                    return users, spawn_rate
+            return None
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: loadgen
+  namespace: capstone
+  labels:
+    app: loadgen
+spec:
+  backoffLimit: 1
+  ttlSecondsAfterFinished: 600
+  template:
+    metadata:
+      labels:
+        app: loadgen
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: locust
+          image: locustio/locust:2.31.8
+          imagePullPolicy: IfNotPresent
+          args:
+            - -f
+            - /locust/locustfile.py
+            - --headless
+            - --host
+            - http://nginx-lb.capstone.svc.cluster.local:8090
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          volumeMounts:
+            - name: script
+              mountPath: /locust
+              readOnly: true
+      volumes:
+        - name: script
+          configMap:
+            name: loadgen-script

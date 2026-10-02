@@ -15,22 +15,54 @@ spec:
       labels:
         app: predictor
     spec:
+      terminationGracePeriodSeconds: 20
       containers:
         - name: predictor
           image: capstone/predictor:latest
           imagePullPolicy: IfNotPresent
+          env:
+            # Horizon forecast trained on the compressed NASA trace.
+            # Delete this env to fall back to the original hourly weights.
+            - name: MODEL_DIR
+              value: /app/models/nasa
           ports:
             - containerPort: 50051
               name: grpc
             - containerPort: 50052
               name: http
+          # Model load happens before :50052 listens. The startup probe
+          # allows a few minutes for that without killing the container.
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+            failureThreshold: 60
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sh", "-c", "sleep 5"]
           resources:
+            # 1Gi is the schedule request. The image is about 4 GB on disk
+            # and the process wants the 1536Mi limit. A Standard_B2s node
+            # (4 GiB, under 3 GiB allocatable) does not have that left after
+            # system pods; the demo uses B2ms (about 6 GB allocatable).
             requests:
               cpu: 200m
-              memory: 512Mi
-            limits:
-              cpu: 1000m
               memory: 1Gi
+            limits:
+              cpu: "1"
+              memory: 1536Mi
 ---
 apiVersion: v1
 kind: Service
