@@ -1,8 +1,7 @@
 torch>=2.4.0
-numpy==1.26.4
+numpy>=1.26.4
 pandas
 scikit-learn
-neuralprophet
 xgboost
 grpcio
 grpcio-tools

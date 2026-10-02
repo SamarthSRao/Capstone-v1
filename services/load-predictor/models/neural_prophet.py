@@ -1,3 +1,6 @@
+# Not imported by server.py. The running predictor uses the joblib seasonality
+# model. This module stays for the old training helper and is not a startup
+# dependency.
 from neuralprophet import NeuralProphet
 import pandas as pd
 

@@ -19,12 +19,10 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../h
 import predictor_pb2
 import predictor_pb2_grpc
 
-# Import models
+# Import models. neural_prophet is not imported: the seasonality model is
+# the joblib regressor, and importing neuralprophet pulled an unused package
+# into startup.
 from models.lstm import BayesianLSTM
-try:
-    from models.neural_prophet import WorkloadNeuralProphet
-except ImportError:
-    WorkloadNeuralProphet = None
 from models.xgboost_residuals import XGBoostResidualModel
 from models.hybrid_mlp import HybridMLPFusion
 from rl_agent import RLAgent
