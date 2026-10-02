@@ -9,7 +9,8 @@
 #   5. Create an Azure Container Registry, build and push the four app images
 #   6. Create AKS (or reuse it) and attach that registry
 #   7. Apply k8s/ with the images rewritten to <acr>.azurecr.io/<name>:latest
-#   8. Print the LoadBalancer addresses
+#   8. Print the LoadBalancer address (one public IP: dashboard on :80,
+#      storefront on :8090)
 #
 # Azure for Students on this subscription allows only:
 #   indiasouthcentral, centralindia, eastasia, koreacentral, malaysiawest
@@ -374,16 +375,14 @@ kubectl apply -k "$OVERLAY"
 rm -rf "$OVERLAY"
 
 echo
-echo "[8/8] Waiting for LoadBalancer addresses (up to 3 minutes)..."
+echo "[8/8] Waiting for the nginx-lb LoadBalancer address (up to 3 minutes)..."
+echo "The dashboard is ClusterIP. It is served on this same IP, port 80."
 kubectl -n capstone rollout status deployment/nginx-lb --timeout=180s || true
 kubectl -n capstone rollout status deployment/dashboard --timeout=180s || true
 kubectl wait --namespace capstone --for=jsonpath='{.status.loadBalancer.ingress[0].ip}' service/nginx-lb --timeout=180s || true
-kubectl wait --namespace capstone --for=jsonpath='{.status.loadBalancer.ingress[0].ip}' service/dashboard --timeout=180s || true
 
 WEBSITE_IP="$(kubectl get svc nginx-lb -n capstone -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)"
-DASHBOARD_IP="$(kubectl get svc dashboard -n capstone -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)"
 if [ -z "$WEBSITE_IP" ]; then WEBSITE_IP="Pending"; fi
-if [ -z "$DASHBOARD_IP" ]; then DASHBOARD_IP="Pending"; fi
 
 echo
 echo "=========================================================="
@@ -391,7 +390,7 @@ echo " Capstone stack applied to AKS"
 echo "=========================================================="
 echo
 echo "  Target app (nginx):   http://${WEBSITE_IP}:8090"
-echo "  Autoscaler dashboard: http://${DASHBOARD_IP}"
+echo "  Autoscaler dashboard: http://${WEBSITE_IP}"
 echo "  Registry:             ${LOGIN_SERVER}"
 echo
 kubectl get pods -n capstone -o wide || true

@@ -21,6 +21,8 @@ from typing import Any
 
 SIMULATOR = "http://localhost:8083"
 API = "http://localhost:8080"
+# Local compose publishes the dashboard on :3000. On AKS it is the nginx-lb
+# address, port 80, not a second LoadBalancer IP.
 DASHBOARD = "http://localhost:3000"
 STOREFRONT = "http://localhost:3001"
 

@@ -460,7 +460,7 @@ func autonomousScalerEnabled() bool {
 func startTargetAppMonitor(orch *Orchestrator) {
 	metricsURL := os.Getenv("TARGET_METRICS_URL")
 	if metricsURL == "" {
-		metricsURL = "http://nginx-lb:8090/stub_status"
+		metricsURL = "http://nginx-metrics:8091/stub_status"
 	}
 
 	log.Printf("[Target Monitor] Starting live traffic monitor for: %s (service rate %.0f RPS/pod, scale-down every %s by %d)",

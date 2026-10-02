@@ -5,7 +5,8 @@ In cluster (preferred, generates enough RPS to move several pods):
     kubectl delete job loadgen -n capstone --ignore-not-found
     kubectl apply -f k8s/06-loadgen-job.yaml
 
-From a laptop against the public LoadBalancer (weaker spike):
+From a laptop against the public LoadBalancer (weaker spike). The dashboard
+is that same IP on port 80; this host is the storefront on port 8090.
 
     locust -f deploy/locustfile.py --headless --host http://<NGINX-LB-IP>:8090
 

@@ -6,7 +6,9 @@ WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci
 COPY . .
-# Relative URL. nginx proxies this prefix to the orchestrator Service.
+# Relative URL. The AKS page is served from the nginx-lb host (port 80),
+# and that host's dashboard nginx proxies this prefix to the orchestrator.
+# Do not set a separate dashboard IP or a cluster DNS name here.
 ENV VITE_ORCHESTRATOR_URL=/api/orchestrator
 # Leave the simulator unset. AKS does not run one; an empty value stops the
 # UI from calling window.location:8083.

@@ -6,7 +6,8 @@
 #
 #   ./deploy/load_gen.sh
 #
-# From this machine, against the public LoadBalancer (a lighter spike):
+# From this machine, against the public LoadBalancer (a lighter spike).
+# The dashboard is that same IP on port 80. There is no second address.
 #
 #   ./deploy/load_gen.sh --url http://<NGINX-IP>:8090
 #

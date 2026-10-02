@@ -23,10 +23,11 @@ spec:
           ports:
             - name: http
               containerPort: 80
-          # Static nginx build. The browser calls /api/orchestrator/..., which
-          # this pod proxies to the orchestrator Service. VITE_* URLs are baked
-          # at image build time and must not be cluster DNS names: the browser
-          # cannot resolve them.
+          # Static nginx build. The browser loads this pod through nginx-lb
+          # port 80 and calls /api/orchestrator/..., which this pod proxies to
+          # the orchestrator Service. VITE_ORCHESTRATOR_URL is the relative
+          # path /api/orchestrator, baked at image build. A cluster DNS name
+          # would be fetched by the browser and fail.
           startupProbe:
             httpGet:
               path: /health
@@ -57,7 +58,7 @@ metadata:
   name: dashboard
   namespace: capstone
 spec:
-  type: LoadBalancer
+  type: ClusterIP
   selector:
     app: dashboard
   ports:

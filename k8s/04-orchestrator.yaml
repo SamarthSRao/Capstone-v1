@@ -32,7 +32,7 @@ spec:
             - name: K8S_DEPLOYMENT
               value: "target-app"
             - name: TARGET_METRICS_URL
-              value: "http://nginx-lb:8090/stub_status"
+              value: "http://nginx-metrics:8091/stub_status"
             # Dial target. The process used to ignore this and hardcode predictor:50051.
             - name: PREDICTOR_URL
               value: "predictor:50051"

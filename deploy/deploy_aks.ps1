@@ -10,7 +10,8 @@
       5. Create an Azure Container Registry, build, and push the four app images
       6. Create AKS (or reuse it) and attach that registry
       7. Apply k8s/ with images rewritten to <acr>.azurecr.io/<name>:latest
-      8. Print the LoadBalancer addresses
+      8. Print the LoadBalancer address (one public IP: dashboard on port 80,
+         storefront on port 8090)
 
     Azure for Students on this subscription allows only these regions:
     indiasouthcentral, centralindia, eastasia, koreacentral, malaysiawest.
@@ -355,28 +356,22 @@ try {
 }
 
 Write-Host ""
-Write-Host "[8/8] Waiting for LoadBalancer addresses (up to 3 minutes)..."
+Write-Host "[8/8] Waiting for the nginx-lb LoadBalancer address (up to 3 minutes)..."
+Write-Host "The dashboard is ClusterIP. It is served on this same IP, port 80."
 kubectl -n capstone rollout status deployment/nginx-lb --timeout=180s
 if ($LASTEXITCODE -ne 0) { Write-Host "nginx-lb rollout still in progress" }
 kubectl -n capstone rollout status deployment/dashboard --timeout=180s
 if ($LASTEXITCODE -ne 0) { Write-Host "dashboard rollout still in progress" }
 
 $websiteIp = ""
-$dashboardIp = ""
 $elapsed = 0
-while ($elapsed -lt 180 -and ((-not $websiteIp) -or (-not $dashboardIp))) {
+while ($elapsed -lt 180 -and (-not $websiteIp)) {
     Start-Sleep -Seconds 10
     $elapsed += 10
-    if (-not $websiteIp) {
-        $websiteIp = kubectl get svc nginx-lb -n capstone -o jsonpath="{.status.loadBalancer.ingress[0].ip}" 2>$null
-    }
-    if (-not $dashboardIp) {
-        $dashboardIp = kubectl get svc dashboard -n capstone -o jsonpath="{.status.loadBalancer.ingress[0].ip}" 2>$null
-    }
-    Write-Host "Waiting for external IPs... (${elapsed}s elapsed)"
+    $websiteIp = kubectl get svc nginx-lb -n capstone -o jsonpath="{.status.loadBalancer.ingress[0].ip}" 2>$null
+    Write-Host "Waiting for the nginx-lb IP... (${elapsed}s elapsed)"
 }
 if (-not $websiteIp) { $websiteIp = "Pending" }
-if (-not $dashboardIp) { $dashboardIp = "Pending" }
 
 Write-Host ""
 Write-Host "=========================================================="
@@ -384,7 +379,7 @@ Write-Host " Capstone stack applied to AKS"
 Write-Host "=========================================================="
 Write-Host ""
 Write-Host "  Target app (nginx):   http://${websiteIp}:8090"
-Write-Host "  Autoscaler dashboard: http://${dashboardIp}"
+Write-Host "  Autoscaler dashboard: http://${websiteIp}"
 Write-Host "  Registry:             $LoginServer"
 Write-Host ""
 kubectl get pods -n capstone -o wide

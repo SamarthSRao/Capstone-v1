@@ -10,10 +10,10 @@ Do not point this at a production subscription. The scripts create a resource gr
 
 | Piece | Where |
 |---|---|
-| Target storefront | `target-app` behind `nginx-lb` (stub_status on `:8090/stub_status`) |
+| Target storefront | `target-app` behind `nginx-lb:8090` |
 | Forecast | Python predictor, gRPC `:50051` |
 | Replica decision | Go orchestrator, `:8082` `/api/target/status` |
-| Dashboard | Static build, nginx proxies `/api/orchestrator/` to the orchestrator |
+| Dashboard | Same public IP as nginx-lb, port 80. The Service is ClusterIP. `stub_status` is `nginx-metrics:8091` (not on the LoadBalancer) |
 
 Each target pod is treated as **200 requests/second**. The cap is 10, which fits a 1-node student pool if the node is a 2-vCPU size. Scale-down waits 100 seconds, then removes one pod, and only if the busiest forecast mean or live RPS in that window fits in fewer pods.
 
@@ -92,11 +92,13 @@ az group delete --name capstone-rg --yes --no-wait
 az group delete --name capstone-rg --yes --no-wait
 ```
 
-When it finishes, note the two addresses it prints:
+Azure for Students allows **3 Standard public IPs** in the region. AKS keeps one for the cluster outbound address. This stack creates **one** LoadBalancer Service (`nginx-lb`), so the inbound address is the second IP, not a third. The dashboard Service is ClusterIP. nginx proxies port 80 to it and keeps the storefront on port 8090.
+
+When it finishes, note the one address it prints:
 
 ```text
 Target app (nginx):   http://<NGINX-IP>:8090
-Autoscaler dashboard: http://<DASHBOARD-IP>
+Autoscaler dashboard: http://<NGINX-IP>
 ```
 
 Confirm pods are Running before generating load. The predictor image is the slow one (model load, startup probe allows several minutes).
@@ -107,7 +109,7 @@ kubectl -n capstone rollout status deployment/predictor
 kubectl -n capstone rollout status deployment/orchestrator
 ```
 
-Open the dashboard in a browser. It should show live RPS, forecast, upper bound, and current versus desired replicas. Those numbers come from `http://<DASHBOARD-IP>/api/orchestrator/api/target/status`, which nginx proxies to the orchestrator. You should not need a simulator URL.
+Open the dashboard in a browser at `http://<NGINX-IP>/`. It should show live RPS, forecast, upper bound, and current versus desired replicas. Those numbers come from `http://<NGINX-IP>/api/orchestrator/api/target/status`. nginx-lb forwards that host to the dashboard pod, and the dashboard nginx proxies `/api/orchestrator/` to the orchestrator. The page is built with `VITE_ORCHESTRATOR_URL=/api/orchestrator`, so the browser stays on this host. Upgrade and Connection are forwarded, and the proxy does not buffer that location. You should not need a simulator URL.
 
 Start the spike (in-cluster Locust) and watch pods in a second terminal:
 
@@ -130,9 +132,10 @@ Optional lighter spike from the laptop (often not enough RPS to pass two pods):
 Direct checks while it runs:
 
 ```bash
-curl -s "http://<DASHBOARD-IP>/api/orchestrator/api/target/status"
-curl -s "http://<NGINX-IP>:8090/stub_status"
+curl -s "http://<NGINX-IP>/api/orchestrator/api/target/status"
 ```
+
+`stub_status` is not on the public IP. The orchestrator reads `http://nginx-metrics:8091/stub_status`. That port allows only localhost and private ranges, and the Service is ClusterIP. A request to `http://<NGINX-IP>:8090/stub_status` is the storefront, not the counter.
 
 The status JSON fields to point at: `current_rps`, `predicted_mean`, `predicted_upper`, `active_replicas`, `desired_replicas`, `scaling`.
 
@@ -158,11 +161,10 @@ kubectl -n capstone rollout status deployment/orchestrator --timeout=180s
 kind does not give LoadBalancer IPs a public address by itself. Either install the kind Cloud Provider, or port-forward:
 
 ```bash
-kubectl -n capstone port-forward svc/dashboard 8088:80
-kubectl -n capstone port-forward svc/nginx-lb 8090:8090
+kubectl -n capstone port-forward svc/nginx-lb 8088:80 8090:8090
 ```
 
-Dashboard: `http://127.0.0.1:8088`. Storefront: `http://127.0.0.1:8090`.
+Dashboard: `http://127.0.0.1:8088`. Storefront: `http://127.0.0.1:8090`. The dashboard Service is ClusterIP, so it has no address of its own.
 
 `nginx:alpine` and `locustio/locust` are pulled by the cluster from Docker Hub when the pod starts. Then:
 
@@ -182,11 +184,10 @@ docker build -t capstone/predictor:latest services/load-predictor
 docker build -t capstone/dashboard:latest services/dashboard
 kubectl apply -k k8s
 kubectl -n capstone rollout status deployment/predictor --timeout=300s
-minikube service -n capstone dashboard --url
 minikube service -n capstone nginx-lb --url
 ```
 
-`minikube tunnel` (separate terminal, often needs sudo) is the other way to materialize LoadBalancer addresses. Load generation is the same `./deploy/load_gen.sh`.
+The URL on port 80 is the dashboard. The URL on port 8090 is the storefront. `minikube tunnel` (separate terminal, often needs sudo) is the other way to materialize the LoadBalancer address. Load generation is the same `./deploy/load_gen.sh`.
 
 ## Retrain on the NASA trace
 

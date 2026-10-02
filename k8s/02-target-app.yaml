@@ -8,6 +8,12 @@ data:
     # One worker is enough on a 2 vCPU node. Access logs are off so 800 RPS
     # is not spent formatting lines. Keepalive to the storefront avoids a
     # new upstream TCP handshake per request.
+    #
+    # One public LoadBalancer IP (Azure for Students allows 3 Standard
+    # public IPs, and the cluster outbound IP uses one of them):
+    #   :80   dashboard
+    #   :8090 storefront (/ , /api/products, /api/checkout, /health, /metrics)
+    #   :8091 stub_status, ClusterIP only, private clients
     worker_processes 1;
     events {
         worker_connections 4096;
@@ -16,17 +22,28 @@ data:
     http {
         access_log off;
         keepalive_timeout 65;
+
+        map $http_upgrade $connection_upgrade {
+            default upgrade;
+            ''      close;
+        }
+
         upstream target_backend {
             least_conn;
             server target-app:8080 max_fails=3 fail_timeout=5s;
             keepalive 64;
         }
+        upstream dashboard_backend {
+            server dashboard:80;
+            keepalive 16;
+        }
+
         server {
             listen 8090;
-            location /stub_status {
-                stub_status on;
+            location = /healthz {
                 access_log off;
-                allow all;
+                default_type text/plain;
+                return 200 "ok\n";
             }
             location / {
                 proxy_pass http://target_backend;
@@ -38,6 +55,44 @@ data:
                 proxy_set_header X-Forwarded-Proto $scheme;
                 proxy_connect_timeout 2s;
                 proxy_read_timeout 5s;
+            }
+        }
+
+        server {
+            listen 80;
+            # The dashboard polls /api/orchestrator/... and its nginx proxies
+            # that prefix on. Forward the whole request, including Upgrade,
+            # and do not buffer so a stream is not held until it ends.
+            location / {
+                proxy_pass http://dashboard_backend;
+                proxy_http_version 1.1;
+                proxy_set_header Host $host;
+                proxy_set_header X-Real-IP $remote_addr;
+                proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                proxy_set_header X-Forwarded-Proto $scheme;
+                proxy_set_header Upgrade $http_upgrade;
+                proxy_set_header Connection $connection_upgrade;
+                proxy_buffering off;
+                proxy_cache off;
+                proxy_read_timeout 3600s;
+                proxy_send_timeout 3600s;
+            }
+        }
+
+        server {
+            listen 8091;
+            location = /stub_status {
+                stub_status on;
+                access_log off;
+                allow 127.0.0.1;
+                allow ::1;
+                allow 10.0.0.0/8;
+                allow 172.16.0.0/12;
+                allow 192.168.0.0/16;
+                deny all;
+            }
+            location / {
+                return 404;
             }
         }
     }
@@ -139,20 +194,24 @@ spec:
           ports:
             - name: http
               containerPort: 8090
+            - name: web
+              containerPort: 80
+            - name: metrics
+              containerPort: 8091
           startupProbe:
             httpGet:
-              path: /stub_status
+              path: /healthz
               port: http
             periodSeconds: 2
             failureThreshold: 15
           livenessProbe:
             httpGet:
-              path: /stub_status
+              path: /healthz
               port: http
             periodSeconds: 10
           readinessProbe:
             httpGet:
-              path: /stub_status
+              path: /healthz
               port: http
             periodSeconds: 5
           lifecycle:
@@ -188,6 +247,26 @@ spec:
   selector:
     app: nginx-lb
   ports:
-    - protocol: TCP
+    - name: web
+      protocol: TCP
+      port: 80
+      targetPort: web
+    - name: http
+      protocol: TCP
       port: 8090
-      targetPort: 8090
+      targetPort: http
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nginx-metrics
+  namespace: capstone
+spec:
+  type: ClusterIP
+  selector:
+    app: nginx-lb
+  ports:
+    - name: metrics
+      protocol: TCP
+      port: 8091
+      targetPort: metrics
