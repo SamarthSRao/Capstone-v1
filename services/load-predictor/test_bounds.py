@@ -41,6 +41,34 @@ class IdleUpperBoundTest(unittest.TestCase):
         # A high flat plateau is not idle, so it is clamped, not reset.
         self.assertEqual(clamp_z_score(10.0, [400.0] * 24), 4.0)
 
+    def test_idle_window_caps_std_in_the_upper_bound(self):
+        # Live 1-2 RPS, mean 4-6, MC std ~19, z reset to 1.96. Without the
+        # cap the upper bound is about 41-46. min(std, 5) brings it near 15.
+        idle = [1.0, 2.0, 1.0, 2.0]
+        for mean in (4.0, 5.0, 6.0):
+            capped, lower, err = uncertainty_bounds(mean, 19.0, 1.96, 1.0, idle)
+            raw, raw_lower, raw_err = uncertainty_bounds(mean, 19.0, 1.96, 1.0)
+            self.assertEqual(err, 0.0)
+            self.assertEqual(raw_err, 0.0)
+            self.assertAlmostEqual(capped, mean + 1.96 * 5.0)
+            self.assertLessEqual(capped, 16.0)
+            self.assertAlmostEqual(raw, mean + 1.96 * 19.0)
+            self.assertGreater(raw, 40.0)
+            # The lower bound still uses the raw std.
+            self.assertAlmostEqual(lower, raw_lower)
+
+    def test_non_idle_window_keeps_the_full_std(self):
+        moving = [1.0, 2.0, 6.0]
+        upper, lower, err = uncertainty_bounds(72, 105, 2.0, 1.0, moving)
+        raw, raw_lower, raw_err = uncertainty_bounds(72, 105, 2.0, 1.0)
+        self.assertEqual(err, raw_err)
+        self.assertAlmostEqual(upper, raw)
+        self.assertAlmostEqual(lower, raw_lower)
+        self.assertAlmostEqual(upper, 72 + 2.0 * 105)
+        # A std that is already under the cap is unchanged at idle too.
+        small, _, _ = uncertainty_bounds(5.0, 3.0, 1.96, 1.0, [1.0, 1.0])
+        self.assertAlmostEqual(small, 5.0 + 1.96 * 3.0)
+
     def test_real_overload_does_widen_the_bound(self):
         quiet, _, quiet_err = uncertainty_bounds(72, 105, 2.0, 1)
         shock, _, shock_err = uncertainty_bounds(72, 105, 2.0, 500)

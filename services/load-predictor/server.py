@@ -270,9 +270,11 @@ class PredictorService(predictor_pb2_grpc.PredictorServicer):
         # so z moves with it. A single tick can therefore jump from ~180 to
         # ~440 while the mean stays put. The orchestrator does not add pods
         # for that jump unless live RPS is rising (ForecastGuard).
+        # When the recent window is idle (<=5 RPS), the std term inside the
+        # upper bound is capped at 5. The published std_dev stays the raw draw.
         std_dev = float(total_std)
         upper_bound, lower_bound, _ = uncertainty_bounds(
-            mean, std_dev, current_z_score, float(history[-1])
+            mean, std_dev, current_z_score, float(history[-1]), history
         )
         
         # The Orchestrator scales based on the upper_bound!
