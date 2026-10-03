@@ -194,7 +194,7 @@ export default function Dashboard() {
               <MetricCard
                 label="Replicas"
                 value={`${view.activeReplicas}`}
-                detail={`Desired ${view.desiredReplicas}. The status payload reports the live replica count.`}
+                detail={`Desired ${view.desiredReplicas}`}
               />
               <MetricCard
                 label="Live RPS"
@@ -204,12 +204,12 @@ export default function Dashboard() {
               <MetricCard
                 label="Forecast mean"
                 value={fmtRps(view.forecastMean)}
-                detail="raw_ml_mean"
+                detail="Predictor mean"
               />
               <MetricCard
                 label="Upper bound"
                 value={fmtRps(view.upperBound)}
-                detail="predicted_upper"
+                detail="Published bound"
               />
               <MetricCard
                 label="Z-score"
@@ -240,7 +240,7 @@ export default function Dashboard() {
                     Forecast, actual, and capacity
                   </h2>
                   <p className="mt-0.5 text-xs text-slate-500">
-                    Requests per second. Upper bound is predicted_upper, not the raw forecast.
+                    Requests per second. The dashed indigo line is the published upper bound.
                   </p>
                 </div>
               </div>
