@@ -133,7 +133,13 @@ Direct checks while it runs:
 
 ```bash
 curl -s "http://<NGINX-IP>/api/orchestrator/api/target/status"
+# GET is the only orchestrator call the dashboard makes. POST /scale must not
+# be reachable through the public proxy (403 if it is the status URL, 404 otherwise).
+curl -s -o /dev/null -w "%{http_code}\n" -X POST "http://<NGINX-IP>/api/orchestrator/api/target/status"
+curl -s -o /dev/null -w "%{http_code}\n" -X POST "http://<NGINX-IP>/api/orchestrator/scale"
 ```
+
+The first POST prints `403`. The second prints `404`. `services/dashboard/test_nginx_allowlist.sh` checks the same rules against a local nginx.
 
 `stub_status` is not on the public IP. The orchestrator reads `http://nginx-metrics:8091/stub_status`. That port allows only localhost and private ranges, and the Service is ClusterIP. A request to `http://<NGINX-IP>:8090/stub_status` is the storefront, not the counter.
 
