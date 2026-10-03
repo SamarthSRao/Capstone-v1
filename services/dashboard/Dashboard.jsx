@@ -1,77 +1,37 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
+  CartesianGrid,
   ComposedChart,
-  Area,
+  Legend,
   Line,
+  ResponsiveContainer,
+  Tooltip,
   XAxis,
   YAxis,
-  CartesianGrid,
-  Tooltip,
-  ResponsiveContainer,
-  AreaChart,
 } from 'recharts';
+import { MetricCard } from './components/MetricCard';
+import { LocalSimulator } from './localSimulator';
 import {
-  Activity,
-  Zap,
-  ShieldCheck,
-  Server,
-  Terminal,
-  Clock,
-  Box,
-  AlertTriangle,
-} from 'lucide-react';
-import { motion, AnimatePresence } from 'framer-motion';
-import { SlaCostVisualizer } from './SlaCostVisualizer';
-import { RlVisualizationPanel } from './RlVisualizationPanel';
+  chartPoint,
+  explainDecision,
+  fmtRps,
+  mapStatus,
+} from './statusView';
 
-// Empty in the AKS image so the browser does not invent :8083 on the
-// dashboard's public host. Set VITE_SIMULATOR_URL for the local simulator demo.
 const SIMULATOR_URL = import.meta.env.VITE_SIMULATOR_URL || '';
-
-// Relative by default. nginx (cluster) and the Vite dev proxy both forward
-// /api/orchestrator to the orchestrator. Do not bake http://orchestrator:8082
-// into the bundle: the browser cannot resolve cluster DNS.
 const ORCHESTRATOR_URL = (
   import.meta.env.VITE_ORCHESTRATOR_URL || '/api/orchestrator'
 ).replace(/\/$/, '');
 
-function mapOrchestratorStatus(data) {
-  return {
-    status: data.status || 'LIVE',
-    current_rps: data.current_rps,
-    active_servers: data.active_replicas,
-    required_servers: data.desired_replicas ?? data.active_replicas,
-    predicted_mean: data.predicted_mean,
-    predicted_upper: data.predicted_upper,
-    predicted_lower: data.predicted_lower,
-    sla_reliability: data.sla_reliability,
-    violations: data.violations ?? 0,
-    rl_action: data.rl_action,
-    rl_action_label: data.rl_action_label,
-    z_score: data.z_score,
-    std_dev: data.std_dev,
-    raw_ml_mean: data.raw_ml_mean,
-    error_ratio: data.error_ratio,
-    forecast_lead_rps: data.forecast_lead_rps,
-    scale_rule: data.scale_rule || '',
-    source: 'orchestrator',
-  };
-}
+const STATUS_PATH = `${ORCHESTRATOR_URL}/api/target/status`;
 
-// Prefer the orchestrator's live target status (AKS and kind). Fall back to
-// the simulator only when that loop is not running.
 async function fetchTelemetry() {
   if (ORCHESTRATOR_URL) {
     try {
-      const response = await fetch(
-        `${ORCHESTRATOR_URL}/api/target/status`,
-        { cache: 'no-store' }
-      );
+      const response = await fetch(STATUS_PATH, { cache: 'no-store' });
       if (response.ok) {
         const data = await response.json();
-        if (data && data.live) {
-          return mapOrchestratorStatus(data);
-        }
+        if (data && data.live) return data;
       }
     } catch (err) {
       console.warn('[Dashboard] orchestrator status unavailable', err);
@@ -79,2211 +39,339 @@ async function fetchTelemetry() {
   }
 
   if (!SIMULATOR_URL) {
-    throw new Error('orchestrator status is not live and no simulator URL is configured');
+    throw new Error('orchestrator status is not live');
   }
 
-  const response = await fetch(`${SIMULATOR_URL}/metrics`, {
-    cache: 'no-store',
-  });
+  const response = await fetch(`${SIMULATOR_URL}/metrics`, { cache: 'no-store' });
   if (!response.ok) {
     throw new Error(`simulator HTTP ${response.status}`);
   }
   return response.json();
 }
 
-/* ============================================================
-   Simulation Datasets
-   ============================================================ */
-
-const DATASETS = {
-  organic: {
-    label: 'Organic Traffic',
-    description: 'Steady baseline — 50 to 100 RPS',
-    data: [
-      50, 52, 55, 58, 60, 62, 65, 63, 70, 72,
-      68, 75, 78, 80, 76, 72, 70, 68, 65, 60,
-      58, 55, 60, 62, 65, 70, 72, 75, 78, 80,
-      82, 80, 78, 75, 72, 70, 68, 65, 62, 60,
-    ],
-  },
-
-  flash_sale: {
-    label: '⚡ Flash Sale Spike',
-    description: 'Organic → 2,500 RPS spike → cooldown',
-    data: [
-      50, 55, 60, 65, 70, 80, 100, 200, 500, 1000,
-      1800, 2200, 2500, 2500, 2400, 2000, 1500, 1000,
-      600, 400, 250, 150, 100, 80, 65, 55, 50, 50,
-      50, 50,
-    ],
-  },
-
-  nasa_trace: {
-    label: 'NASA HTTP Trace',
-    description: 'Real 1995 NASA server traffic pattern',
-    data: [
-      120, 135, 140, 180, 210, 350, 620, 980, 1200, 1450,
-      1600, 1580, 1420, 1300, 1200, 1100, 980, 850, 720,
-      600, 480, 380, 280, 200, 160, 140, 130, 125, 120,
-      118,
-    ],
-  },
-
-  calgary_trace: {
-    label: 'Calgary HTTP Trace',
-    description: 'University server — sharp midday spike',
-    data: [
-      80, 85, 90, 95, 100, 120, 180, 320, 580, 850,
-      1100, 1250, 1100, 900, 750, 600, 480, 380, 280,
-      200, 160, 130, 110, 95, 88, 85, 82, 80, 80, 80,
-    ],
-  },
-};
-
-/* ============================================================
-   Helpers
-   ============================================================ */
-
-function toNumber(value, fallback = null) {
-  if (value === null || value === undefined || value === '') {
-    return fallback;
-  }
-
-  const number = Number(value);
-
-  return Number.isFinite(number) ? number : fallback;
-}
-
-function getPredictionValue(data, snakeCaseKey, camelCaseKey) {
-  const snake = data?.[snakeCaseKey];
-  const camel = data?.[camelCaseKey];
-
-  const value = Array.isArray(snake)
-    ? snake[0]
-    : Array.isArray(camel)
-      ? camel[0]
-      : snake ?? camel;
-
-  return toNumber(value);
-}
-
-function fmt(value, digits = 0) {
-  const number = toNumber(value);
-
-  if (number === null) {
-    return '—';
-  }
-
-  return number.toLocaleString(undefined, {
-    maximumFractionDigits: digits,
-    minimumFractionDigits: digits,
+function clockLabel(date) {
+  return date.toLocaleTimeString([], {
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
   });
 }
 
-/* ============================================================
-   Simulation Control Panel
-   ============================================================ */
-
-const SimulationControlPanel = ({
-  latestStatus,
-  selected,
-  setSelected,
-  onSimulationStarted,
-  latest,
-}) => {
-  const [localStatus, setLocalStatus] = useState(
-    latestStatus || 'IDLE'
-  );
-
-  const [starting, setStarting] = useState(false);
-
-  useEffect(() => {
-    if (latestStatus) {
-      setLocalStatus(latestStatus);
-    }
-  }, [latestStatus]);
-
-  const startSimulation = async () => {
-    if (starting || localStatus === 'SIMULATING') {
-      return;
-    }
-
-    const dataset = DATASETS[selected];
-
-    if (!dataset) {
-      console.error('Unknown dataset:', selected);
-      return;
-    }
-
-    setStarting(true);
-
-    try {
-      /*
-       * Tell Dashboard to clear the old chart BEFORE
-       * starting the new simulation.
-       */
-      if (onSimulationStarted) {
-        onSimulationStarted(selected);
-      }
-
-      const response = await fetch(
-        `${SIMULATOR_URL}/start-simulation`,
-        {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({
-            workload: dataset.data,
-          }),
-        }
-      );
-
-      if (!response.ok) {
-        const text = await response.text();
-
-        throw new Error(
-          text || `HTTP ${response.status}`
-        );
-      }
-
-      let result = null;
-
-      try {
-        result = await response.json();
-      } catch {
-        // Endpoint may return empty response.
-      }
-
-      console.log(
-        '[SimulationControlPanel] Simulation started:',
-        result
-      );
-
-      setLocalStatus('SIMULATING');
-    } catch (error) {
-      console.error(
-        '[SimulationControlPanel] Failed to start simulation:',
-        error
-      );
-
-      /*
-       * If the backend rejected the simulation,
-       * allow the user to try again.
-       */
-      setLocalStatus('IDLE');
-    } finally {
-      setStarting(false);
-    }
+function StatusPill({ link }) {
+  const styles = {
+    loading: 'border-slate-200 bg-slate-50 text-slate-600',
+    live: 'border-emerald-200 bg-emerald-50 text-emerald-800',
+    offline: 'border-rose-200 bg-rose-50 text-rose-800',
   };
-
-  const dataset = DATASETS[selected];
-
-  const statusColors = {
-    IDLE: {
-      bg: 'rgba(113,113,122,0.2)',
-      text: '#71717A',
-    },
-
-    SIMULATING: {
-      bg: 'rgba(34,197,94,0.2)',
-      text: '#22c55e',
-    },
-
-    FINISHED: {
-      bg: 'rgba(59,130,246,0.2)',
-      text: '#3b82f6',
-    },
-  };
-
-  const statusStyle =
-    statusColors[localStatus] || statusColors.IDLE;
-
-  const running =
-    starting || localStatus === 'SIMULATING';
-
-  if (!SIMULATOR_URL) {
-    return (
-      <div
-        style={{
-          background: 'rgba(255,255,255,0.03)',
-          border: '1px solid #252525',
-          borderRadius: 12,
-          padding: 20,
-          marginBottom: 24,
-        }}
-      >
-        <div style={{ fontSize: 14, fontWeight: 600, color: '#E7E6D9', marginBottom: 8 }}>
-          Live cluster
-        </div>
-        <div style={{ fontSize: 12, color: '#A1A1AA', lineHeight: 1.5 }}>
-          Reading RPS, forecast, upper bound, and current/desired replicas from the orchestrator.
-          The NASA replay is deploy/load_gen.sh --replay. There is no simulator in this mode.
-        </div>
-        <div style={{ fontSize: 13, color: '#E7E6D9', marginTop: 12, lineHeight: 1.5 }}>
-          Forecast mean {Math.round(latest?.rawMlMean ?? latest?.predictedMean ?? 0).toLocaleString()} RPS
-          {' · '}
-          live {Math.round(latest?.actualRPS ?? 0).toLocaleString()} RPS
-          {Number(latest?.forecastLeadRPS) > 15
-            ? ` · forecast leads by ${Math.round(latest.forecastLeadRPS)} RPS`
-            : ''}
-          {latest?.scaleRule ? ` · rule ${latest.scaleRule}` : ''}
-        </div>
-      </div>
-    );
-  }
-
+  const label = link === 'live' ? 'Live' : link === 'offline' ? 'Disconnected' : 'Loading';
   return (
-    <div
-      style={{
-        background: 'rgba(255,255,255,0.03)',
-        border: '1px solid #252525',
-        borderRadius: 12,
-        padding: 20,
-        marginBottom: 24,
-      }}
+    <span
+      className={`inline-flex items-center gap-2 rounded-full border px-2.5 py-1 text-xs font-medium ${styles[link] || styles.loading}`}
     >
-      <div
-        style={{
-          fontSize: 14,
-          fontWeight: 600,
-          color: '#E7E6D9',
-          marginBottom: 12,
-        }}
-      >
-        Simulation Control
-      </div>
-
-      <div
-        style={{
-          display: 'flex',
-          gap: 12,
-          flexWrap: 'wrap',
-          alignItems: 'center',
-        }}
-      >
-        <select
-          value={selected}
-          onChange={(event) =>
-            setSelected(event.target.value)
-          }
-          disabled={running}
-          style={{
-            background: '#111111',
-            color: '#E7E6D9',
-            border: '1px solid #252525',
-            borderRadius: 8,
-            padding: '8px 12px',
-            fontSize: 13,
-            cursor: running
-              ? 'not-allowed'
-              : 'pointer',
-            opacity: running ? 0.6 : 1,
-          }}
-        >
-          {Object.entries(DATASETS).map(
-            ([key, datasetItem]) => (
-              <option key={key} value={key}>
-                {datasetItem.label}
-              </option>
-            )
-          )}
-        </select>
-
-        <button
-          type="button"
-          onClick={startSimulation}
-          disabled={running}
-          style={{
-            background: running
-              ? 'rgba(99,102,241,0.3)'
-              : '#6366f1',
-            color: 'white',
-            border: 'none',
-            borderRadius: 8,
-            padding: '8px 20px',
-            fontSize: 13,
-            fontWeight: 600,
-            cursor: running
-              ? 'not-allowed'
-              : 'pointer',
-            transition: 'all 0.2s',
-            minWidth: 160,
-          }}
-        >
-          {starting
-            ? '⏳ Starting...'
-            : localStatus === 'SIMULATING'
-              ? '⏳ Running...'
-              : '▶ Start Simulation'}
-        </button>
-
-        <span
-          style={{
-            background: statusStyle.bg,
-            color: statusStyle.text,
-            borderRadius: 20,
-            padding: '4px 12px',
-            fontSize: 12,
-            fontWeight: 600,
-          }}
-        >
-          {localStatus}
-        </span>
-      </div>
-
-      <div
-        style={{
-          fontSize: 12,
-          color: '#71717A',
-          marginTop: 8,
-        }}
-      >
-        {dataset.description} — {dataset.data.length} ticks
-      </div>
-
-      <div
-        style={{
-          fontSize: 10,
-          color: '#3F3F46',
-          marginTop: 8,
-          wordBreak: 'break-all',
-        }}
-      >
-        Simulator: {SIMULATOR_URL}
-      </div>
-    </div>
+      <span
+        className={`h-1.5 w-1.5 rounded-full ${
+          link === 'live'
+            ? 'bg-emerald-500'
+            : link === 'offline'
+              ? 'bg-rose-500'
+              : 'bg-slate-400'
+        }`}
+      />
+      {label}
+    </span>
   );
-};
+}
 
-/* ============================================================
-   Prediction Tooltip
-   ============================================================ */
-
-function PredictionTooltip({ active, payload, label }) {
-  if (!active || !payload?.length) {
-    return null;
-  }
-
-  const point = payload[0]?.payload ?? {};
-
+function ChartTooltip({ active, payload, label }) {
+  if (!active || !payload?.length) return null;
   return (
-    <div className="bg-slate-950/95 border border-slate-700 rounded-lg px-3 py-2 text-xs shadow-xl min-w-[210px]">
-      <div className="text-slate-400 mb-2 font-mono">
-        {label}
-      </div>
-
+    <div className="rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs shadow-console">
+      <div className="mb-1 text-slate-500">{label}</div>
       <div className="space-y-1">
-        <Row
-          color="#ffffff"
-          name="Actual RPS"
-          value={fmt(point.actualRPS)}
-        />
-
-        <Row
-          color="#3b82f6"
-          name="Predicted Mean"
-          value={fmt(point.predictedMean)}
-        />
-
-        <Row
-          color="#f59e0b"
-          name="Upper Bound"
-          value={fmt(point.predictedUpper)}
-        />
-
-        <Row
-          color="#60a5fa"
-          name="Lower Bound"
-          value={fmt(point.predictedLower)}
-        />
-
-        <Row
-          color="#f59e0b"
-          name="Active Servers"
-          value={fmt(point.activeServers)}
-        />
-
-        <Row
-          color="#22c55e"
-          name="Required Servers"
-          value={fmt(point.requiredServers)}
-        />
-
-        <Row
-          color="#ef4444"
-          name="Violations"
-          value={fmt(point.violations)}
-        />
-
-        <Row
-          color="#22c55e"
-          name="SLA"
-          value={
-            point.slaReliability != null
-              ? `${fmt(point.slaReliability, 2)}%`
-              : '—'
-          }
-        />
+        {payload.map((item) => (
+          <div key={item.dataKey} className="flex items-center justify-between gap-4">
+            <span className="text-slate-600">{item.name}</span>
+            <span className="font-medium tabular-nums text-slate-900">
+              {fmtRps(item.value)}
+            </span>
+          </div>
+        ))}
       </div>
     </div>
   );
 }
 
-function Row({ color, name, value }) {
-  return (
-    <div className="flex justify-between gap-4">
-      <span className="flex items-center gap-1.5">
-        <span
-          className="w-2 h-2 rounded-full"
-          style={{ background: color }}
-        />
-
-        <span className="text-slate-300">
-          {name}
-        </span>
-      </span>
-
-      <span className="font-bold tabular-nums text-white">
-        {value}
-      </span>
-    </div>
-  );
+function ruleChip(rule, scaling) {
+  if (scaling === 'up') return 'Scale up';
+  if (scaling === 'down') return 'Scale down';
+  if (!rule) return 'Waiting';
+  return rule;
 }
 
-/* ============================================================
-   Agent Proof Panel
-   ============================================================ */
-
-function AgentProofPanel({ history, latest }) {
-  if (!history || history.length < 2) {
-    return null;
-  }
-
-  /*
-   * Find peak actual RPS.
-   */
-  const peakRPS = Math.max(
-    ...history.map(
-      (point) => toNumber(point.actualRPS, 0)
-    )
-  );
-
-  const peakTick = history.findIndex(
-    (point) =>
-      toNumber(point.actualRPS, 0) === peakRPS
-  );
-
-  /*
-   * Find the FIRST tick where active servers increased.
-   */
-  const scaleEvent = history.findIndex(
-    (point, index) =>
-      index > 0 &&
-      toNumber(point.activeServers, 0) >
-        toNumber(
-          history[index - 1].activeServers,
-          0
-        )
-  );
-
-  /*
-   * Agent acted before the peak only if
-   * scaling happened at an earlier chart tick.
-   */
-  const provisionLead =
-    scaleEvent >= 0 &&
-    peakTick >= 0 &&
-    scaleEvent < peakTick
-      ? peakTick - scaleEvent
-      : null;
-
-  /*
-   * Get the most recent prediction.
-   */
-  const latestUpper =
-    latest?.predictedUpper != null
-      ? toNumber(latest.predictedUpper)
-      : null;
-
-  const latestMean =
-    latest?.predictedMean != null
-      ? toNumber(latest.predictedMean)
-      : null;
-
-  const agentActedEarly =
-    provisionLead !== null &&
-    provisionLead > 0;
-
-  return (
-    <div
-      style={{
-        background: agentActedEarly
-          ? 'rgba(34,197,94,0.05)'
-          : 'rgba(245,158,11,0.05)',
-        border: agentActedEarly
-          ? '1px solid rgba(34,197,94,0.2)'
-          : '1px solid rgba(245,158,11,0.2)',
-        borderRadius: 12,
-        padding: 16,
-        marginTop: 16,
-      }}
-    >
-      <div
-        style={{
-          fontSize: 13,
-          fontWeight: 600,
-          color: agentActedEarly
-            ? '#22c55e'
-            : '#f59e0b',
-          marginBottom: 12,
-        }}
-      >
-        🧠 Agent Proof
-      </div>
-
-      <div
-        style={{
-          display: 'grid',
-          gridTemplateColumns:
-            'repeat(4, minmax(0, 1fr))',
-          gap: 12,
-        }}
-      >
-        {/* Peak RPS */}
-
-        <div style={{ textAlign: 'center' }}>
-          <div
-            style={{
-              fontSize: 20,
-              fontWeight: 700,
-              color: '#22c55e',
-            }}
-          >
-            {peakRPS.toLocaleString()}
-          </div>
-
-          <div
-            style={{
-              fontSize: 11,
-              color: '#71717A',
-              marginTop: 2,
-            }}
-          >
-            Peak Actual RPS
-          </div>
-        </div>
-
-        {/* Predicted mean */}
-
-        <div style={{ textAlign: 'center' }}>
-          <div
-            style={{
-              fontSize: 20,
-              fontWeight: 700,
-              color: '#3b82f6',
-            }}
-          >
-            {latestMean != null
-              ? latestMean.toLocaleString(
-                  undefined,
-                  {
-                    maximumFractionDigits: 0,
-                  }
-                )
-              : '—'}
-          </div>
-
-          <div
-            style={{
-              fontSize: 11,
-              color: '#71717A',
-              marginTop: 2,
-            }}
-          >
-            Agent Prediction
-          </div>
-        </div>
-
-        {/* Upper bound */}
-
-        <div style={{ textAlign: 'center' }}>
-          <div
-            style={{
-              fontSize: 20,
-              fontWeight: 700,
-              color: '#f59e0b',
-            }}
-          >
-            {latestUpper != null
-              ? latestUpper.toLocaleString(
-                  undefined,
-                  {
-                    maximumFractionDigits: 0,
-                  }
-                )
-              : '—'}
-          </div>
-
-          <div
-            style={{
-              fontSize: 11,
-              color: '#71717A',
-              marginTop: 2,
-            }}
-          >
-            Agent Upper Bound
-          </div>
-        </div>
-
-        {/* Provision lead */}
-
-        <div style={{ textAlign: 'center' }}>
-          <div
-            style={{
-              fontSize: 20,
-              fontWeight: 700,
-              color: agentActedEarly
-                ? '#22c55e'
-                : '#f59e0b',
-            }}
-          >
-            {agentActedEarly
-              ? `${provisionLead}s early`
-              : 'Monitoring'}
-          </div>
-
-          <div
-            style={{
-              fontSize: 11,
-              color: '#71717A',
-              marginTop: 2,
-            }}
-          >
-            Provisioned Before Peak
-          </div>
-        </div>
-      </div>
-
-      {/* Explanation */}
-
-      <div
-        style={{
-          marginTop: 12,
-          paddingTop: 10,
-          borderTop:
-            '1px solid rgba(255,255,255,0.05)',
-          fontSize: 11,
-          color: '#71717A',
-          textAlign: 'center',
-        }}
-      >
-        {agentActedEarly
-          ? `Agent increased capacity ${provisionLead} tick${
-              provisionLead === 1 ? '' : 's'
-            } before the traffic peak.`
-          : 'Waiting for the agent to demonstrate proactive scaling before the traffic peak.'}
-      </div>
-    </div>
-  );
-}
-
-/* ============================================================
-   Dashboard
-   ============================================================ */
-
-const Dashboard = () => {
-  const [chartData, setChartData] = useState([]);
-
-  const [connected, setConnected] =
-    useState(false);
-
-  const [latestStatus, setLatestStatus] =
-    useState('IDLE');
-
-  const [logs, setLogs] = useState([]);
-
-  const [selectedDataset, setSelectedDataset] =
-    useState('flash_sale');
-
-  /*
-   * Used to make sure we don't accidentally keep
-   * old simulation data when starting a new simulation.
-   */
-  const simulationIdRef = useRef(0);
-
-  const lastHighLoadLog =
-    useRef(0);
-
-  const lastSlaAlarmLog =
-    useRef(0);
-
-  const lastRlAction =
-    useRef(null);
-
-  const loggedConnect =
-    useRef(false);
-
-  const previousLatestStatus =
-    useRef('IDLE');
-
-  /* ==========================================================
-     Logging
-     ========================================================== */
-
-  const addLog = (message, type = 'info') => {
-    const timestamp = new Date()
-      .toISOString()
-      .split('T')[1]
-      .substring(0, 8);
-
-    setLogs((previous) => [
-      ...previous.slice(-49),
-      {
-        timestamp,
-        msg: message,
-        type,
-      },
-    ]);
-  };
-
-  /* ==========================================================
-     Initial Logs
-     ========================================================== */
-
-  useEffect(() => {
-    if (connected && !loggedConnect.current) {
-      loggedConnect.current = true;
-      addLog('Connected to simulator telemetry bus', 'info');
-    }
-  }, [connected]);
-
-  /* ==========================================================
-     Start New Simulation
-     ========================================================== */
-
-  const handleSimulationStarted = (
-    datasetKey
-  ) => {
-    /*
-     * Increment simulation ID.
-     * Any stale metrics from a previous run are
-     * discarded because chartData is cleared.
-     */
-    simulationIdRef.current += 1;
-
-    setChartData([]);
-
-    setLatestStatus('SIMULATING');
-
-    lastHighLoadLog.current = 0;
-    lastSlaAlarmLog.current = 0;
-    lastRlAction.current = null;
-
-    previousLatestStatus.current =
-      'SIMULATING';
-
-    const dataset =
-      DATASETS[datasetKey];
-
-    addLog(
-      `Starting ${dataset?.label || datasetKey} simulation — ${
-        dataset?.data.length || 0
-      } ticks`,
-      'info'
-    );
-  };
-
-  /* ==========================================================
-     Metrics Polling
-     ========================================================== */
+export default function Dashboard() {
+  const [history, setHistory] = useState([]);
+  const [link, setLink] = useState('loading');
+  const [events, setEvents] = useState([]);
+  const [selectedDataset, setSelectedDataset] = useState('flash_sale');
+  const [simStatus, setSimStatus] = useState('IDLE');
 
   useEffect(() => {
     let mounted = true;
+    let lastEvent = '';
 
-    const pollMetrics = async () => {
+    const poll = async () => {
       try {
         const data = await fetchTelemetry();
-
-        if (!mounted) {
-          return;
-        }
-
-        setConnected(true);
-
-        const currentStatus =
-          data.status ?? 'IDLE';
-
-        setLatestStatus(
-          currentStatus
-        );
-
-        /* ----------------------------------------------------
-           Status transition
-        ---------------------------------------------------- */
-
-        if (
-          previousLatestStatus.current !==
-            currentStatus &&
-          currentStatus === 'FINISHED'
-        ) {
-          addLog(
-            'Simulation finished — telemetry retained for Agent Proof',
-            'success'
-          );
-
-          lastHighLoadLog.current = 0;
-        }
-
-        previousLatestStatus.current =
-          currentStatus;
-
-        /* ----------------------------------------------------
-           Predictions
-
-           Supports:
-           predicted_mean
-           predictedMean
-
-           predicted_upper
-           predictedUpper
-
-           predicted_lower
-           predictedLower
-        ---------------------------------------------------- */
-
-        const predictedMean =
-          getPredictionValue(
-            data,
-            'predicted_mean',
-            'predictedMean'
-          );
-
-        const predictedUpper =
-          getPredictionValue(
-            data,
-            'predicted_upper',
-            'predictedUpper'
-          );
-
-        const predictedLower =
-          getPredictionValue(
-            data,
-            'predicted_lower',
-            'predictedLower'
-          );
-
-        /* ----------------------------------------------------
-           Current metrics
-        ---------------------------------------------------- */
-
-        const actualRPS = toNumber(
-          data.current_rps ??
-            data.currentRPS,
-          0
-        );
-
-        const activeServers =
-          toNumber(
-            data.active_servers ??
-              data.activeServers,
-            0
-          );
-
-        const requiredServers =
-          toNumber(
-            data.required_servers ??
-              data.requiredServers
-          );
-
-        const violations =
-          toNumber(
-            data.violations,
-            0
-          );
-
-        const slaReliability =
-          toNumber(
-            data.sla_reliability ??
-              data.slaReliability,
-            100
-          );
-
-        const rawMlMean =
-          getPredictionValue(
-            data,
-            'raw_ml_mean',
-            'rawMlMean'
-          );
-
-        const forecastLeadRPS = toNumber(
-          data.forecast_lead_rps ?? data.forecastLeadRPS,
-          rawMlMean != null ? rawMlMean - actualRPS : 0
-        );
-
-        const scaleRule = data.scale_rule ?? data.scaleRule ?? '';
-
-        const zScore = toNumber(
-          data.z_score ?? data.zScore
-        );
-
-        const rlAction = toNumber(
-          data.rl_action ?? data.rlAction,
-          2
-        );
-
-        const rlActionLabel =
-          data.rl_action_label ??
-          data.rlActionLabel ??
-          null;
-
-        const errorRatio = toNumber(
-          data.error_ratio ?? data.errorRatio,
-          0
-        );
-
-        const stdDev = toNumber(
-          data.std_dev ?? data.stdDev,
-          0
-        );
-
-        const stateVarianceNorm = toNumber(data.state_variance_norm ?? data.stateVarianceNorm);
-        const stateSla = toNumber(data.state_sla ?? data.stateSla);
-        const stateWasteNorm = toNumber(data.state_waste_norm ?? data.stateWasteNorm);
-        const stateTrend = toNumber(data.state_trend ?? data.stateTrend);
-        const stateHourSin = toNumber(data.state_hour_sin ?? data.stateHourSin);
-
-        /* ----------------------------------------------------
-           Confidence band
-
-           Recharts stacked Areas require:
-
-           base = lower bound
-           width = upper - lower
-        ---------------------------------------------------- */
-
-        const bandBase =
-          predictedLower != null
-            ? predictedLower
-            : null;
-
-        const bandWidth =
-          predictedUpper != null &&
-          predictedLower != null
-            ? Math.max(
-                0,
-                predictedUpper -
-                  predictedLower
-              )
-            : null;
-
-        /* ----------------------------------------------------
-           Time
-        ---------------------------------------------------- */
-
-        const now =
-          new Date();
-
-        const timeStr =
-          now.toLocaleTimeString(
-            [],
-            {
-              hour: '2-digit',
-              minute: '2-digit',
-              second: '2-digit',
-            }
-          );
-
-        /* ----------------------------------------------------
-           Chart point
-        ---------------------------------------------------- */
-
-        const newPoint = {
-          time: timeStr,
-
-          actualRPS,
-
-          activeServers,
-
-          requiredServers,
-
-          violations,
-
-          slaReliability,
-
-          status:
-            currentStatus,
-
-          predictedMean,
-
-          predictedUpper,
-
-          predictedLower,
-
-          bandBase,
-
-          bandWidth,
-
-          rawMlMean,
-
-          forecastLeadRPS,
-
-          scaleRule,
-
-          zScore,
-
-          rlAction,
-
-          rlActionLabel,
-
-          errorRatio,
-
-          stdDev,
-
-          stateVarianceNorm,
-
-          stateSla,
-
-          stateWasteNorm,
-
-          stateTrend,
-
-          stateHourSin,
-
-          /*
-           * Load-derived latency estimate (not measured P95).
-           */
-          latency:
-            actualRPS > 0
-              ? 120 +
-                actualRPS / 50
-              : 100,
-        };
-
-        /* ----------------------------------------------------
-           Add point to history
-        ---------------------------------------------------- */
-
-        setChartData(
-          (previous) => {
-            /*
-             * Avoid adding identical consecutive
-             * FINISHED baseline points forever.
-             */
-            const last =
-              previous[
-                previous.length - 1
-              ];
-
-            if (
-              last &&
-              currentStatus ===
-                'FINISHED' &&
-              last.status ===
-                'FINISHED' &&
-              last.actualRPS ===
-                actualRPS &&
-              last.activeServers ===
-                activeServers &&
-              last.requiredServers ===
-                requiredServers
-            ) {
-              return previous;
-            }
-
-            return [
+        if (!mounted) return;
+        const view = mapStatus(data);
+        const point = chartPoint(view, clockLabel(new Date()));
+        setLink('live');
+        setSimStatus(view.status || 'LIVE');
+        setHistory((previous) => [...previous, { ...point, view }].slice(-120));
+        if (view.lastScaleEvent && view.lastScaleEvent !== lastEvent) {
+          lastEvent = view.lastScaleEvent;
+          setEvents((previous) =>
+            [
+              { time: point.time, text: view.lastScaleEvent, rule: view.scaleRule },
               ...previous,
-              newPoint,
-            ].slice(-120);
-          }
-        );
-
-        /* ----------------------------------------------------
-           SLA Alarm
-        ---------------------------------------------------- */
-
-        if (
-          slaReliability < 99
-        ) {
-          const nowMs =
-            Date.now();
-
-          if (
-            nowMs -
-              lastSlaAlarmLog.current >
-            5000
-          ) {
-            lastSlaAlarmLog.current =
-              nowMs;
-
-            addLog(
-              `SLA ALARM: reliability ${slaReliability.toFixed(
-                2
-              )}% — ${violations} violations`,
-              'error'
-            );
-          }
-        }
-
-        if (
-          rlAction != null &&
-          lastRlAction.current !== rlAction
-        ) {
-          lastRlAction.current = rlAction;
-
-          const logType =
-            rlAction === 4
-              ? 'warn'
-              : rlAction === 3
-                ? 'info'
-                : 'info';
-
-          addLog(
-            `RL Agent: ${rlActionLabel} → z=${zScore?.toFixed(2) ?? '?'}, upper=${predictedUpper != null ? Math.round(predictedUpper).toLocaleString() : '?'} RPS, fleet=${requiredServers ?? '?'} servers`,
-            logType
+            ].slice(0, 8),
           );
         }
-
-        /* ----------------------------------------------------
-           High traffic logging
-        ---------------------------------------------------- */
-
-        if (
-          actualRPS > 1000 &&
-          (currentStatus ===
-            'SIMULATING' ||
-            currentStatus === 'LIVE')
-        ) {
-          const bucket =
-            Math.floor(
-              actualRPS / 500
-            );
-
-          if (
-            bucket !==
-            lastHighLoadLog.current
-          ) {
-            lastHighLoadLog.current =
-              bucket;
-
-            addLog(
-              `High traffic: ${actualRPS.toLocaleString()} RPS — RL Agent scaling`,
-              'warn'
-            );
-          }
-        }
-
-        /* ----------------------------------------------------
-           Proactive scaling logging
-        ---------------------------------------------------- */
-
-        setChartData(
-          (previous) => {
-            const previousPoint =
-              previous[
-                previous.length - 1
-              ];
-
-            if (
-              previousPoint &&
-              activeServers >
-                previousPoint.activeServers &&
-              actualRPS <
-                peakTrafficSoFar(
-                  previous,
-                  actualRPS
-                )
-            ) {
-              /*
-               * This is intentionally lightweight.
-               * The Agent Proof Panel is the actual
-               * source of truth.
-               */
-            }
-
-            return previous;
-          }
-        );
       } catch (error) {
-        console.error(
-          '[Dashboard] Metrics error:',
-          error
-        );
-
-        if (mounted) {
-          setConnected(false);
-        }
+        console.error('[Dashboard] metrics error', error);
+        if (mounted) setLink('offline');
       }
     };
 
-    /*
-     * Immediately poll once instead of waiting
-     * for the first 1-second interval.
-     */
-    pollMetrics();
-
-    const interval =
-      setInterval(
-        pollMetrics,
-        1000
-      );
-
+    poll();
+    const interval = setInterval(poll, 1000);
     return () => {
       mounted = false;
       clearInterval(interval);
     };
   }, []);
 
-  /* ==========================================================
-     Latest telemetry
-     ========================================================== */
-
-  const latest =
-    chartData[
-      chartData.length - 1
-    ];
-
-  const rlLive =
-    connected &&
-    latest?.rlActionLabel != null &&
-    latest.rlActionLabel.length > 0 &&
-    latest?.zScore != null &&
-    latest.zScore > 0;
-
-  const slaCritical =
-    (latest?.slaReliability ?? 100) <
-    99;
-
-  /* ==========================================================
-     Render
-     ========================================================== */
+  const latest = history[history.length - 1];
+  const view = latest?.view;
+  const why = view ? explainDecision(view) : [];
 
   return (
-    <div className="min-h-screen bg-[#09090b] text-slate-300 font-sans selection:bg-blue-500/30">
-
-      {/* ======================================================
-          SLA Alarm
-      ====================================================== */}
-
-      <AnimatePresence>
-        {slaCritical && (
-          <motion.div
-            initial={{
-              height: 0,
-              opacity: 0,
-            }}
-            animate={{
-              height: 'auto',
-              opacity: 1,
-            }}
-            exit={{
-              height: 0,
-              opacity: 0,
-            }}
-            className="bg-red-600/90 text-white text-sm font-bold px-6 py-2 flex items-center justify-center gap-2 animate-pulse sticky top-0 z-[60]"
-          >
-            <AlertTriangle size={16} />
-
-            SLA VIOLATION ALARM — Reliability{' '}
-            {latest?.slaReliability?.toFixed(
-              2
-            )}
-            % (threshold 99%)
-          </motion.div>
-        )}
-      </AnimatePresence>
-
-      {/* ======================================================
-          Header
-      ====================================================== */}
-
-      <header className="border-b border-white/[0.06] bg-[#09090b]/95 backdrop-blur-sm sticky top-0 z-50 px-6 py-3 flex justify-between items-center">
-
-        <div className="flex items-center gap-3">
-
-          <div className="w-9 h-9 bg-blue-600/20 border border-blue-500/30 rounded-lg flex items-center justify-center text-blue-300 text-sm font-semibold">
-            HT
-          </div>
-
-          <div className="flex flex-col">
-
-            <span className="text-slate-100 font-semibold tracking-tight text-sm">
+    <div className="min-h-screen bg-[#f6f7f9] text-slate-800">
+      <header className="sticky top-0 z-20 border-b border-slate-200 bg-white">
+        <div className="mx-auto flex h-14 max-w-6xl items-center justify-between px-6">
+          <div className="flex items-baseline gap-3">
+            <span className="text-sm font-semibold tracking-tight text-slate-900">
               HybridTimeNet
             </span>
-
-            <span className="text-xs text-slate-500">
-              Autoscaling control plane
+            <span className="hidden text-xs text-slate-500 sm:inline">
+              Autoscaler console
             </span>
-
           </div>
-
-        </div>
-
-        <div className="flex items-center gap-4">
-
-          <div
-            className={`flex items-center gap-2 text-xs px-3 py-1 rounded-full ${
-              connected
-                ? 'bg-green-500/20 text-green-400'
-                : 'bg-red-500/20 text-red-400 animate-pulse'
-            }`}
-          >
-
-            <div
-              className={`w-2 h-2 rounded-full ${
-                connected
-                  ? 'bg-green-400'
-                  : 'bg-red-400'
-              }`}
-            />
-
-            {connected
-              ? 'Live'
-              : 'Disconnected — start docker compose up'}
-          </div>
-
-          <div className="hidden md:flex items-center gap-8">
-
-            <div className="flex flex-col items-end">
-
-              <span className="text-[10px] text-slate-500 uppercase font-black tracking-widest">
-                Target Environment
-              </span>
-
-              <span className="text-xs text-white font-medium flex items-center gap-1.5">
-                <Box
-                  size={12}
-                  className="text-slate-400"
-                />
-
-                NexusGear Storefront
-              </span>
-
-            </div>
-
-            <div className="flex flex-col items-end">
-
-              <span className="text-[10px] text-slate-500">
-                RL predictor
-              </span>
-
-              <span
-                className={`text-xs flex items-center gap-1.5 font-medium ${
-                  rlLive
-                    ? 'text-emerald-400'
-                    : connected
-                      ? 'text-amber-400'
-                      : 'text-red-400'
-                }`}
-              >
-
-                <span
-                  className={`w-1.5 h-1.5 rounded-full ${
-                    rlLive
-                      ? 'bg-emerald-500'
-                      : connected
-                        ? 'bg-amber-500'
-                        : 'bg-red-500'
-                  }`}
-                />
-
-                {rlLive
-                  ? 'Streaming decisions'
-                  : connected
-                    ? 'Awaiting RL data'
-                    : 'Offline'}
-              </span>
-
-            </div>
-
-          </div>
-
+          <StatusPill link={link} />
         </div>
       </header>
 
-      {/* ======================================================
-          Main
-      ====================================================== */}
-
-      <main className="p-6 max-w-[1800px] mx-auto relative z-10 space-y-6">
-
-        {/* ====================================================
-            Simulation Control
-        ==================================================== */}
-
-        <SimulationControlPanel
-          latestStatus={
-            latestStatus
-          }
-          selected={
-            selectedDataset
-          }
-          setSelected={
-            setSelectedDataset
-          }
-          onSimulationStarted={
-            handleSimulationStarted
-          }
-          latest={latest}
-        />
-
-        {/* ====================================================
-            Metric Cards
-        ==================================================== */}
-
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-4">
-
-          {[
-            {
-              label:
-                'Gateway RPS',
-
-              val:
-                Math.round(
-                  latest?.actualRPS ??
-                    0
-                ).toLocaleString(),
-
-              sub:
-                Number(latest?.forecastLeadRPS) > 15
-                  ? `Forecast leads by ${Math.round(latest.forecastLeadRPS)} RPS`
-                  : 'Requests/sec',
-
-              icon:
-                Activity,
-
-              color:
-                'text-white',
-            },
-
-            {
-              label:
-                'Predicted Upper',
-
-              val:
-                latest?.predictedUpper !=
-                null
-                  ? Math.round(
-                      latest.predictedUpper
-                    ).toLocaleString()
-                  : '—',
-
-              sub:
-                'Prediction confidence bound',
-
-              icon:
-                Zap,
-
-              color:
-                'text-amber-400',
-            },
-
-            {
-              label:
-                'Active Fleet',
-
-              val:
-                `${Math.ceil(
-                  latest?.activeServers ??
-                    0
-                )}`,
-
-              sub:
-                'Current replicas',
-
-              icon:
-                Server,
-
-              color:
-                'text-amber-400',
-            },
-
-            {
-              label:
-                'Desired replicas',
-
-              val:
-                latest?.requiredServers !=
-                null
-                  ? String(
-                      latest.requiredServers
-                    )
-                  : '—',
-
-              sub:
-                latest?.scaleRule
-                  ? `rule ${latest.scaleRule}`
-                  : 'Forecast target',
-
-              icon:
-                Server,
-
-              color:
-                'text-emerald-400',
-            },
-
-            {
-              label:
-                'SLA Reliability',
-
-              val:
-                `${(
-                  latest?.slaReliability ??
-                  100
-                ).toFixed(1)}%`,
-
-              sub:
-                `${
-                  latest?.violations ??
-                  0
-                } Violations`,
-
-              icon:
-                ShieldCheck,
-
-              color:
-                (latest?.slaReliability ??
-                  100) >= 99
-                  ? 'text-emerald-400'
-                  : 'text-red-400 animate-pulse',
-            },
-          ].map(
-            (stat, index) => (
-
-              <motion.div
-                initial={{
-                  opacity: 0,
-                  y: 20,
-                }}
-                animate={{
-                  opacity: 1,
-                  y: 0,
-                }}
-                transition={{
-                  delay:
-                    index * 0.1,
-                }}
-                key={
-                  stat.label
-                }
-                className="rounded-xl border border-white/[0.06] bg-[#0c0c0e] p-5 hover:border-white/[0.1] transition-colors relative overflow-hidden group"
-              >
-
-                <div className="absolute top-0 right-0 p-4 opacity-10 group-hover:opacity-20 transition-opacity">
-
-                  <stat.icon
-                    size={48}
-                    className={
-                      stat.color
-                    }
-                  />
-
-                </div>
-
-                <div className="flex justify-between items-start mb-4 relative z-10">
-
-                  <div
-                    className={`p-2 bg-white/5 rounded-lg ${stat.color}`}
-                  >
-                    <stat.icon
-                      size={18}
-                    />
-                  </div>
-
-                  <span className="text-[10px] font-black text-slate-500 uppercase tracking-widest">
-                    {stat.label}
-                  </span>
-
-                </div>
-
-                <div
-                  className={`text-3xl font-bold tracking-tight tabular-nums relative z-10 ${stat.color}`}
-                >
-                  {stat.val}
-                </div>
-
-                <div className="text-xs text-slate-500 mt-2 font-medium relative z-10">
-                  {stat.sub}
-                </div>
-
-              </motion.div>
-            )
-          )}
-
-        </div>
-
-        {/* ====================================================
-            RL Agent Visualization
-        ==================================================== */}
-
-        <RlVisualizationPanel
-          latest={latest}
-          history={chartData}
-          live={rlLive}
-        />
-
-        {/* ====================================================
-            Traffic Chart
-        ==================================================== */}
-
-        <div className="rounded-xl border border-white/[0.06] bg-[#0c0c0e] p-6">
-
-          <div className="flex justify-between items-center mb-8">
-
-            <div>
-
-              <h4 className="text-sm font-semibold text-slate-100">
-                Traffic & scaling
-              </h4>
-
-              <p className="text-xs text-slate-500 mt-0.5">
-                Live RPS from simulator · forecast bands from predictor
-              </p>
-
-            </div>
-
-            <div className="flex flex-wrap gap-4 text-xs font-bold uppercase tracking-wider">
-
-              <div className="flex items-center gap-2 text-white">
-                <div className="w-2.5 h-2.5 rounded-full bg-white" />
-                Actual RPS
-              </div>
-
-              <div className="flex items-center gap-2 text-blue-400">
-                <div className="w-2.5 h-2.5 rounded-full bg-blue-400" />
-                RL Upper Bound
-              </div>
-
-              <div className="flex items-center gap-2 text-cyan-400">
-                <div className="w-2.5 h-2.5 rounded-full bg-cyan-400" />
-                Raw ML Forecast
-              </div>
-
-              <div className="flex items-center gap-2 text-blue-500">
-                <div className="w-4 h-2.5 rounded-sm bg-blue-500/40" />
-                Uncertainty Band
-              </div>
-
-              <div className="flex items-center gap-2 text-amber-400">
-                <div className="w-2.5 h-2.5 bg-amber-400" />
-                Servers
-              </div>
-
-            </div>
-
-          </div>
-
-          {/* Chart */}
-
-          <div className="h-[400px] w-full">
-
-            {!connected &&
-            chartData.length === 0 ? (
-
-              <div className="h-full flex items-center justify-center text-slate-500 text-sm">
-                Waiting for orchestrator at{' '}
-                {ORCHESTRATOR_URL}/api/target/status
-                {SIMULATOR_URL ? ` or simulator ${SIMULATOR_URL}/metrics` : ''}…
-              </div>
-
-            ) : (
-
-              <ResponsiveContainer
-                width="100%"
-                height="100%"
-              >
-
-                <ComposedChart
-                  data={chartData}
-                  margin={{
-                    top: 10,
-                    right: 10,
-                    left: -20,
-                    bottom: 0,
-                  }}
-                >
-
-                  <defs>
-
-                    <linearGradient
-                      id="bandFill"
-                      x1="0"
-                      y1="0"
-                      x2="0"
-                      y2="1"
-                    >
-
-                      <stop
-                        offset="0%"
-                        stopColor="#22c55e"
-                        stopOpacity={0.30}
-                      />
-
-                      <stop
-                        offset="100%"
-                        stopColor="#22c55e"
-                        stopOpacity={0.05}
-                      />
-
-                    </linearGradient>
-
-                  </defs>
-
-                  <CartesianGrid
-                    strokeDasharray="3 3"
-                    stroke="#ffffff0a"
-                    vertical={false}
-                  />
-
-                  <XAxis
-                    dataKey="time"
-                    axisLine={false}
-                    tickLine={false}
-                    tick={{
-                      fontSize: 11,
-                      fill: '#64748b',
-                    }}
-                    minTickGap={30}
-                  />
-
-                  <YAxis
-                    axisLine={false}
-                    tickLine={false}
-                    tick={{
-                      fontSize: 11,
-                      fill: '#64748b',
-                    }}
-                  />
-
-                  <Tooltip
-                    content={
-                      <PredictionTooltip />
-                    }
-                    cursor={{
-                      stroke: '#334155',
-                      strokeWidth: 1,
-                      strokeDasharray:
-                        '4 4',
-                    }}
-                  />
-
-                  {/* ==========================================
-                      Lower bound / base
-                  ========================================== */}
-
-                  <Area
-                    type="monotone"
-                    dataKey="bandBase"
-                    stackId="confidence"
-                    stroke="none"
-                    fill="transparent"
-                    connectNulls={false}
-                    isAnimationActive={false}
-                  />
-
-                  {/* ==========================================
-                      Confidence interval
-                  ========================================== */}
-
-                  <Area
-                    type="monotone"
-                    dataKey="bandWidth"
-                    stackId="confidence"
-                    stroke="none"
-                    fill="url(#bandFill)"
-                    connectNulls={false}
-                    isAnimationActive={false}
-                    name="Uncertainty Band"
-                  />
-
-                  {/* ==========================================
-                      Predicted mean
-                  ========================================== */}
-
-                  <Line
-                    type="monotone"
-                    dataKey="rawMlMean"
-                    stroke="#22d3ee"
-                    strokeWidth={2}
-                    strokeDasharray="8 4"
-                    dot={false}
-                    name="Forecast mean"
-                    connectNulls={false}
-                    isAnimationActive={false}
-                  />
-
-                  <Line
-                    type="monotone"
-                    dataKey="predictedMean"
-                    stroke="#3b82f6"
-                    strokeWidth={2}
-                    strokeDasharray="6 4"
-                    dot={false}
-                    name="RL Upper Bound"
-                    connectNulls={false}
-                    isAnimationActive={false}
-                  />
-
-                  {/* ==========================================
-                      Upper bound (same as RL target)
-                  ========================================== */}
-
-                  <Line
-                    type="monotone"
-                    dataKey="predictedUpper"
-                    stroke="#f59e0b"
-                    strokeWidth={1.5}
-                    strokeDasharray="2 4"
-                    dot={false}
-                    name="Upper Band Edge"
-                    connectNulls={false}
-                    isAnimationActive={false}
-                  />
-
-                  {/* ==========================================
-                      Lower bound
-                  ========================================== */}
-
-                  <Line
-                    type="monotone"
-                    dataKey="predictedLower"
-                    stroke="#60a5fa"
-                    strokeWidth={1}
-                    strokeDasharray="2 3"
-                    dot={false}
-                    name="Lower Bound"
-                    connectNulls={false}
-                    isAnimationActive={false}
-                  />
-
-                  {/* ==========================================
-                      Required servers
-                  ========================================== */}
-
-                  <Line
-                    type="stepAfter"
-                    dataKey="requiredServers"
-                    stroke="#22c55e"
-                    strokeWidth={2}
-                    strokeDasharray="5 3"
-                    dot={false}
-                    isAnimationActive={false}
-                    name="Required Servers"
-                  />
-
-                  {/* ==========================================
-                      Active servers
-                  ========================================== */}
-
-                  <Line
-                    type="stepAfter"
-                    dataKey="activeServers"
-                    stroke="#f59e0b"
-                    strokeWidth={2}
-                    dot={false}
-                    isAnimationActive={false}
-                    name="Active Servers"
-                  />
-
-                  {/* ==========================================
-                      Actual RPS
-                  ========================================== */}
-
-                  <Line
-                    type="monotone"
-                    dataKey="actualRPS"
-                    stroke="#ffffff"
-                    strokeWidth={2.5}
-                    dot={false}
-                    isAnimationActive={false}
-                    name="Actual RPS"
-                  />
-
-                </ComposedChart>
-
-              </ResponsiveContainer>
-
-            )}
-
-          </div>
-
-          {/* ==================================================
-              Agent Proof
-          ================================================== */}
-
-          <AgentProofPanel
-            history={chartData}
-            latest={latest}
-          />
-
-        </div>
-
-        {/* ====================================================
-            Lower Dashboard
-        ==================================================== */}
-
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-
-          {/* ==================================================
-              Latency
-          ================================================== */}
-
-          <div className="bg-white/[0.02] border border-white/5 rounded-2xl p-6">
-
-            <h4 className="text-sm font-bold text-white mb-6 uppercase tracking-widest flex items-center gap-2">
-
-              <Clock
-                size={16}
-                className="text-emerald-400"
-              />
-
-              Load-derived latency estimate
-
-            </h4>
-
-            <p className="text-[10px] text-slate-600 mb-4">
-              Derived from RPS/capacity model — not measured P95
+      <main className="mx-auto max-w-6xl space-y-6 px-6 py-8">
+        {link === 'loading' && !view ? (
+          <section className="rounded-xl border border-slate-200 bg-white px-6 py-16 text-center shadow-console">
+            <p className="text-sm font-medium text-slate-700">Loading live status</p>
+            <p className="mt-1 text-xs text-slate-500">
+              Waiting for the first status poll.
             </p>
+          </section>
+        ) : null}
 
-            <div className="h-[200px] w-full">
+        {link === 'offline' && !view ? (
+          <section className="rounded-xl border border-slate-200 bg-white px-6 py-16 text-center shadow-console">
+            <p className="text-sm font-medium text-slate-800">Status unavailable</p>
+            <p className="mt-1 text-xs text-slate-500">{STATUS_PATH}</p>
+          </section>
+        ) : null}
 
-              <ResponsiveContainer
-                width="100%"
-                height="100%"
-              >
+        {view ? (
+          <>
+            <section className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4">
+              <MetricCard
+                label="Replicas"
+                value={`${view.activeReplicas}`}
+                detail={`Desired ${view.desiredReplicas}`}
+              />
+              <MetricCard
+                label="Live RPS"
+                value={fmtRps(view.liveRps)}
+                detail="Requests per second"
+              />
+              <MetricCard
+                label="Forecast mean"
+                value={fmtRps(view.forecastMean)}
+                detail="Predictor mean"
+              />
+              <MetricCard
+                label="Upper bound"
+                value={fmtRps(view.upperBound)}
+                detail="Published bound"
+              />
+              <MetricCard
+                label="Z-score"
+                value={view.zScore == null ? '—' : Number(view.zScore).toFixed(2)}
+                detail={view.rlActionLabel || 'RL margin'}
+              />
+              <MetricCard
+                label="Capacity"
+                value={fmtRps(view.capacity)}
+                detail={`${view.activeReplicas} pods × ${view.perPod} RPS`}
+              />
+              <MetricCard
+                label="Scale decision"
+                value={ruleChip(view.scaleRule, view.scaling)}
+                detail={view.scaleRule || 'No rule yet'}
+              />
+              <MetricCard
+                label="SLA"
+                value={view.sla == null ? '—' : `${Number(view.sla).toFixed(1)}%`}
+                detail={`${view.violations} violations`}
+              />
+            </section>
 
-                <AreaChart
-                  data={chartData}
-                  margin={{
-                    top: 0,
-                    right: 0,
-                    left: -20,
-                    bottom: 0,
-                  }}
-                >
-
-                  <defs>
-
-                    <linearGradient
-                      id="colorLatency"
-                      x1="0"
-                      y1="0"
-                      x2="0"
-                      y2="1"
-                    >
-
-                      <stop
-                        offset="5%"
-                        stopColor="#10b981"
-                        stopOpacity={0.3}
-                      />
-
-                      <stop
-                        offset="95%"
-                        stopColor="#10b981"
-                        stopOpacity={0}
-                      />
-
-                    </linearGradient>
-
-                  </defs>
-
-                  <CartesianGrid
-                    strokeDasharray="3 3"
-                    stroke="#ffffff0a"
-                    vertical={false}
-                  />
-
-                  <XAxis
-                    dataKey="time"
-                    hide
-                  />
-
-                  <YAxis
-                    domain={[
-                      'dataMin - 10',
-                      'dataMax + 10',
-                    ]}
-                    axisLine={false}
-                    tickLine={false}
-                    tick={{
-                      fontSize: 11,
-                      fill: '#64748b',
-                    }}
-                  />
-
-                  <Tooltip
-                    contentStyle={{
-                      backgroundColor:
-                        '#0f172a',
-                      border:
-                        '1px solid #1e293b',
-                      borderRadius:
-                        '8px',
-                    }}
-                  />
-
-                  <Area
-                    type="monotone"
-                    dataKey="latency"
-                    stroke="#10b981"
-                    strokeWidth={2}
-                    fill="url(#colorLatency)"
-                    isAnimationActive={false}
-                  />
-
-                </AreaChart>
-
-              </ResponsiveContainer>
-
-            </div>
-
-          </div>
-
-          {/* ==================================================
-              SLA / Cost
-          ================================================== */}
-
-          <SlaCostVisualizer
-            latest={latest}
-            chartData={chartData}
-          />
-
-          {/* ==================================================
-              Event Stream
-          ================================================== */}
-
-          <div className="bg-black border border-white/5 rounded-2xl p-6 font-mono relative overflow-hidden flex flex-col">
-
-            <div className="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-blue-500 via-emerald-500 to-purple-500" />
-
-            <h4 className="text-xs font-bold text-slate-500 mb-4 uppercase tracking-widest flex items-center gap-2">
-
-              <Terminal size={14} />
-
-              Agent / Gateway Event Stream
-
-            </h4>
-
-            <div className="flex-1 overflow-y-auto space-y-2 text-xs custom-scrollbar max-h-[260px]">
-
-              <AnimatePresence>
-
-                {logs.map(
-                  (log, index) => (
-
-                    <motion.div
-                      initial={{
-                        opacity: 0,
-                        x: -10,
-                      }}
-                      animate={{
-                        opacity: 1,
-                        x: 0,
-                      }}
-                      key={`${log.timestamp}-${index}`}
-                      className="flex gap-3"
-                    >
-
-                      <span className="text-slate-600">
-                        [
-                        {
-                          log.timestamp
-                        }
-                        ]
-                      </span>
-
-                      <span
-                        className={`font-bold ${
-                          log.type ===
-                          'error'
-                            ? 'text-red-400'
-                            : log.type ===
-                              'warn'
-                              ? 'text-amber-400'
-                              : log.type ===
-                                'success'
-                                ? 'text-emerald-400'
-                                : 'text-blue-400'
-                        }`}
-                      >
-                        {log.type
-                          .toUpperCase()
-                          .padEnd(7)}
-                      </span>
-
-                      <span className="text-slate-300">
-                        {log.msg}
-                      </span>
-
-                    </motion.div>
-
-                  )
-                )}
-
-              </AnimatePresence>
-
-              {logs.length ===
-                0 && (
-                <div className="text-slate-600 italic">
-                  Waiting for events...
+            <section className="rounded-xl border border-slate-200 bg-white p-5 shadow-console">
+              <div className="mb-4 flex flex-wrap items-end justify-between gap-3">
+                <div>
+                  <h2 className="text-sm font-semibold text-slate-900">
+                    Forecast, actual, and capacity
+                  </h2>
+                  <p className="mt-0.5 text-xs text-slate-500">
+                    Requests per second. The dashed indigo line is the published upper bound.
+                  </p>
                 </div>
-              )}
+              </div>
+              <div className="h-80 w-full">
+                {history.length === 0 ? (
+                  <div className="flex h-full items-center justify-center text-sm text-slate-500">
+                    Loading live status
+                  </div>
+                ) : (
+                  <ResponsiveContainer width="100%" height="100%">
+                    <ComposedChart data={history} margin={{ top: 8, right: 8, left: 0, bottom: 0 }}>
+                      <CartesianGrid stroke="#eef0f3" vertical={false} />
+                      <XAxis
+                        dataKey="time"
+                        tick={{ fontSize: 11, fill: '#64748b' }}
+                        tickLine={false}
+                        axisLine={false}
+                        minTickGap={28}
+                      />
+                      <YAxis
+                        tick={{ fontSize: 11, fill: '#64748b' }}
+                        tickLine={false}
+                        axisLine={false}
+                        width={48}
+                        label={{
+                          value: 'RPS',
+                          angle: -90,
+                          position: 'insideLeft',
+                          fill: '#94a3b8',
+                          fontSize: 11,
+                        }}
+                      />
+                      <Tooltip content={<ChartTooltip />} />
+                      <Legend
+                        wrapperStyle={{ fontSize: 12, paddingTop: 8 }}
+                      />
+                      <Line
+                        type="stepAfter"
+                        dataKey="capacity"
+                        name="Capacity"
+                        stroke="#94a3b8"
+                        strokeWidth={1.5}
+                        strokeDasharray="4 4"
+                        dot={false}
+                        isAnimationActive={false}
+                      />
+                      <Line
+                        type="monotone"
+                        dataKey="forecast"
+                        name="Forecast mean"
+                        stroke="#4f46e5"
+                        strokeWidth={2}
+                        dot={false}
+                        isAnimationActive={false}
+                      />
+                      <Line
+                        type="monotone"
+                        dataKey="upper"
+                        name="Upper bound"
+                        stroke="#4f46e5"
+                        strokeWidth={1.5}
+                        strokeDasharray="6 4"
+                        dot={false}
+                        isAnimationActive={false}
+                      />
+                      <Line
+                        type="monotone"
+                        dataKey="actual"
+                        name="Actual"
+                        stroke="#0f172a"
+                        strokeWidth={2}
+                        dot={false}
+                        isAnimationActive={false}
+                      />
+                    </ComposedChart>
+                  </ResponsiveContainer>
+                )}
+              </div>
+            </section>
 
+            <div className="grid grid-cols-1 gap-3 lg:grid-cols-5">
+              <section className="rounded-xl border border-slate-200 bg-white p-5 shadow-console lg:col-span-3">
+                <h2 className="text-sm font-semibold text-slate-900">Why this decision</h2>
+                <div className="mt-3 space-y-2 text-sm leading-6 text-slate-600">
+                  {why.map((sentence) => (
+                    <p key={sentence}>{sentence}</p>
+                  ))}
+                </div>
+              </section>
+
+              <section className="rounded-xl border border-slate-200 bg-white p-5 shadow-console lg:col-span-2">
+                <h2 className="text-sm font-semibold text-slate-900">Recent scale events</h2>
+                {events.length === 0 ? (
+                  <p className="mt-3 text-sm text-slate-500">No scale events yet.</p>
+                ) : (
+                  <table className="mt-3 w-full text-left text-xs">
+                    <thead>
+                      <tr className="border-b border-slate-100 text-slate-500">
+                        <th className="py-2 pr-3 font-medium">Time</th>
+                        <th className="py-2 pr-3 font-medium">Rule</th>
+                        <th className="py-2 font-medium">Event</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {events.map((event) => (
+                        <tr key={`${event.time}-${event.text}`} className="border-b border-slate-50 align-top">
+                          <td className="py-2 pr-3 tabular-nums text-slate-500">{event.time}</td>
+                          <td className="py-2 pr-3">
+                            <span className="inline-flex rounded-full bg-indigo-50 px-2 py-0.5 font-medium text-indigo-700">
+                              {event.rule || '—'}
+                            </span>
+                          </td>
+                          <td className="py-2 text-slate-700">{event.text}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                )}
+              </section>
             </div>
+          </>
+        ) : null}
 
-          </div>
-
-        </div>
-
+        <LocalSimulator
+          simulatorUrl={SIMULATOR_URL}
+          latestStatus={simStatus}
+          selected={selectedDataset}
+          setSelected={setSelectedDataset}
+          onSimulationStarted={() => setHistory([])}
+        />
       </main>
-
-      {/* ======================================================
-          Custom Scrollbar
-      ====================================================== */}
-
-      <style>{`
-        .custom-scrollbar::-webkit-scrollbar {
-          width: 6px;
-        }
-
-        .custom-scrollbar::-webkit-scrollbar-track {
-          background: transparent;
-        }
-
-        .custom-scrollbar::-webkit-scrollbar-thumb {
-          background: #334155;
-          border-radius: 3px;
-        }
-
-        .custom-scrollbar::-webkit-scrollbar-thumb:hover {
-          background: #475569;
-        }
-      `}</style>
-
     </div>
   );
-};
-
-/* ============================================================
-   Helper used by proactive-scaling logic
-   ============================================================ */
-
-function peakTrafficSoFar(history, currentRPS) {
-  if (!history?.length) {
-    return currentRPS;
-  }
-
-  return Math.max(
-    currentRPS,
-    ...history.map(
-      (point) =>
-        toNumber(
-          point.actualRPS,
-          0
-        )
-    )
-  );
 }
-
-export default Dashboard;
