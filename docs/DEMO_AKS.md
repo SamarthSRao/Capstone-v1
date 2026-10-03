@@ -213,10 +213,10 @@ Linux is the same command with `python3` and forward slashes. The script prints 
 
 `services/load-predictor/models/nasa/` is that command, already run on CPU (6 epochs, batch 256). Held-out median lead: **23.5s** before 200 RPS, **18s** before 400, **24s** before 600. The original hourly weights on the same days led by **-6s** at 200 RPS and never reached 400 or 600. MAE 38 versus 63, RMSE 57 versus 97. Fraction of quiet seconds (under 80 RPS) whose forecast exceeded 200 was 0. `models/lstm_weights.pth` was not modified. The predictor manifest sets `MODEL_DIR=/app/models/nasa`. Re-running the command replaces that directory; it does not touch the original files.
 
-The DQN only picks the z-score. Retrain it on the same trace if you want, into a new file. Do not point the server at it until that command has finished:
+The DQN only picks the z-score. Retrain it on the same trace if you want. The default output is `models\nasa_rl\rl_agent_checkpoint.pth`, not the shipped `models\nasa\rl_agent_checkpoint.pth`. The script refuses to write either shipped checkpoint. Do not point the server at the new file until that command has finished:
 
 ```powershell
-py -3 finetune_rl_nasa.py --trace data\nasa_per_minute.csv --base-checkpoint models\rl_agent_checkpoint.pth --out models\nasa\rl_agent_checkpoint.pth --episodes 20 --max-steps 8000
+py -3 finetune_rl_nasa.py --trace data\nasa_per_minute.csv --base-checkpoint models\rl_agent_checkpoint.pth --out models\nasa_rl\rl_agent_checkpoint.pth --episodes 20 --max-steps 8000
 ```
 
 Rebuild the predictor image so `models/nasa` is in it, then set `MODEL_DIR=/app/models/nasa` on the predictor Deployment. `training_stats.json` in that directory has `"forecast_source": "lstm"`, which makes the published mean the horizon forecast. Leaving `MODEL_DIR` unset keeps the original hourly weights. Rebuild the orchestrator image as well: the pre-scale rule is in that binary.
