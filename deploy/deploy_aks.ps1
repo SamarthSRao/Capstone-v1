@@ -161,7 +161,15 @@ Register-OneProvider -Namespace "Microsoft.ContainerService"
 
 Write-Host ""
 Write-Host "[3/8] Preflight: VM size and vCPU quota in $Location..."
-Invoke-QuotaPreflight
+$ErrorActionPreference = "Continue"
+az aks show --resource-group $ResourceGroup --name $ClusterName -o none 2>$null
+$clusterExists = ($LASTEXITCODE -eq 0)
+$ErrorActionPreference = "Stop"
+if ($clusterExists) {
+    Write-Host "Cluster $ClusterName already exists; skipping the quota preflight (its nodes already use the quota)."
+} else {
+    Invoke-QuotaPreflight
+}
 
 Write-Host ""
 Write-Host "[4/8] Ensuring resource group $ResourceGroup in $Location..."
