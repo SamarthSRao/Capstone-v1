@@ -197,7 +197,7 @@ The URL on port 80 is the dashboard. The URL on port 8090 is the storefront. `mi
 
 ## Retrain on the NASA trace
 
-The forecaster has to see the ramp at 1-second cadence. `services/load-predictor/data/nasa_per_minute.csv` is the public NASA-KSC minute counts (Jul-Aug 1995). `finetune_nasa.py` drops the outage zeros from 1995-08-01 14:52 through 1995-08-03 04:36, smooths 7 minutes, compresses time 40x (one demo second per 40 real seconds), and scales the trace so the peak is 750 RPS. That peak is the 13 July morning, which is also `deploy/nasa_demo_window_10min.csv`. Training holds out 13 July, 20 July, 10 August, and 17 August. The target is RPS 30 seconds ahead, not the next second.
+The forecaster has to see the ramp at 1-second cadence. `services/load-predictor/data/nasa_per_minute.csv` is the public NASA-KSC minute counts (Jul-Aug 1995). `finetune_nasa.py` drops only the outage zeros from 1995-08-01 14:52 through 1995-08-03 04:36. A second zero run, 1995-07-28 13:33 through 1995-07-31 23:59 (4,947 minutes), stays in the training data and is about 6% of the compressed training seconds. Shorter zero stretches are kept too. The script then smooths 7 minutes, compresses time 40x (one demo second per 40 real seconds), and scales the trace so the peak is 750 RPS. That peak is the 13 July morning, which is also `deploy/nasa_demo_window_10min.csv`. Training holds out 13 July, 20 July, 10 August, and 17 August. The target is RPS 30 seconds ahead, not the next second.
 
 This does not overwrite `models/lstm_weights.pth`. Output goes to `models/nasa/`. CPU, a few GB of RAM, a few minutes to well under an hour.
 
