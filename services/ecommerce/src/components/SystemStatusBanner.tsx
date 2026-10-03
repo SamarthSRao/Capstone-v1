@@ -1,11 +1,6 @@
 import { useEffect, useState } from 'react'
-import { AlertTriangle, XCircle } from 'lucide-react'
 import { useSystemLoad } from '../hooks/useSystemLoad'
 
-/**
- * HT-306 — Top alert banner when SLA reliability drops.
- * Auto-dismisses 3 seconds after load normalizes.
- */
 export const SystemStatusBanner = () => {
   const { violations, slaReliability, currentRPS } = useSystemLoad()
   const [visible, setVisible] = useState(false)
@@ -20,9 +15,7 @@ export const SystemStatusBanner = () => {
       return
     }
 
-    if (!visible) {
-      return
-    }
+    if (!visible) return
 
     const timer = window.setTimeout(() => {
       setVisible(false)
@@ -37,31 +30,22 @@ export const SystemStatusBanner = () => {
 
   return (
     <div
-      className={`fixed top-16 left-0 right-0 z-50 flex items-center justify-between
-                  px-6 py-2.5 transition-all duration-300 animate-slide-down
-                  ${
-                    isCritical
-                      ? 'bg-red-600/95 text-white border-b border-red-500 shadow-lg shadow-red-950/20'
-                      : 'bg-yellow-500/95 text-black border-b border-yellow-400 shadow-lg shadow-yellow-950/20'
-                  }`}
+      className={`fixed top-16 right-0 left-0 z-50 flex items-center justify-between gap-3 border-b px-6 py-2.5 text-sm animate-slide-down ${
+        isCritical
+          ? 'border-rose-200 bg-rose-50 text-rose-900'
+          : 'border-amber-200 bg-amber-50 text-amber-900'
+      }`}
       role="alert"
     >
-      <div className="flex items-center gap-3">
-        {isCritical ? (
-          <XCircle className="w-5 h-5 shrink-0 animate-bounce" />
-        ) : (
-          <AlertTriangle className="w-5 h-5 shrink-0 animate-pulse" />
-        )}
-        <span className="font-semibold text-sm">
-          {isCritical
-            ? `CRITICAL CONGESTION: SLA Reliability is ${slaReliability.toFixed(2)}% | Active Violations: ${violations}`
-            : `HIGH WORKLOAD WARNING: System load is high (${currentRPS} RPS). Checking out may be sluggish.`}
-        </span>
-      </div>
+      <span className="font-medium">
+        {isCritical
+          ? `SLA reliability is ${slaReliability.toFixed(2)}%. Active violations: ${violations}.`
+          : `Load is high (${currentRPS} RPS). Checkout may be slower.`}
+      </span>
       <button
         type="button"
         onClick={() => setDismissed(true)}
-        className="text-xs px-2 py-1 rounded bg-black/10 hover:bg-black/20 font-bold"
+        className="rounded-md px-2 py-1 text-xs font-medium underline"
       >
         Dismiss
       </button>

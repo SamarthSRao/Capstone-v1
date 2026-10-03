@@ -1,174 +1,102 @@
-import { useEffect, useState } from 'react'
 import { useCart } from '../context/CartContext'
+import { useCatalog } from '../context/CatalogContext'
 import { useDynamicPricing } from '../hooks/useDynamicPricing'
-import type { Product } from '../types'
+import { ProductArt } from './ProductArt'
 
-const API_URL = import.meta.env.VITE_API_URL ?? 'http://localhost:8080'
+interface ProductGridProps {
+  query: string
+  onOpen: (id: number) => void
+}
 
-/** Fallback catalog when the API / DB is not running yet */
-const FALLBACK_PRODUCTS: Product[] = [
-  {
-    id: 1,
-    name: 'AeroStride Runners',
-    category: 'Footwear',
-    base_price: 149.0,
-    description: 'Lightweight carbon-plate racing shoes.',
-    stock: 40,
-  },
-  {
-    id: 2,
-    name: 'PulseForge Watch',
-    category: 'Wearables',
-    base_price: 229.0,
-    description: 'GPS + HRV training computer.',
-    stock: 25,
-  },
-  {
-    id: 3,
-    name: 'VoltPack Hydration',
-    category: 'Accessories',
-    base_price: 48.0,
-    description: 'Insulated soft flask vest.',
-    stock: 60,
-  },
-  {
-    id: 4,
-    name: 'SummitShell Jacket',
-    category: 'Apparel',
-    base_price: 189.0,
-    description: 'Windproof shell for alpine efforts.',
-    stock: 18,
-  },
-  {
-    id: 5,
-    name: 'CoreBand Resistance',
-    category: 'Training',
-    base_price: 32.0,
-    description: 'Progressive resistance loop set.',
-    stock: 80,
-  },
-  {
-    id: 6,
-    name: 'NightTrail Headlamp',
-    category: 'Accessories',
-    base_price: 64.0,
-    description: '1200-lumen rechargeable beam.',
-    stock: 35,
-  },
-]
-
-export function ProductGrid() {
+export function ProductGrid({ query, onOpen }: ProductGridProps) {
   const { addItem } = useCart()
+  const { products, source } = useCatalog()
   const pricing = useDynamicPricing()
-  const [products, setProducts] = useState<Product[]>(FALLBACK_PRODUCTS)
-  const [source, setSource] = useState<'api' | 'fallback'>('fallback')
-
-  useEffect(() => {
-    let cancelled = false
-
-    const load = async () => {
-      try {
-        const res = await fetch(`${API_URL}/api/products`)
-        if (!res.ok) return
-        const data = (await res.json()) as Product[]
-        if (!cancelled && Array.isArray(data) && data.length > 0) {
-          setProducts(data)
-          setSource('api')
-        }
-      } catch {
-        // Keep fallback catalog
-      }
-    }
-
-    load()
-    return () => {
-      cancelled = true
-    }
-  }, [])
+  const needle = query.trim().toLowerCase()
+  const visible = needle
+    ? products.filter((product) =>
+        `${product.name} ${product.category} ${product.description}`
+          .toLowerCase()
+          .includes(needle),
+      )
+    : products
 
   return (
-    <section className="mx-auto max-w-6xl px-6 pb-20 pt-10">
-      <div className="mb-10 max-w-xl">
-        <p className="mb-2 text-xs uppercase tracking-[0.25em] text-[var(--color-accent)]">
-          Catalog
-        </p>
-        <h2 className="font-[family-name:var(--font-display)] text-4xl font-extrabold tracking-tight sm:text-5xl">
-          Built for the surge
-        </h2>
-        <p className="mt-3 text-[var(--color-mist)]">
-          Premium performance gear. Live checkout traffic feeds the HybridTimeNet
-          autoscaling loop.
-          {source === 'fallback' && (
-            <span className="ml-1 text-xs text-[var(--color-warn)]">
-              (showing demo catalog — API offline)
-            </span>
-          )}
-        </p>
+    <section className="mx-auto max-w-6xl px-6 pt-8 pb-16">
+      <div className="mb-8 flex flex-wrap items-end justify-between gap-3">
+        <div>
+          <h2 className="text-2xl font-semibold tracking-tight text-slate-900">
+            Catalog
+          </h2>
+          <p className="mt-1 text-sm text-slate-500">
+            Performance gear for training and trail.
+            {source === 'fallback' ? ' Showing the local catalog.' : ''}
+          </p>
+        </div>
+        <p className="text-xs text-slate-500">{visible.length} products</p>
       </div>
 
-      <div className="grid gap-6 sm:grid-cols-2 lg:grid-cols-3">
-        {products.map((product) => {
-          const displayPrice =
-            Number(product.base_price) * pricing.multiplier
-          const priceClass = pricing.isChaos
-            ? 'text-red-400'
-            : pricing.isHighDemand
-              ? 'text-[var(--color-warn)]'
-              : 'text-[var(--color-accent)]'
-          const badgeClass = pricing.isChaos
-            ? 'border-red-500 bg-red-600 text-white'
-            : 'border-[var(--color-warn)]/50 bg-[var(--color-warn)]/15 text-[var(--color-warn)]'
-          const cardBorder = pricing.isChaos
-            ? 'border-red-500/40 hover:border-red-400'
-            : 'border-[var(--color-edge)] hover:border-[var(--color-accent-dim)]'
-
-          return (
-            <article
-              key={product.id}
-              className={`group flex flex-col border bg-[var(--color-panel)]/80 p-5 transition ${cardBorder}`}
-            >
-              <div className="mb-4 aspect-[4/3] bg-gradient-to-br from-[var(--color-edge)] to-[var(--color-ink)]" />
-              <div className="flex items-start justify-between gap-2">
-                <p className="text-xs uppercase tracking-wider text-[var(--color-mist)]">
-                  {product.category}
-                </p>
-                {pricing.badgeLabel && (
-                  <span
-                    className={`shrink-0 rounded border px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide ${badgeClass}`}
-                  >
-                    {pricing.badgeLabel}
-                  </span>
-                )}
-              </div>
-              <h3 className="mt-1 font-[family-name:var(--font-display)] text-xl font-bold">
-                {product.name}
-              </h3>
-              <p className="mt-2 flex-1 text-sm text-[var(--color-mist)]">
-                {product.description}
-              </p>
-              <div className="mt-4 flex items-center justify-between">
-                <div>
-                  <span className={`text-lg font-semibold ${priceClass}`}>
-                    ${displayPrice.toFixed(2)}
-                  </span>
-                  {pricing.isHighDemand && (
-                    <span className="ml-2 text-xs text-[var(--color-mist)] line-through">
-                      ${Number(product.base_price).toFixed(2)}
-                    </span>
-                  )}
-                </div>
+      {visible.length === 0 ? (
+        <div className="rounded-xl border border-slate-200 bg-white px-6 py-16 text-center shadow-sm">
+          <p className="text-sm font-medium text-slate-800">No matching products</p>
+          <p className="mt-1 text-xs text-slate-500">Try another search.</p>
+        </div>
+      ) : (
+        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+          {visible.map((product) => {
+            const displayPrice = Number(product.base_price) * pricing.multiplier
+            return (
+              <article
+                key={product.id}
+                className="flex flex-col rounded-xl border border-slate-200 bg-white p-4 shadow-sm"
+              >
                 <button
                   type="button"
-                  onClick={() => addItem(product)}
-                  className="rounded-md border border-[var(--color-edge)] px-3 py-1.5 text-sm font-medium transition group-hover:border-[var(--color-accent)] group-hover:text-[var(--color-accent)]"
+                  onClick={() => onOpen(product.id)}
+                  className="text-left"
                 >
-                  Add to cart
+                  <ProductArt name={product.name} />
+                  <p className="mt-4 text-[11px] font-medium uppercase tracking-wide text-slate-500">
+                    {product.category}
+                  </p>
+                  <h3 className="mt-1 text-base font-semibold text-slate-900">
+                    {product.name}
+                  </h3>
+                  <p className="mt-1 line-clamp-2 text-sm text-slate-500">
+                    {product.description}
+                  </p>
                 </button>
-              </div>
-            </article>
-          )
-        })}
-      </div>
+                <div className="mt-4 flex items-center justify-between gap-3">
+                  <div>
+                    <span className="text-base font-semibold tabular-nums text-slate-900">
+                      ${displayPrice.toFixed(2)}
+                    </span>
+                    {pricing.isHighDemand && (
+                      <span className="ml-2 text-xs text-slate-400 line-through">
+                        ${Number(product.base_price).toFixed(2)}
+                      </span>
+                    )}
+                    {pricing.badgeLabel && (
+                      <p className="mt-1">
+                        <span className="rounded-full bg-amber-50 px-2 py-0.5 text-[11px] font-medium text-amber-800">
+                          {pricing.badgeLabel}
+                        </span>
+                      </p>
+                    )}
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => addItem(product)}
+                    className="rounded-lg bg-indigo-600 px-3 py-2 text-sm font-medium text-white hover:bg-indigo-700"
+                  >
+                    Add
+                  </button>
+                </div>
+              </article>
+            )
+          })}
+        </div>
+      )}
     </section>
   )
 }
