@@ -3,9 +3,12 @@
 The public trace (Arlitt & Williamson, SIGMETRICS 1996) is one row per minute.
 The predictor is served a 24-step history of 1-second samples. This module
 time-compresses the trace 40x, the same way deploy/nasa_demo_window_10min.csv
-was built, so one training step is one demo second. An outage that was logged
-as zeros (1995-08-01 14:52 through 1995-08-03 04:36) is dropped and splits the
-series so smoothing and windows never cross the gap.
+was built, so one training step is one demo second. Only one logged outage
+is dropped: 1995-08-01 14:52 through 1995-08-03 04:36. That gap splits the
+series so smoothing and windows never cross it. A second run of zeros,
+1995-07-28 13:33 through 1995-07-31 23:59 (4,947 minutes), is left in the
+file. After the 40x compression it is about 6% of the training seconds.
+Shorter zero stretches are kept as well.
 
 No pandas and no torch: the unit tests and a laptop with a few GB of RAM can
 import this module on its own.
@@ -19,7 +22,9 @@ from datetime import datetime, timedelta
 
 import numpy as np
 
-# Inclusive. The logs record this stretch as zeros; it is not real idle.
+# Inclusive. This is the only stretch contiguous_segments removes. The logs
+# also record zeros from 1995-07-28 13:33 through 1995-07-31 23:59; those
+# rows stay in the training series.
 OUTAGE_START = datetime(1995, 8, 1, 14, 52)
 OUTAGE_END = datetime(1995, 8, 3, 4, 36)
 
@@ -81,9 +86,10 @@ def _rolling_mean(values, window):
 
 
 def contiguous_segments(times, counts):
-    """Split on the outage and on any gap longer than one minute.
+    """Split on the 1-3 August outage and on any gap longer than one minute.
 
-    Returns a list of (times, counts) with the outage rows removed.
+    Returns a list of (times, counts) with that outage removed. The 28-31
+    July zero run is not removed.
     """
     segments = []
     bucket_t = []
@@ -197,7 +203,9 @@ def prepare_trace(
     compression_seconds=COMPRESSION_SECONDS,
     smooth_minutes=SMOOTH_MINUTES,
 ):
-    """Load, drop the outage, compress, and scale so the trace peak is peak_rps.
+    """Load, drop the 1-3 August outage, compress, and scale to peak_rps.
+
+    The 28-31 July zeros are still in the compressed training series.
 
     The peak is the held-out 13 July morning, which is also the demo replay.
     Using it only to choose the requests-per-second unit keeps that replay

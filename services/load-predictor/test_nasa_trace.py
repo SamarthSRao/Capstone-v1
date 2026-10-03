@@ -53,6 +53,11 @@ class OutageTests(unittest.TestCase):
         self.assertIn(datetime(1995, 8, 1, 14, 51), kept)
         self.assertIn(datetime(1995, 8, 3, 4, 37), kept)
         self.assertNotIn(OUTAGE_START, kept)
+        # 28-31 July is a second zero run. It is not the August outage and
+        # the loader leaves it in the series on purpose.
+        self.assertFalse(in_outage(datetime(1995, 7, 28, 13, 33)))
+        self.assertIn(datetime(1995, 7, 28, 13, 33), kept)
+        self.assertIn(datetime(1995, 7, 31, 23, 59), kept)
         self.assertNotIn(OUTAGE_END, kept)
 
 

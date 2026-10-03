@@ -133,7 +133,13 @@ Direct checks while it runs:
 
 ```bash
 curl -s "http://<NGINX-IP>/api/orchestrator/api/target/status"
+# GET is the only orchestrator call the dashboard makes. POST /scale must not
+# be reachable through the public proxy (403 if it is the status URL, 404 otherwise).
+curl -s -o /dev/null -w "%{http_code}\n" -X POST "http://<NGINX-IP>/api/orchestrator/api/target/status"
+curl -s -o /dev/null -w "%{http_code}\n" -X POST "http://<NGINX-IP>/api/orchestrator/scale"
 ```
+
+The first POST prints `403`. The second prints `404`. `services/dashboard/test_nginx_allowlist.sh` checks the same rules against a local nginx.
 
 `stub_status` is not on the public IP. The orchestrator reads `http://nginx-metrics:8091/stub_status`. That port allows only localhost and private ranges, and the Service is ClusterIP. A request to `http://<NGINX-IP>:8090/stub_status` is the storefront, not the counter.
 
@@ -191,7 +197,7 @@ The URL on port 80 is the dashboard. The URL on port 8090 is the storefront. `mi
 
 ## Retrain on the NASA trace
 
-The forecaster has to see the ramp at 1-second cadence. `services/load-predictor/data/nasa_per_minute.csv` is the public NASA-KSC minute counts (Jul-Aug 1995). `finetune_nasa.py` drops the outage zeros from 1995-08-01 14:52 through 1995-08-03 04:36, smooths 7 minutes, compresses time 40x (one demo second per 40 real seconds), and scales the trace so the peak is 750 RPS. That peak is the 13 July morning, which is also `deploy/nasa_demo_window_10min.csv`. Training holds out 13 July, 20 July, 10 August, and 17 August. The target is RPS 30 seconds ahead, not the next second.
+The forecaster has to see the ramp at 1-second cadence. `services/load-predictor/data/nasa_per_minute.csv` is the public NASA-KSC minute counts (Jul-Aug 1995). `finetune_nasa.py` drops only the outage zeros from 1995-08-01 14:52 through 1995-08-03 04:36. A second zero run, 1995-07-28 13:33 through 1995-07-31 23:59 (4,947 minutes), stays in the training data and is about 6% of the compressed training seconds. Shorter zero stretches are kept too. The script then smooths 7 minutes, compresses time 40x (one demo second per 40 real seconds), and scales the trace so the peak is 750 RPS. That peak is the 13 July morning, which is also `deploy/nasa_demo_window_10min.csv`. Training holds out 13 July, 20 July, 10 August, and 17 August. The target is RPS 30 seconds ahead, not the next second.
 
 This does not overwrite `models/lstm_weights.pth`. Output goes to `models/nasa/`. CPU, a few GB of RAM, a few minutes to well under an hour.
 
@@ -207,10 +213,10 @@ Linux is the same command with `python3` and forward slashes. The script prints 
 
 `services/load-predictor/models/nasa/` is that command, already run on CPU (6 epochs, batch 256). Held-out median lead: **23.5s** before 200 RPS, **18s** before 400, **24s** before 600. The original hourly weights on the same days led by **-6s** at 200 RPS and never reached 400 or 600. MAE 38 versus 63, RMSE 57 versus 97. Fraction of quiet seconds (under 80 RPS) whose forecast exceeded 200 was 0. `models/lstm_weights.pth` was not modified. The predictor manifest sets `MODEL_DIR=/app/models/nasa`. Re-running the command replaces that directory; it does not touch the original files.
 
-The DQN only picks the z-score. Retrain it on the same trace if you want, into a new file. Do not point the server at it until that command has finished:
+The DQN only picks the z-score. Retrain it on the same trace if you want. The default output is `models\nasa_rl\rl_agent_checkpoint.pth`, not the shipped `models\nasa\rl_agent_checkpoint.pth`. The script refuses to write either shipped checkpoint. Do not point the server at the new file until that command has finished:
 
 ```powershell
-py -3 finetune_rl_nasa.py --trace data\nasa_per_minute.csv --base-checkpoint models\rl_agent_checkpoint.pth --out models\nasa\rl_agent_checkpoint.pth --episodes 20 --max-steps 8000
+py -3 finetune_rl_nasa.py --trace data\nasa_per_minute.csv --base-checkpoint models\rl_agent_checkpoint.pth --out models\nasa_rl\rl_agent_checkpoint.pth --episodes 20 --max-steps 8000
 ```
 
 Rebuild the predictor image so `models/nasa` is in it, then set `MODEL_DIR=/app/models/nasa` on the predictor Deployment. `training_stats.json` in that directory has `"forecast_source": "lstm"`, which makes the published mean the horizon forecast. Leaving `MODEL_DIR` unset keeps the original hourly weights. Rebuild the orchestrator image as well: the pre-scale rule is in that binary.

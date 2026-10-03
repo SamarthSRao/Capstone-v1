@@ -123,3 +123,12 @@ class RLAgent:
             self.target_model.load_state_dict(checkpoint['model_state_dict'])
         self.current_z_score = checkpoint.get('current_z_score', 1.96)
         self.epsilon = checkpoint.get('epsilon', self.epsilon_min)
+
+    def load_for_inference(self, filepath):
+        """Load a checkpoint, then force epsilon to 0.
+
+        load() restores the epsilon that was saved (about 0.03 on the shipped
+        file). Leaving that in place makes a few percent of ticks random.
+        """
+        self.load(filepath)
+        self.epsilon = 0.0

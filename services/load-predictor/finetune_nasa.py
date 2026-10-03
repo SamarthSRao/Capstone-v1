@@ -143,7 +143,10 @@ def train(args):
         sys.exit("base weights not found: %s" % base_weights)
 
     device = torch.device("cpu")
-    print("Preparing NASA trace (outage dropped, 40x compression, peak %.0f RPS)..." % args.peak_rps)
+    print(
+        "Preparing NASA trace (1-3 Aug outage dropped, 28-31 Jul zeros kept, "
+        "40x compression, peak %.0f RPS)..." % args.peak_rps
+    )
     trace = prepare_trace(args.trace, peak_rps=args.peak_rps)
     print("scale=%.2f train_peak=%.1f target_peak=%.1f" % (trace.scale, trace.train_peak, trace.target_peak))
 

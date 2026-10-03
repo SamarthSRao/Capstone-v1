@@ -10,16 +10,17 @@ orchestrator: the noisy upper bound is capped at live RPS + headroom unless
 the slope is rising, and a forecast mean that stays above capacity for a few
 ticks is trusted. Reward matches hybrid_time_net/train_rl_flash.py.
 
-Writes a new checkpoint. Does not overwrite --base-checkpoint.
+Writes a new checkpoint under models/nasa_rl/. It will not write the shipped
+files models/rl_agent_checkpoint.pth or models/nasa/rl_agent_checkpoint.pth.
 
     py -3 finetune_rl_nasa.py ^
         --trace data/nasa_per_minute.csv ^
         --base-checkpoint models/rl_agent_checkpoint.pth ^
-        --out models/nasa/rl_agent_checkpoint.pth ^
+        --out models/nasa_rl/rl_agent_checkpoint.pth ^
         --episodes 20 --max-steps 8000
 
-Do not point the server at this file until you have actually trained it.
-The default image keeps models/rl_agent_checkpoint.pth.
+Do not point MODEL_DIR at nasa_rl until that file has actually been trained.
+The image keeps the shipped copy at models/nasa/rl_agent_checkpoint.pth.
 """
 
 from __future__ import annotations
@@ -198,11 +199,29 @@ def run_episodes(args):
     print("Original checkpoint left in place: %s" % base)
 
 
+# Checkpoints the running predictor ships. A retrain must not replace them.
+SHIPPED_CHECKPOINTS = (
+    os.path.join("models", "rl_agent_checkpoint.pth"),
+    os.path.join("models", "nasa", "rl_agent_checkpoint.pth"),
+)
+DEFAULT_OUT = os.path.join("models", "nasa_rl", "rl_agent_checkpoint.pth")
+
+
+def refuse_shipped_output(path):
+    target = os.path.abspath(path)
+    for shipped in SHIPPED_CHECKPOINTS:
+        if target == os.path.abspath(shipped):
+            raise SystemExit(
+                "refusing to write %s; that file is shipped with the predictor. "
+                "Use models/nasa_rl/rl_agent_checkpoint.pth." % path
+            )
+
+
 def main():
     parser = argparse.ArgumentParser(description="Fine-tune the DQN on the compressed NASA trace.")
     parser.add_argument("--trace", default=os.path.join("data", "nasa_per_minute.csv"))
     parser.add_argument("--base-checkpoint", default=os.path.join("models", "rl_agent_checkpoint.pth"))
-    parser.add_argument("--out", default=os.path.join("models", "nasa", "rl_agent_checkpoint.pth"))
+    parser.add_argument("--out", default=DEFAULT_OUT)
     parser.add_argument("--episodes", type=int, default=20)
     parser.add_argument("--max-steps", type=int, default=8000)
     parser.add_argument("--batch-size", type=int, default=64)
@@ -217,6 +236,7 @@ def main():
     parser.add_argument("--peak-rps", type=float, default=750.0)
     parser.add_argument("--seed", type=int, default=7)
     args = parser.parse_args()
+    refuse_shipped_output(args.out)
     run_episodes(args)
 
 
