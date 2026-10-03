@@ -104,7 +104,7 @@ class PredictorService(predictor_pb2_grpc.PredictorServicer):
         self.rl_checkpoint_error = ""
         rl_path = os.path.join(models_dir, 'rl_agent_checkpoint.pth')
         try:
-            self.rl_agent.load(rl_path)
+            self.rl_agent.load_for_inference(rl_path)
             self.rl_loaded = True
             print("Loaded trained RL Agent.")
         except Exception as e:
