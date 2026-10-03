@@ -29,6 +29,21 @@ from rl_agent import RLAgent
 from bounds import clamp_z_score, uncertainty_bounds
 from nasa_trace import select_forecast_mean
 
+OPTIONAL_MODEL_FILES = (
+    "season_model.pkl",
+    "xgboost_model.json",
+    "fusion_mlp_weights.pth",
+)
+
+
+def missing_optional_model_files(models_dir):
+    """Files the hourly ensemble uses and the NASA directory does not ship."""
+    return [
+        name for name in OPTIONAL_MODEL_FILES
+        if not os.path.isfile(os.path.join(models_dir, name))
+    ]
+
+
 log = logging.getLogger("predictor")
 if not log.handlers:
     _handler = logging.StreamHandler()
@@ -81,24 +96,40 @@ class PredictorService(predictor_pb2_grpc.PredictorServicer):
         except Exception as e:
             print("Could not load LSTM weights:", e)
             
-        try:
-            self.season_model = joblib.load(os.path.join(models_dir, 'season_model.pkl'))
-            print("Loaded Seasonality model.")
-        except Exception as e:
-            print("Could not load Seasonality model:", e)
-            
-        try:
-            self.xgb_model.model.load_model(os.path.join(models_dir, 'xgboost_model.json'))
-            print("Loaded XGBoost model.")
-        except Exception as e:
-            print("Could not load XGBoost model:", e)
-            
-        try:
-            self.fusion.load_state_dict(torch.load(os.path.join(models_dir, 'fusion_mlp_weights.pth'), map_location=self.device))
-            self.fusion.eval()
-            print("Loaded Fusion MLP weights.")
-        except Exception as e:
-            print("Could not load Fusion MLP weights:", e)
+        # NASA MODEL_DIR ships the LSTM and the RL checkpoint only. The hourly
+        # season, XGBoost, and fusion files are absent there on purpose.
+        missing_optional = missing_optional_model_files(models_dir)
+        season_path = os.path.join(models_dir, 'season_model.pkl')
+        if 'season_model.pkl' not in missing_optional:
+            try:
+                self.season_model = joblib.load(season_path)
+                print("Loaded Seasonality model.")
+            except Exception as e:
+                log.warning("Could not load Seasonality model: %s", e)
+
+        xgb_path = os.path.join(models_dir, 'xgboost_model.json')
+        if 'xgboost_model.json' not in missing_optional:
+            try:
+                self.xgb_model.model.load_model(xgb_path)
+                print("Loaded XGBoost model.")
+            except Exception as e:
+                log.warning("Could not load XGBoost model: %s", e)
+
+        fusion_path = os.path.join(models_dir, 'fusion_mlp_weights.pth')
+        if 'fusion_mlp_weights.pth' not in missing_optional:
+            try:
+                self.fusion.load_state_dict(torch.load(fusion_path, map_location=self.device))
+                self.fusion.eval()
+                print("Loaded Fusion MLP weights.")
+            except Exception as e:
+                log.warning("Could not load Fusion MLP weights: %s", e)
+
+        if missing_optional:
+            log.info(
+                "LSTM-only mode is intended for %s; not loading %s.",
+                models_dir,
+                ", ".join(missing_optional),
+            )
 
         self.rl_loaded = False
         self.rl_checkpoint_error = ""
