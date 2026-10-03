@@ -37,6 +37,13 @@ data:
             server dashboard:80;
             keepalive 16;
         }
+        # NexusGear static bundle (services/ecommerce, nginx). Only the
+        # browser page and its assets come from here; every API call and all
+        # load-generator traffic still goes to target_backend.
+        upstream storefront_backend {
+            server storefront:80;
+            keepalive 8;
+        }
 
         server {
             listen 8090;
@@ -45,8 +52,70 @@ data:
                 default_type text/plain;
                 return 200 "ok\n";
             }
-            location / {
+            # Read-only live status for the storefront banner. The dashboard
+            # pod's nginx allows GET only and returns 404 for the rest of
+            # /api/orchestrator/.
+            location = /api/orchestrator/api/target/status {
+                proxy_pass http://dashboard_backend;
+                proxy_http_version 1.1;
+                proxy_set_header Connection "";
+                proxy_set_header Host $host;
+                proxy_connect_timeout 2s;
+                proxy_read_timeout 5s;
+            }
+            # Always the autoscaled workload: API, health and metrics.
+            location ^~ /api/ {
                 proxy_pass http://target_backend;
+                proxy_http_version 1.1;
+                proxy_set_header Connection "";
+                proxy_set_header Host $host;
+                proxy_set_header X-Real-IP $remote_addr;
+                proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                proxy_set_header X-Forwarded-Proto $scheme;
+                proxy_connect_timeout 2s;
+                proxy_read_timeout 5s;
+            }
+            location = /health {
+                proxy_pass http://target_backend;
+                proxy_http_version 1.1;
+                proxy_set_header Connection "";
+                proxy_set_header Host $host;
+                proxy_connect_timeout 2s;
+                proxy_read_timeout 5s;
+            }
+            location = /metrics {
+                proxy_pass http://target_backend;
+                proxy_http_version 1.1;
+                proxy_set_header Connection "";
+                proxy_set_header Host $host;
+                proxy_connect_timeout 2s;
+                proxy_read_timeout 5s;
+            }
+            # Built bundle files (hashed names) and the icon: static pod.
+            location ^~ /assets/ {
+                proxy_pass http://storefront_backend;
+                proxy_http_version 1.1;
+                proxy_set_header Connection "";
+                proxy_set_header Host $host;
+                proxy_connect_timeout 2s;
+                proxy_read_timeout 5s;
+            }
+            location = /favicon.svg {
+                proxy_pass http://storefront_backend;
+                proxy_http_version 1.1;
+                proxy_set_header Connection "";
+                proxy_set_header Host $host;
+            }
+            # "/" : a browser (Accept: text/html) gets the NexusGear page from
+            # the static pod. Load generators (locust, nasa_replay, curl) send
+            # no text/html Accept header and keep hitting target-app, so the
+            # NASA replay still exercises the autoscaled pods.
+            location / {
+                set $page_upstream target_backend;
+                if ($http_accept ~* "text/html") {
+                    set $page_upstream storefront_backend;
+                }
+                proxy_pass http://$page_upstream;
                 proxy_http_version 1.1;
                 proxy_set_header Connection "";
                 proxy_set_header Host $host;

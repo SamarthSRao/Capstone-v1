@@ -1,0 +1,64 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: storefront
+  namespace: capstone
+  labels:
+    app: storefront
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: storefront
+  template:
+    metadata:
+      labels:
+        app: storefront
+    spec:
+      terminationGracePeriodSeconds: 15
+      containers:
+        - name: storefront
+          # Applied by deploy/redeploy_ui.ps1 with the ACR image and tag.
+          image: capstone/storefront:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 80
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 3
+            failureThreshold: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 200m
+              memory: 64Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: storefront
+  namespace: capstone
+spec:
+  type: ClusterIP
+  selector:
+    app: storefront
+  ports:
+    - name: http
+      protocol: TCP
+      port: 80
+      targetPort: http

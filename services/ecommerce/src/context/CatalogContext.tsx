@@ -60,6 +60,24 @@ const FALLBACK_PRODUCTS: Product[] = [
   },
 ]
 
+// The NexusGear API returns base_price and stock. The AKS storefront backend
+// (services/target-app) returns price and no stock. Accept both so prices do
+// not render as NaN.
+function normalizeProducts(raw: unknown): Product[] {
+  if (!Array.isArray(raw)) return []
+  return raw
+    .map((item) => {
+      const p = item as Record<string, unknown>
+      const price = Number(p.base_price ?? p.price)
+      return {
+        ...(p as unknown as Product),
+        base_price: Number.isFinite(price) ? price : NaN,
+        stock: Number.isFinite(Number(p.stock)) ? Number(p.stock) : 50,
+      }
+    })
+    .filter((p) => Number.isFinite(p.base_price))
+}
+
 interface CatalogValue {
   products: Product[]
   source: 'api' | 'fallback'
@@ -80,8 +98,8 @@ export function CatalogProvider({ children }: { children: ReactNode }) {
       try {
         const res = await fetch(`${API_URL}/api/products`)
         if (!res.ok) return
-        const data = (await res.json()) as Product[]
-        if (!cancelled && Array.isArray(data) && data.length > 0) {
+        const data = normalizeProducts(await res.json())
+        if (!cancelled && data.length > 0) {
           setProducts(data)
           setSource('api')
         }
