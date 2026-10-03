@@ -276,8 +276,8 @@ if ($LASTEXITCODE -eq 0) {
 # applies during an upgrade. Auto-upgrade is none, so no upgrade and no surge
 # node happens unless someone runs one. Do not run az aks upgrade on this
 # cluster: the surge node would exceed the 4 vCPU BS-family quota.
-az aks update --resource-group $ResourceGroup --name $ClusterName --auto-upgrade-channel none --output table
-Assert-Exit "az aks update --auto-upgrade-channel none"
+# auto-upgrade-channel none is already set by az aks create. Re-running
+# az aks update --auto-upgrade-channel none prompts y/n (NoTTYException), so it is not repeated.
 
 Write-Host ""
 Write-Host "[7/8] Configuring kubectl and applying manifests..."
