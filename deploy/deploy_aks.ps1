@@ -20,8 +20,9 @@
 
     Standard_B2s is 4 GiB and does not fit the predictor next to system pods.
     The default is Standard_B2ms (2 vCPU, 8 GiB, same BS family). The cluster
-    is a fixed 2 nodes: no cluster autoscaler, auto-upgrade none, max surge 0,
-    max unavailable 1 (AKS rejects maxSurge 0 unless maxUnavailable is > 0).
+    is a fixed 2 nodes: no cluster autoscaler, auto-upgrade none. Surge 0 is not
+    settable on the System pool (AKS: max unavailable must be 0), so the default
+    10% surge stays; it only matters during an upgrade, which never runs.
 
     Tear down when the demo is over:
       az group delete --name capstone-rg --yes --no-wait
@@ -135,7 +136,7 @@ Write-Host "=========================================================="
 Write-Host "Resource group: $ResourceGroup"
 Write-Host "Location:       $Location"
 Write-Host "Cluster:        $ClusterName"
-Write-Host "Node size:      $NodeSize  (fixed count $NodeCount, max surge 0, max unavailable 1, no autoscaler)"
+Write-Host "Node size:      $NodeSize  (fixed count $NodeCount, no autoscaler, auto-upgrade none)"
 $allowed = @("indiasouthcentral", "centralindia", "eastasia", "koreacentral", "malaysiawest")
 if ($allowed -notcontains $Location) {
     Write-Host "WARNING: $Location is not one of the regions this student subscription allows:"
@@ -261,13 +262,12 @@ if ($LASTEXITCODE -eq 0) {
         --output table
     Assert-Exit "az aks create"
 }
-# A surge node during an upgrade would be a third VM and would exceed the
-# 4 vCPU BS-family quota. max-surge 0 disables that extra node. AKS requires
-# max-unavailable > 0 when max-surge is 0. Auto-upgrade stays off.
-$pool = az aks nodepool list --resource-group $ResourceGroup --cluster-name $ClusterName --query "[0].name" -o tsv
-Assert-Exit "az aks nodepool list"
-az aks nodepool update --resource-group $ResourceGroup --cluster-name $ClusterName --name $pool --max-surge 0 --max-unavailable 1 --output table
-Assert-Exit "az aks nodepool update --max-surge 0 --max-unavailable 1"
+# max-surge 0 is not possible here: the only pool is a System pool, and AKS
+# rejects max-unavailable > 0 on System pools (InvalidParameter), while surge 0
+# needs max-unavailable > 0. The default is max-surge 10% (1 node) and it only
+# applies during an upgrade. Auto-upgrade is none, so no upgrade and no surge
+# node happens unless someone runs one. Do not run az aks upgrade on this
+# cluster: the surge node would exceed the 4 vCPU BS-family quota.
 az aks update --resource-group $ResourceGroup --name $ClusterName --auto-upgrade-channel none --output table
 Assert-Exit "az aks update --auto-upgrade-channel none"
 
