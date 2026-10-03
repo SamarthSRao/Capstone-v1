@@ -53,7 +53,9 @@ function Assert-Exit {
 
 function Register-OneProvider {
     param([string]$Namespace)
+    $ErrorActionPreference = "Continue"
     $state = az provider show --namespace $Namespace --query registrationState -o tsv 2>$null
+    $ErrorActionPreference = "Stop"
     if ($LASTEXITCODE -ne 0 -or -not $state) {
         $state = "Unknown"
     }
@@ -77,9 +79,9 @@ function Register-OneProvider {
 }
 
 function Invoke-QuotaPreflight {
-    $skuJson = az vm list-skus --location $Location --size $NodeSize -o json
+    $skuJson = az vm list-skus --location $Location --size $NodeSize --resource-type virtualMachines -o json
     Assert-Exit "az vm list-skus"
-    $skus = @($skuJson | ConvertFrom-Json)
+    $skus = @($skuJson | ConvertFrom-Json | ForEach-Object { $_ })
     $sku = $skus | Where-Object { $_.name -eq $NodeSize } | Select-Object -First 1
     if (-not $sku) {
         throw "VM size $NodeSize is not offered in $Location. Student regions: indiasouthcentral, centralindia, eastasia, koreacentral, malaysiawest. Use Standard_B2ms."
@@ -100,7 +102,7 @@ function Invoke-QuotaPreflight {
     $family = [string]$sku.family
     $usageJson = az vm list-usage --location $Location -o json
     Assert-Exit "az vm list-usage"
-    $script:QuotaUsage = @($usageJson | ConvertFrom-Json)
+    $script:QuotaUsage = @($usageJson | ConvertFrom-Json | ForEach-Object { $_ })
 
     function Test-OneQuota {
         param([string]$Name, [int]$Need, [bool]$Fatal)
@@ -162,7 +164,9 @@ Invoke-QuotaPreflight
 
 Write-Host ""
 Write-Host "[4/8] Ensuring resource group $ResourceGroup in $Location..."
+$ErrorActionPreference = "Continue"
 $existingLoc = az group show --name $ResourceGroup --query location -o tsv 2>$null
+$ErrorActionPreference = "Stop"
 if ($LASTEXITCODE -eq 0 -and $existingLoc) {
     $want = ($Location -replace "\s", "").ToLower()
     $got = ($existingLoc -replace "\s", "").ToLower()
@@ -192,7 +196,9 @@ if ($AcrName.Length -lt 5 -or $AcrName.Length -gt 50) {
 $acrAvailable = az acr check-name --name $AcrName --query nameAvailable -o tsv
 Assert-Exit "az acr check-name"
 $acrReason = az acr check-name --name $AcrName --query reason -o tsv
+$ErrorActionPreference = "Continue"
 az acr show --name $AcrName --resource-group $ResourceGroup -o none 2>$null
+$ErrorActionPreference = "Stop"
 $acrInGroup = ($LASTEXITCODE -eq 0)
 if ($acrAvailable -ne "true") {
     if ($acrInGroup) {
@@ -213,11 +219,19 @@ Assert-Exit "az acr show loginServer"
 Write-Host "Registry: $LoginServer"
 
 $root = Split-Path -Parent $PSScriptRoot
+# ACR Tasks (az acr build) is not offered in indiasouthcentral
+# (NoRegisteredProviderFound for registries/listBuildSourceUploadUrl), so build
+# with the local Docker engine and push. az acr login uses a short-lived token,
+# not an interactive login.
+az acr login --name $AcrName
+Assert-Exit "az acr login"
 function Build-Image {
     param([string]$Name, [string]$Context)
     Write-Host "---- building ${LoginServer}/${Name}:latest from $Context"
-    az acr build --registry $AcrName --image "${Name}:latest" (Join-Path $root $Context)
-    Assert-Exit "az acr build $Name"
+    docker build -t "${LoginServer}/${Name}:latest" (Join-Path $root $Context)
+    Assert-Exit "docker build $Name"
+    docker push "${LoginServer}/${Name}:latest"
+    Assert-Exit "docker push $Name"
 }
 Build-Image -Name "target-app" -Context "services/target-app"
 Build-Image -Name "orchestrator" -Context "services/orchestrator"
@@ -226,7 +240,9 @@ Build-Image -Name "predictor" -Context "services/load-predictor"
 
 Write-Host ""
 Write-Host "[6/8] Ensuring AKS cluster $ClusterName (attached to $AcrName)..."
+$ErrorActionPreference = "Continue"
 az aks show --resource-group $ResourceGroup --name $ClusterName -o none 2>$null
+$ErrorActionPreference = "Stop"
 if ($LASTEXITCODE -eq 0) {
     Write-Host "Cluster already exists; attaching ACR in case it was not attached before"
     az aks update --resource-group $ResourceGroup --name $ClusterName --attach-acr $AcrName --output table
@@ -368,7 +384,9 @@ $elapsed = 0
 while ($elapsed -lt 180 -and (-not $websiteIp)) {
     Start-Sleep -Seconds 10
     $elapsed += 10
+    $ErrorActionPreference = "Continue"
     $websiteIp = kubectl get svc nginx-lb -n capstone -o jsonpath="{.status.loadBalancer.ingress[0].ip}" 2>$null
+    $ErrorActionPreference = "Stop"
     Write-Host "Waiting for the nginx-lb IP... (${elapsed}s elapsed)"
 }
 if (-not $websiteIp) { $websiteIp = "Pending" }
