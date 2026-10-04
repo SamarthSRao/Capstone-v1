@@ -18,7 +18,8 @@ spec:
       terminationGracePeriodSeconds: 15
       containers:
         - name: storefront
-          # Applied by deploy/redeploy_ui.ps1 with the ACR image and tag.
+          # Part of the kustomization. deploy/deploy_aks.* build and push
+          # services/ecommerce and rewrite this name to <acr>.azurecr.io/storefront:latest.
           image: capstone/storefront:latest
           imagePullPolicy: IfNotPresent
           ports:
