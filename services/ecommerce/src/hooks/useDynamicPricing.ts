@@ -20,10 +20,10 @@ export function useDynamicPricing(): DynamicPricing {
 
     if (currentRPS > 2000) {
       multiplier = 1.30
-      badgeLabel = '🔥 High Demand +30%'
+      badgeLabel = 'High demand +30%'
     } else if (currentRPS > 1000) {
       multiplier = 1.15
-      badgeLabel = '⚡ Surge Pricing +15%'
+      badgeLabel = 'Surge pricing +15%'
     }
 
     const isHighDemand = multiplier > 1
