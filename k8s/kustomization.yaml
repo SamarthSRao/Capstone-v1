@@ -7,6 +7,9 @@ kind: Kustomization
 # deploy/deploy_aks.sh and deploy/deploy_aks.ps1. Load generators are
 # applied separately (k8s/06-loadgen-job.yaml, k8s/07-nasa-replay-job.yaml)
 # so a deploy does not start traffic.
+# 08-storefront.yaml is the static NexusGear page (capstone/storefront:latest,
+# built from services/ecommerce). The nginx-lb config in 02-target-app.yaml has
+# a `storefront` upstream, so it must be deployed with it.
 resources:
   - 00-namespace.yaml
   - 01-rbac.yaml
@@ -14,3 +17,4 @@ resources:
   - 03-predictor.yaml
   - 04-orchestrator.yaml
   - 05-dashboard.yaml
+  - 08-storefront.yaml

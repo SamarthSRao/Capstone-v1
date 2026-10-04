@@ -4,13 +4,15 @@ One path shows the same loop on Azure Kubernetes Service and on a local kind or 
 
 traffic rises, the forecast mean moves ahead of live RPS, pods scale up before that live rate crosses what the current pods can serve, then pods step down after the spike instead of dropping to one replica in a single tick.
 
-Do not point this at a production subscription. The scripts create a resource group, a Basic container registry, and a small AKS cluster. They were not executed against Azure in the change that added them.
+Do not point this at a production subscription. The scripts create a resource group, a Basic container registry, and a small AKS cluster.
+
+Status: `deploy/deploy_aks.ps1` was run end to end against the student subscription in `indiasouthcentral` on 3 October 2026 (seven runs; the failures it hit are listed under "What failed on Azure" below, and each one is fixed in the script). The storefront build and apply in both scripts reproduces the manual UI redeploy that was done on that cluster afterwards; the scripts themselves have not been run end to end with the storefront step, and `deploy/deploy_aks.sh` has been syntax-checked (`bash -n`) but not run.
 
 ## What you are showing
 
 | Piece | Where |
 |---|---|
-| Target storefront | `target-app` behind `nginx-lb:8090` |
+| Target storefront | `target-app` behind `nginx-lb:8090`. A browser (`Accept: text/html`) asking for `/` gets the NexusGear page from the static `storefront` pod; API calls, `/health`, `/metrics` and all load-generator traffic still go to `target-app` |
 | Forecast | Python predictor, gRPC `:50051` |
 | Replica decision | Go orchestrator, `:8082` `/api/target/status` |
 | Dashboard | Same public IP as nginx-lb, port 80. The Service is ClusterIP. `stub_status` is `nginx-metrics:8091` (not on the LoadBalancer) |
@@ -37,7 +39,7 @@ The original LSTM was trained on hourly samples and is served 24 seconds of live
 
 ## 1. Azure (AKS)
 
-Prerequisites on the machine you deploy from: Azure CLI (`az`), `kubectl`, and Python 3 (the bash quota check). `az login` with the student subscription selected. Docker is not required; `az acr build` builds in Azure.
+Prerequisites on the machine you deploy from: Azure CLI (`az`), `kubectl`, **Docker running**, and Python 3 (the bash quota check). `az login` with the student subscription selected. The images are built with the local Docker engine and pushed with `az acr login` + `docker push`; `az acr build` (ACR Tasks) is **not** used because ACR Tasks is not available in `indiasouthcentral` (`NoRegisteredProviderFound` for `registries/listBuildSourceUploadUrl`).
 
 ```bash
 az login
@@ -47,7 +49,7 @@ az account show --output table
 
 Quota check, registry, cluster, push, apply. This subscription (Azure for Students) may deploy only in `indiasouthcentral`, `centralindia`, `eastasia`, `koreacentral`, and `malaysiawest`. Each of those regions has **6 regional vCPUs** and **4 vCPUs of the Standard BS family**.
 
-The default is **two** `Standard_B2ms` nodes (2 vCPU and 8 GiB each). That is the whole BS-family quota, so the cluster is fixed at 2 nodes: no cluster autoscaler, auto-upgrade channel `none`, node-pool `--max-surge 0` with `--max-unavailable 1`. AKS rejects a node pool whose max surge is 0 unless max unavailable is greater than 0. A surge node would be a third VM (6 vCPU of BS family) and Azure would deny it. Two nodes are started up front so the target-app range is schedulable without waiting for a scale-out that quota will not allow.
+The default is **two** `Standard_B2ms` nodes (2 vCPU and 8 GiB each). That is the whole BS-family quota, so the cluster is fixed at 2 nodes: no cluster autoscaler, auto-upgrade channel `none` (set by `az aks create`). The node-pool surge settings are left at the AKS default. Max surge 0 cannot be set here: the only pool is a System pool, AKS rejects `--max-unavailable` above 0 on System pools (`InvalidParameter`), and surge 0 needs it. The default 10% surge only matters during an upgrade, which never runs. **Do not run `az aks upgrade` (or `az aks nodepool upgrade`) on this cluster:** the surge node would be a third VM (6 vCPU of BS family) and the 4 vCPU quota would deny it. Two nodes are started up front so the target-app range is schedulable without waiting for a scale-out that quota will not allow.
 
 `Standard_B2s` is the same 2 vCPU and the same BS quota, but only **4 GiB** of RAM. After kube reserves memory, allocatable is under 3 GiB, which does not leave room for system pods and the predictor (the image is on the order of 4 GB, and the pod limit is 1536Mi). Use `Standard_B2ms`. It spends the same 2 vCPU of BS-family quota per node.
 
@@ -57,7 +59,7 @@ Memory on two `Standard_B2ms` nodes is about **6 GB allocatable per node** (abou
 
 The script runs `az provider show` for `Microsoft.Compute`, `Microsoft.Network`, `Microsoft.ContainerRegistry`, and `Microsoft.ContainerService`, and `az vm list-usage` / `az vm list-skus` before it creates anything. It also runs `az acr check-name` so a registry name that already exists in another subscription fails before the build.
 
-Cost: two B2ms nodes for as long as the resource group exists. Delete it when the demo is over. There is no separate "stop the cluster and keep the quota" path that frees the 4 vCPUs; the nodes have to go.
+Cost: two B2ms nodes for as long as they are running. Delete the resource group when the demo is over (below). To pause without deleting, see "Pause and resume" below.
 
 ```bash
 chmod +x deploy/deploy_aks.sh deploy/load_gen.sh
@@ -80,7 +82,22 @@ Overrides, bash then PowerShell:
 .\deploy\deploy_aks.ps1 -ResourceGroup capstone-rg -Location centralindia -ClusterName capstone-aks -NodeSize Standard_B2ms -NodeCount 2
 ```
 
-The script refuses to continue when the size is not offered, when the size is restricted in that region, when the family or regional vCPU quota cannot fit the two nodes, or when the ACR name is already taken outside this resource group.
+The script refuses to continue when Docker is not running, when the size is not offered, when the size is restricted in that region, when the family or regional vCPU quota cannot fit the two nodes, or when the ACR name is already taken outside this resource group. When the cluster already exists (a re-run) the quota preflight is skipped, because the existing nodes already use the quota and the check would fail against itself.
+
+It builds and pushes **five** images (`target-app`, `orchestrator`, `dashboard`, `predictor`, `storefront` from `services/ecommerce`), then applies `k8s/` through a generated overlay. `k8s/` includes `08-storefront.yaml` (the static NexusGear page) and the nginx-lb config in `02-target-app.yaml` that sends browser page loads to it. The success banner is printed only when the `nginx-lb`, `storefront`, `dashboard`, `orchestrator` and `target-app` rollouts finished and the address exists; otherwise it says the stack was applied but is not fully ready. Re-run the script to continue (it is safe to repeat).
+
+### What failed on Azure, and the fix in the scripts
+
+| Failure seen on 3 October 2026 | Fix |
+|---|---|
+| Windows PowerShell 5.1: probe commands that are allowed to fail (`az ... show`) aborted the script under `$ErrorActionPreference = "Stop"`, and `ConvertFrom-Json` arrays were not enumerated | Probes run with `Continue` and are checked by exit code; JSON arrays are enumerated explicitly; `az vm list-skus` is limited to `--resource-type virtualMachines` |
+| `az acr build`: ACR Tasks unavailable in `indiasouthcentral` | `az acr login` + `docker build` + `docker push` (both scripts) |
+| `az aks nodepool update --max-surge 0 --max-unavailable 1` rejected on a System pool | Step removed; do not upgrade the cluster |
+| Quota preflight failed on a re-run because the existing nodes use the quota | Preflight skipped when the cluster exists |
+| `az aks update --auto-upgrade-channel none` prompted y/n (`NoTTYException`) | Step removed; `az aks create` already sets `none` |
+| The storefront page was the Vite dev server image, and nginx-lb had no route for it | Static nginx image, `08-storefront.yaml`, nginx-lb routing by `Accept` header (see the UI redesign commit) |
+
+Do not run `az aks upgrade`; it is not part of this flow (see the surge note above).
 
 Tear down (cluster, registry, load balancers, and the public IPs):
 
@@ -92,12 +109,23 @@ az group delete --name capstone-rg --yes --no-wait
 az group delete --name capstone-rg --yes --no-wait
 ```
 
+### Pause and resume (`az aks stop` / `az aks start`)
+
+To stop paying for the two node VMs between sessions without deleting anything:
+
+```bash
+az aks stop  --resource-group capstone-rg --name capstone-aks
+az aks start --resource-group capstone-rg --name capstone-aks
+```
+
+`stop` deallocates the nodes; the resource group, the registry and its images, and the cluster definition stay. `start` brings the nodes back; give the predictor several minutes to load its model, then check `kubectl -n capstone get pods` and read the address again with `kubectl -n capstone get svc nginx-lb` (do not assume it is unchanged). The registry (Basic) and any disks or public IPs that remain are still billed while stopped; only `az group delete` stops all charges. `az aks stop` and `start` have **not** been run on this cluster in this project, so the exact behaviour of the nginx-lb address after a restart is not recorded here. After a long stop, run `az aks get-credentials --resource-group capstone-rg --name capstone-aks --overwrite-existing` if kubectl cannot reach the cluster.
+
 Azure for Students allows **3 Standard public IPs** in the region. AKS keeps one for the cluster outbound address. This stack creates **one** LoadBalancer Service (`nginx-lb`), so the inbound address is the second IP, not a third. The dashboard Service is ClusterIP. nginx proxies port 80 to it and keeps the storefront on port 8090.
 
 When it finishes, note the one address it prints:
 
 ```text
-Target app (nginx):   http://<NGINX-IP>:8090
+Storefront (browser): http://<NGINX-IP>:8090
 Autoscaler dashboard: http://<NGINX-IP>
 ```
 
@@ -155,10 +183,12 @@ docker build -t capstone/target-app:latest services/target-app
 docker build -t capstone/orchestrator:latest services/orchestrator
 docker build -t capstone/predictor:latest services/load-predictor
 docker build -t capstone/dashboard:latest services/dashboard
+docker build -t capstone/storefront:latest services/ecommerce
 kind load docker-image capstone/target-app:latest --name capstone
 kind load docker-image capstone/orchestrator:latest --name capstone
 kind load docker-image capstone/predictor:latest --name capstone
 kind load docker-image capstone/dashboard:latest --name capstone
+kind load docker-image capstone/storefront:latest --name capstone
 kubectl apply -k k8s
 kubectl -n capstone rollout status deployment/predictor --timeout=300s
 kubectl -n capstone rollout status deployment/orchestrator --timeout=180s
@@ -188,6 +218,7 @@ docker build -t capstone/target-app:latest services/target-app
 docker build -t capstone/orchestrator:latest services/orchestrator
 docker build -t capstone/predictor:latest services/load-predictor
 docker build -t capstone/dashboard:latest services/dashboard
+docker build -t capstone/storefront:latest services/ecommerce
 kubectl apply -k k8s
 kubectl -n capstone rollout status deployment/predictor --timeout=300s
 minikube service -n capstone nginx-lb --url

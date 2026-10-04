@@ -7,11 +7,27 @@
       2. Register Container Service, Container Registry, Network, and Compute providers
       3. Preflight VM quota and whether the size exists in the region
       4. Create the resource group
-      5. Create an Azure Container Registry, build, and push the four app images
+      5. Create an Azure Container Registry, build the five app images with
+         the local Docker engine (target-app, orchestrator, dashboard,
+         predictor, storefront) and push them (az acr login + docker push)
       6. Create AKS (or reuse it) and attach that registry
-      7. Apply k8s/ with images rewritten to <acr>.azurecr.io/<name>:latest
+      7. Apply k8s/ with images rewritten to <acr>.azurecr.io/<name>:latest.
+         k8s/ includes the NexusGear storefront (08-storefront.yaml) and the
+         nginx-lb config that routes browser page loads to it.
       8. Print the LoadBalancer address (one public IP: dashboard on port 80,
-         storefront on port 8090)
+         storefront on port 8090). The success banner is printed only when
+         every rollout finished and the address exists.
+
+    Docker must be running on the machine that runs this script: ACR Tasks
+    (az acr build) is not available in indiasouthcentral.
+
+    The cluster already exists on a re-run: the quota preflight is skipped
+    then, and no az aks update --auto-upgrade-channel is issued (az aks create
+    already sets it to none, and re-running it prompts y/n).
+
+    Cost control without deleting: az aks stop / az aks start (see
+    docs/DEMO_AKS.md). Stopping releases the VMs but the registry, the
+    cluster object, and the public IP address keep existing.
 
     Azure for Students on this subscription allows only these regions:
     indiasouthcentral, centralindia, eastasia, koreacentral, malaysiawest.
@@ -20,8 +36,9 @@
 
     Standard_B2s is 4 GiB and does not fit the predictor next to system pods.
     The default is Standard_B2ms (2 vCPU, 8 GiB, same BS family). The cluster
-    is a fixed 2 nodes: no cluster autoscaler, auto-upgrade none, max surge 0,
-    max unavailable 1 (AKS rejects maxSurge 0 unless maxUnavailable is > 0).
+    is a fixed 2 nodes: no cluster autoscaler, auto-upgrade none. Surge 0 is not
+    settable on the System pool (AKS: max unavailable must be 0), so the default
+    10% surge stays; it only matters during an upgrade, which never runs.
 
     Tear down when the demo is over:
       az group delete --name capstone-rg --yes --no-wait
@@ -53,7 +70,9 @@ function Assert-Exit {
 
 function Register-OneProvider {
     param([string]$Namespace)
+    $ErrorActionPreference = "Continue"
     $state = az provider show --namespace $Namespace --query registrationState -o tsv 2>$null
+    $ErrorActionPreference = "Stop"
     if ($LASTEXITCODE -ne 0 -or -not $state) {
         $state = "Unknown"
     }
@@ -77,9 +96,9 @@ function Register-OneProvider {
 }
 
 function Invoke-QuotaPreflight {
-    $skuJson = az vm list-skus --location $Location --size $NodeSize -o json
+    $skuJson = az vm list-skus --location $Location --size $NodeSize --resource-type virtualMachines -o json
     Assert-Exit "az vm list-skus"
-    $skus = @($skuJson | ConvertFrom-Json)
+    $skus = @($skuJson | ConvertFrom-Json | ForEach-Object { $_ })
     $sku = $skus | Where-Object { $_.name -eq $NodeSize } | Select-Object -First 1
     if (-not $sku) {
         throw "VM size $NodeSize is not offered in $Location. Student regions: indiasouthcentral, centralindia, eastasia, koreacentral, malaysiawest. Use Standard_B2ms."
@@ -100,7 +119,7 @@ function Invoke-QuotaPreflight {
     $family = [string]$sku.family
     $usageJson = az vm list-usage --location $Location -o json
     Assert-Exit "az vm list-usage"
-    $script:QuotaUsage = @($usageJson | ConvertFrom-Json)
+    $script:QuotaUsage = @($usageJson | ConvertFrom-Json | ForEach-Object { $_ })
 
     function Test-OneQuota {
         param([string]$Name, [int]$Need, [bool]$Fatal)
@@ -133,7 +152,7 @@ Write-Host "=========================================================="
 Write-Host "Resource group: $ResourceGroup"
 Write-Host "Location:       $Location"
 Write-Host "Cluster:        $ClusterName"
-Write-Host "Node size:      $NodeSize  (fixed count $NodeCount, max surge 0, max unavailable 1, no autoscaler)"
+Write-Host "Node size:      $NodeSize  (fixed count $NodeCount, no autoscaler, auto-upgrade none)"
 $allowed = @("indiasouthcentral", "centralindia", "eastasia", "koreacentral", "malaysiawest")
 if ($allowed -notcontains $Location) {
     Write-Host "WARNING: $Location is not one of the regions this student subscription allows:"
@@ -149,6 +168,14 @@ Write-Host "[1/8] Checking Azure CLI login..."
 az account show --output table
 Assert-Exit "az account show"
 
+$ErrorActionPreference = "Continue"
+docker info *> $null
+$dockerOk = ($LASTEXITCODE -eq 0)
+$ErrorActionPreference = "Stop"
+if (-not $dockerOk) {
+    throw "Docker is not running. Start Docker Desktop: images are built locally because ACR Tasks is not available in $Location."
+}
+
 Write-Host ""
 Write-Host "[2/8] Registering resource providers (no-op if already Registered)..."
 Register-OneProvider -Namespace "Microsoft.Compute"
@@ -158,11 +185,21 @@ Register-OneProvider -Namespace "Microsoft.ContainerService"
 
 Write-Host ""
 Write-Host "[3/8] Preflight: VM size and vCPU quota in $Location..."
-Invoke-QuotaPreflight
+$ErrorActionPreference = "Continue"
+az aks show --resource-group $ResourceGroup --name $ClusterName -o none 2>$null
+$clusterExists = ($LASTEXITCODE -eq 0)
+$ErrorActionPreference = "Stop"
+if ($clusterExists) {
+    Write-Host "Cluster $ClusterName already exists; skipping the quota preflight (its nodes already use the quota)."
+} else {
+    Invoke-QuotaPreflight
+}
 
 Write-Host ""
 Write-Host "[4/8] Ensuring resource group $ResourceGroup in $Location..."
+$ErrorActionPreference = "Continue"
 $existingLoc = az group show --name $ResourceGroup --query location -o tsv 2>$null
+$ErrorActionPreference = "Stop"
 if ($LASTEXITCODE -eq 0 -and $existingLoc) {
     $want = ($Location -replace "\s", "").ToLower()
     $got = ($existingLoc -replace "\s", "").ToLower()
@@ -192,7 +229,9 @@ if ($AcrName.Length -lt 5 -or $AcrName.Length -gt 50) {
 $acrAvailable = az acr check-name --name $AcrName --query nameAvailable -o tsv
 Assert-Exit "az acr check-name"
 $acrReason = az acr check-name --name $AcrName --query reason -o tsv
+$ErrorActionPreference = "Continue"
 az acr show --name $AcrName --resource-group $ResourceGroup -o none 2>$null
+$ErrorActionPreference = "Stop"
 $acrInGroup = ($LASTEXITCODE -eq 0)
 if ($acrAvailable -ne "true") {
     if ($acrInGroup) {
@@ -213,20 +252,33 @@ Assert-Exit "az acr show loginServer"
 Write-Host "Registry: $LoginServer"
 
 $root = Split-Path -Parent $PSScriptRoot
+# ACR Tasks (az acr build) is not offered in indiasouthcentral
+# (NoRegisteredProviderFound for registries/listBuildSourceUploadUrl), so build
+# with the local Docker engine and push. az acr login uses a short-lived token,
+# not an interactive login.
+az acr login --name $AcrName
+Assert-Exit "az acr login"
 function Build-Image {
     param([string]$Name, [string]$Context)
     Write-Host "---- building ${LoginServer}/${Name}:latest from $Context"
-    az acr build --registry $AcrName --image "${Name}:latest" (Join-Path $root $Context)
-    Assert-Exit "az acr build $Name"
+    docker build -t "${LoginServer}/${Name}:latest" (Join-Path $root $Context)
+    Assert-Exit "docker build $Name"
+    docker push "${LoginServer}/${Name}:latest"
+    Assert-Exit "docker push $Name"
 }
 Build-Image -Name "target-app" -Context "services/target-app"
 Build-Image -Name "orchestrator" -Context "services/orchestrator"
 Build-Image -Name "dashboard" -Context "services/dashboard"
 Build-Image -Name "predictor" -Context "services/load-predictor"
+# NexusGear storefront: a static nginx image (see services/ecommerce/Dockerfile)
+# that nginx-lb serves to browsers. k8s/08-storefront.yaml references it.
+Build-Image -Name "storefront" -Context "services/ecommerce"
 
 Write-Host ""
 Write-Host "[6/8] Ensuring AKS cluster $ClusterName (attached to $AcrName)..."
+$ErrorActionPreference = "Continue"
 az aks show --resource-group $ResourceGroup --name $ClusterName -o none 2>$null
+$ErrorActionPreference = "Stop"
 if ($LASTEXITCODE -eq 0) {
     Write-Host "Cluster already exists; attaching ACR in case it was not attached before"
     az aks update --resource-group $ResourceGroup --name $ClusterName --attach-acr $AcrName --output table
@@ -245,15 +297,14 @@ if ($LASTEXITCODE -eq 0) {
         --output table
     Assert-Exit "az aks create"
 }
-# A surge node during an upgrade would be a third VM and would exceed the
-# 4 vCPU BS-family quota. max-surge 0 disables that extra node. AKS requires
-# max-unavailable > 0 when max-surge is 0. Auto-upgrade stays off.
-$pool = az aks nodepool list --resource-group $ResourceGroup --cluster-name $ClusterName --query "[0].name" -o tsv
-Assert-Exit "az aks nodepool list"
-az aks nodepool update --resource-group $ResourceGroup --cluster-name $ClusterName --name $pool --max-surge 0 --max-unavailable 1 --output table
-Assert-Exit "az aks nodepool update --max-surge 0 --max-unavailable 1"
-az aks update --resource-group $ResourceGroup --name $ClusterName --auto-upgrade-channel none --output table
-Assert-Exit "az aks update --auto-upgrade-channel none"
+# max-surge 0 is not possible here: the only pool is a System pool, and AKS
+# rejects max-unavailable > 0 on System pools (InvalidParameter), while surge 0
+# needs max-unavailable > 0. The default is max-surge 10% (1 node) and it only
+# applies during an upgrade. Auto-upgrade is none, so no upgrade and no surge
+# node happens unless someone runs one. Do not run az aks upgrade on this
+# cluster: the surge node would exceed the 4 vCPU BS-family quota.
+# auto-upgrade-channel none is already set by az aks create. Re-running
+# az aks update --auto-upgrade-channel none prompts y/n (NoTTYException), so it is not repeated.
 
 Write-Host ""
 Write-Host "[7/8] Configuring kubectl and applying manifests..."
@@ -282,6 +333,9 @@ images:
     newTag: latest
   - name: capstone/dashboard
     newName: $LoginServer/dashboard
+    newTag: latest
+  - name: capstone/storefront
+    newName: $LoginServer/storefront
     newTag: latest
 patches:
   - target:
@@ -344,6 +398,21 @@ patches:
             containers:
               - name: dashboard
                 imagePullPolicy: Always
+  - target:
+      kind: Deployment
+      name: storefront
+    patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: storefront
+        namespace: capstone
+      spec:
+        template:
+          spec:
+            containers:
+              - name: storefront
+                imagePullPolicy: Always
 "@
 Set-Content -Path (Join-Path $overlay "kustomization.yaml") -Value $kustomize -Encoding Ascii
 try {
@@ -356,29 +425,47 @@ try {
 }
 
 Write-Host ""
-Write-Host "[8/8] Waiting for the nginx-lb LoadBalancer address (up to 3 minutes)..."
+Write-Host "[8/8] Waiting for the rollouts and the nginx-lb LoadBalancer address (up to 3 minutes each)..."
 Write-Host "The dashboard is ClusterIP. It is served on this same IP, port 80."
-kubectl -n capstone rollout status deployment/nginx-lb --timeout=180s
-if ($LASTEXITCODE -ne 0) { Write-Host "nginx-lb rollout still in progress" }
-kubectl -n capstone rollout status deployment/dashboard --timeout=180s
-if ($LASTEXITCODE -ne 0) { Write-Host "dashboard rollout still in progress" }
+$rolloutsOk = $true
+foreach ($d in @("nginx-lb", "storefront", "dashboard", "orchestrator", "target-app")) {
+    kubectl -n capstone rollout status deployment/$d --timeout=180s
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "WARNING: deployment/$d is not ready yet" -ForegroundColor Yellow
+        $rolloutsOk = $false
+    }
+}
+# The predictor loads a large model and is slow; it is reported but does not
+# hold back the address.
+kubectl -n capstone rollout status deployment/predictor --timeout=60s
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "NOTE: predictor is still starting (model load can take several minutes)"
+}
 
 $websiteIp = ""
 $elapsed = 0
 while ($elapsed -lt 180 -and (-not $websiteIp)) {
     Start-Sleep -Seconds 10
     $elapsed += 10
+    $ErrorActionPreference = "Continue"
     $websiteIp = kubectl get svc nginx-lb -n capstone -o jsonpath="{.status.loadBalancer.ingress[0].ip}" 2>$null
+    $ErrorActionPreference = "Stop"
     Write-Host "Waiting for the nginx-lb IP... (${elapsed}s elapsed)"
 }
 if (-not $websiteIp) { $websiteIp = "Pending" }
 
 Write-Host ""
 Write-Host "=========================================================="
-Write-Host " Capstone stack applied to AKS"
+if ($rolloutsOk -and $websiteIp -ne "Pending") {
+    Write-Host " Capstone stack applied to AKS and rollouts are complete"
+} else {
+    Write-Host " Capstone stack APPLIED to AKS, but it is NOT fully ready yet" -ForegroundColor Yellow
+    Write-Host " (a rollout is unfinished or the address is still Pending)."
+    Write-Host " Check: kubectl -n capstone get pods ; kubectl -n capstone get svc nginx-lb"
+}
 Write-Host "=========================================================="
 Write-Host ""
-Write-Host "  Target app (nginx):   http://${websiteIp}:8090"
+Write-Host "  Storefront (browser): http://${websiteIp}:8090"
 Write-Host "  Autoscaler dashboard: http://${websiteIp}"
 Write-Host "  Registry:             $LoginServer"
 Write-Host ""
