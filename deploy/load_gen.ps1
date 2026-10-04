@@ -51,7 +51,7 @@ if ($Url) {
         while ((Get-Date) -lt $deadline) {
             $procs = @()
             for ($i = 0; $i -lt $Parallel; $i++) {
-                $procs += Start-Process -FilePath "curl.exe" -ArgumentList @("-s", "-o", "NUL", "--max-time", "5", $target) -WindowStyle Hidden -PassThru
+                $procs += Start-Process -FilePath "curl.exe" -ArgumentList @("-s", "-o", "NUL", "-H", "X-Load-Test: 1", "--max-time", "5", $target) -WindowStyle Hidden -PassThru
             }
             foreach ($proc in $procs) {
                 if (-not $proc.HasExited) {
