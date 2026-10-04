@@ -21,7 +21,8 @@ class Browser(HttpUser):
 
     @task
     def home(self):
-        self.client.get("/")
+        # X-Load-Test keeps this out of the real-visitor count.
+        self.client.get("/", headers={"X-Load-Test": "1"})
 
 
 class DemoShape(LoadTestShape):

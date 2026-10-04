@@ -30,6 +30,11 @@ import time
 from urllib.parse import urlsplit
 
 
+# X-Load-Test marks this traffic as generated. nginx-lb and the orchestrator
+# leave it out of the "real visitors" count (services/orchestrator/visitors.go).
+REQUEST_HEADERS = {"Connection": "keep-alive", "X-Load-Test": "1"}
+
+
 def load_rps(path):
     values = []
     with open(path, newline="") as handle:
@@ -112,7 +117,7 @@ class _Pool:
         )
 
     def _fetch(self, conn):
-        conn.request("GET", self.path, headers={"Connection": "keep-alive"})
+        conn.request("GET", self.path, headers=REQUEST_HEADERS)
         response = conn.getresponse()
         response.read()
         return 200 <= response.status < 400

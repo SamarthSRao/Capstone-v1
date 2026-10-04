@@ -28,6 +28,20 @@ data:
             ''      close;
         }
 
+        # Real-visitor counting. 1 only for a GET of "/" that asks for HTML
+        # and does not carry X-Load-Test. In a mirror subrequest $uri is the
+        # mirror location, so the original $request_uri is matched. The
+        # orchestrator applies the same rule again (services/orchestrator/
+        # visitors.go) and also drops known bots and probes by user agent.
+        map "$request_method|$request_uri|$http_x_load_test|$http_accept" $count_visit {
+            default 0;
+            "~*^GET\|/(\?[^|]*)?\|\|[^|]*text/html" 1;
+        }
+        upstream orchestrator_visits {
+            server orchestrator:8082;
+            keepalive 4;
+        }
+
         upstream target_backend {
             least_conn;
             server target-app:8080 max_fails=3 fail_timeout=5s;
@@ -40,6 +54,35 @@ data:
 
         server {
             listen 8090;
+            # Fire-and-forget copy of every request to /_visit, which drops
+            # all but browser page loads of "/". The client never waits for it
+            # and a failing orchestrator does not affect the storefront.
+            mirror /_visit;
+            mirror_request_body off;
+            location = /_visit {
+                internal;
+                if ($count_visit = 0) {
+                    return 204;
+                }
+                # The page's query string (utm_source=...) is not sent on.
+                set $args "";
+                proxy_pass http://orchestrator_visits/api/target/visit;
+                proxy_method POST;
+                proxy_http_version 1.1;
+                proxy_set_header Connection "";
+                proxy_pass_request_body off;
+                proxy_set_header Content-Length "";
+                # The address nginx-lb saw. Not X-Forwarded-For: that header
+                # is client-controlled. Cookies and credentials are not passed.
+                proxy_set_header X-Visitor-IP $remote_addr;
+                proxy_set_header X-Orig-Method $request_method;
+                proxy_set_header X-Orig-URI $request_uri;
+                proxy_set_header X-Forwarded-For "";
+                proxy_set_header Cookie "";
+                proxy_set_header Authorization "";
+                proxy_connect_timeout 1s;
+                proxy_read_timeout 2s;
+            }
             location = /healthz {
                 access_log off;
                 default_type text/plain;
@@ -244,6 +287,10 @@ metadata:
   namespace: capstone
 spec:
   type: LoadBalancer
+  # Keep the visitor's real address. With the default (Cluster) the Azure
+  # load balancer's traffic is source-NATed by kube-proxy and nginx-lb sees a
+  # node or pod address, so every visitor would look like one address.
+  externalTrafficPolicy: Local
   selector:
     app: nginx-lb
   ports:

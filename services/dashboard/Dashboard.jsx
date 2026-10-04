@@ -1,5 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import {
+  Bar,
+  BarChart,
   CartesianGrid,
   ComposedChart,
   Legend,
@@ -17,6 +19,11 @@ import {
   fmtRps,
   mapStatus,
 } from './statusView';
+import {
+  VISITORS_REFRESH_MS,
+  mapVisitors,
+  visitorsDetail,
+} from './visitorsView';
 
 const SIMULATOR_URL = import.meta.env.VITE_SIMULATOR_URL || '';
 const ORCHESTRATOR_URL = (
@@ -24,6 +31,15 @@ const ORCHESTRATOR_URL = (
 ).replace(/\/$/, '');
 
 const STATUS_PATH = `${ORCHESTRATOR_URL}/api/target/status`;
+const VISITORS_PATH = `${ORCHESTRATOR_URL}/api/target/visitors`;
+
+async function fetchVisitors() {
+  const response = await fetch(VISITORS_PATH, { cache: 'no-store' });
+  if (!response.ok) throw new Error(`visitors HTTP ${response.status}`);
+  const view = mapVisitors(await response.json());
+  if (!view) throw new Error('visitors response not usable');
+  return view;
+}
 
 async function fetchTelemetry() {
   if (ORCHESTRATOR_URL) {
@@ -101,6 +117,21 @@ function ChartTooltip({ active, payload, label }) {
   );
 }
 
+function VisitorTooltip({ active, payload, label }) {
+  if (!active || !payload?.length) return null;
+  return (
+    <div className="rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs shadow-console">
+      <div className="mb-1 text-slate-500">{label}</div>
+      {payload.map((item) => (
+        <div key={item.dataKey} className="flex items-center justify-between gap-4">
+          <span className="text-slate-600">{item.name}</span>
+          <span className="font-medium tabular-nums text-slate-900">{item.value}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 function ruleChip(rule, scaling) {
   if (scaling === 'up') return 'Scale up';
   if (scaling === 'down') return 'Scale down';
@@ -114,6 +145,8 @@ export default function Dashboard() {
   const [events, setEvents] = useState([]);
   const [selectedDataset, setSelectedDataset] = useState('flash_sale');
   const [simStatus, setSimStatus] = useState('IDLE');
+  const [visitors, setVisitors] = useState(null);
+  const [visitorsLink, setVisitorsLink] = useState('loading');
 
   useEffect(() => {
     let mounted = true;
@@ -145,6 +178,27 @@ export default function Dashboard() {
 
     poll();
     const interval = setInterval(poll, 1000);
+    return () => {
+      mounted = false;
+      clearInterval(interval);
+    };
+  }, []);
+
+  useEffect(() => {
+    let mounted = true;
+    const load = async () => {
+      try {
+        const next = await fetchVisitors();
+        if (!mounted) return;
+        setVisitors(next);
+        setVisitorsLink('ok');
+      } catch (error) {
+        console.warn('[Dashboard] visitors unavailable', error);
+        if (mounted) setVisitorsLink('unavailable');
+      }
+    };
+    load();
+    const interval = setInterval(load, VISITORS_REFRESH_MS);
     return () => {
       mounted = false;
       clearInterval(interval);
@@ -197,9 +251,9 @@ export default function Dashboard() {
                 detail={`Desired ${view.desiredReplicas}`}
               />
               <MetricCard
-                label="Live RPS"
+                label="Total traffic (RPS, includes replay)"
                 value={fmtRps(view.liveRps)}
-                detail="Requests per second"
+                detail="All requests: replay, API and page loads"
               />
               <MetricCard
                 label="Forecast mean"
@@ -233,14 +287,16 @@ export default function Dashboard() {
               />
             </section>
 
-            <section className="rounded-xl border border-slate-200 bg-white p-5 shadow-console">
+            <div className="grid grid-cols-1 gap-3 lg:grid-cols-3">
+            <section className="rounded-xl border border-slate-200 bg-white p-5 shadow-console lg:col-span-2">
               <div className="mb-4 flex flex-wrap items-end justify-between gap-3">
                 <div>
                   <h2 className="text-sm font-semibold text-slate-900">
-                    Forecast, actual, and capacity
+                    Total traffic (RPS, includes replay)
                   </h2>
                   <p className="mt-0.5 text-xs text-slate-500">
-                    Requests per second. The dashed indigo line is the published upper bound.
+                    Forecast, actual, and capacity. Every request counts here, including the
+                    replay Job. The dashed indigo line is the published upper bound.
                   </p>
                 </div>
               </div>
@@ -320,6 +376,81 @@ export default function Dashboard() {
                 )}
               </div>
             </section>
+
+            <section className="rounded-xl border border-slate-200 bg-white p-5 shadow-console">
+              <h2 className="text-sm font-semibold text-slate-900">
+                Real visitors (page loads)
+              </h2>
+              <p className="mt-0.5 text-xs text-slate-500">
+                People who opened the storefront in a browser. The replay Job, API calls and
+                health checks are not counted.
+              </p>
+              <div className="mt-4">
+                <MetricCard
+                  label="Real visitors (page loads)"
+                  value={
+                    visitors
+                      ? visitors.totalUnique.toLocaleString()
+                      : visitorsLink === 'loading'
+                        ? '…'
+                        : '—'
+                  }
+                  detail={
+                    visitorsLink === 'unavailable' && !visitors
+                      ? 'Unavailable'
+                      : visitors
+                        ? `Unique visitors. ${visitorsDetail(visitors)}`
+                        : 'Loading'
+                  }
+                />
+              </div>
+              <div className="mt-4 h-44 w-full">
+                {visitors ? (
+                  <ResponsiveContainer width="100%" height="100%">
+                    <BarChart data={visitors.series} margin={{ top: 8, right: 8, left: 0, bottom: 0 }}>
+                      <CartesianGrid stroke="#eef0f3" vertical={false} />
+                      <XAxis
+                        dataKey="time"
+                        tick={{ fontSize: 11, fill: '#64748b' }}
+                        tickLine={false}
+                        axisLine={false}
+                        minTickGap={32}
+                      />
+                      <YAxis
+                        allowDecimals={false}
+                        tick={{ fontSize: 11, fill: '#64748b' }}
+                        tickLine={false}
+                        axisLine={false}
+                        width={32}
+                      />
+                      <Tooltip content={<VisitorTooltip />} />
+                      <Bar
+                        dataKey="pageviews"
+                        name="Page loads"
+                        fill="#4f46e5"
+                        radius={[2, 2, 0, 0]}
+                        isAnimationActive={false}
+                      />
+                      <Bar
+                        dataKey="newUnique"
+                        name="New visitors"
+                        fill="#94a3b8"
+                        radius={[2, 2, 0, 0]}
+                        isAnimationActive={false}
+                      />
+                    </BarChart>
+                  </ResponsiveContainer>
+                ) : (
+                  <div className="flex h-full items-center justify-center text-sm text-slate-500">
+                    {visitorsLink === 'unavailable' ? 'Visitor counts unavailable' : 'Loading'}
+                  </div>
+                )}
+              </div>
+              <p className="mt-2 text-xs text-slate-500">
+                Page loads per minute, last 60 minutes. Counts reset when the orchestrator restarts.
+              </p>
+            </section>
+            </div>
 
             <div className="grid grid-cols-1 gap-3 lg:grid-cols-5">
               <section className="rounded-xl border border-slate-200 bg-white p-5 shadow-console lg:col-span-3">
