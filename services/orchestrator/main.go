@@ -802,6 +802,10 @@ func main() {
 		json.NewEncoder(w).Encode(targetStatus)
 	})
 
+	// Real storefront visitors: nginx-lb mirrors browser page loads to
+	// POST /api/target/visit, the dashboard reads GET /api/target/visitors.
+	registerVisitorRoutes(http.DefaultServeMux, newVisitorCounter())
+
 	http.HandleFunc("/scale", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Only POST allowed", http.StatusMethodNotAllowed)
