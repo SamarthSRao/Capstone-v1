@@ -241,6 +241,31 @@ Each pod logs `target_rps`, `shard_target_rps`, and `achieved_rps` every 30 seco
 
 `k8s/06-loadgen-job.yaml` is still the short Locust spike. The replay is `k8s/07-nasa-replay-job.yaml` (python:3.12-slim, not part of `kubectl apply -k`). Regenerate it with `python3 deploy/render_nasa_job.py` after editing `deploy/nasa_replay.py`.
 
+## Real visitors (page loads)
+
+The dashboard has a **Real visitors (page loads)** tile and a per-minute chart next to **Total traffic (RPS, includes replay)**. The traffic chart counts every request, including the replay Job. The visitor chart counts only people who opened the storefront in a browser, so it is the number to quote when you say "N real people used it".
+
+**Share the link.** Send `http://<NGINX-IP>:8090/` (the storefront). Ask people to open it at a set time. The dashboard is `http://<NGINX-IP>/`. Say it is a demo store with no real payments. Turn the cluster off afterwards (`az aks stop`), because the address is public while it runs.
+
+**What is counted.** A request that is a `GET` of `/` (a query string such as `?utm_source=wa` is fine) with `Accept: text/html`, which is what a browser sends when a page is opened or refreshed. nginx-lb copies each request to the orchestrator with its `mirror` directive; the copy is fire-and-forget, so a slow or dead orchestrator cannot slow or break the page. The orchestrator then applies the rule again (`services/orchestrator/visitors.go`).
+
+**What is not counted.** API calls (`/api/...`), health checks, assets, anything that is not a `GET` of `/`, requests without `text/html` in `Accept` (curl, scripts, fetch calls), requests with a `X-Load-Test` header, and known bots and probes by user agent (`kube-probe`, `curl`, `python-requests`, `locust`, anything with `bot`, `crawler` or `spider`). The replay Job (`deploy/nasa_replay.py`, packaged in `k8s/07-nasa-replay-job.yaml`), the Locust spike (`k8s/06-loadgen-job.yaml`, `deploy/locustfile.py`) and the `curl` mode of `deploy/load_gen.sh` / `load_gen.ps1` all send `X-Load-Test: 1`. Any new load generator should do the same. If you regenerate `k8s/07-nasa-replay-job.yaml`, use `python3 deploy/render_nasa_job.py`.
+
+**Read it.** `GET /api/orchestrator/api/target/visitors` on the dashboard address returns `total_unique`, `total_pageviews` and `per_minute` for the last 60 minutes (oldest first, empty minutes are zero). It is read only: any other method on that path is `403`, and every other path under `/api/orchestrator/` is `404`, as before.
+
+```bash
+curl -s "http://<NGINX-IP>/api/orchestrator/api/target/visitors"
+```
+
+**Privacy.** No cookies, no tracking script, no stored IP addresses and no stored user agents. A visitor is a hash of the client address and user agent with a random salt that is kept in memory only and replaced every UTC day (so a hash cannot be linked from one day to the next). Counts live in orchestrator memory and start again from zero when the orchestrator pod restarts.
+
+**Limits, stated honestly.**
+
+- "Unique" means one address plus one user agent per day. Two people on the same Wi-Fi with the same browser and version look like one visitor, and one person with two browsers looks like two. Treat it as an estimate. Page loads are exact.
+- It only sees the address nginx-lb sees. With the default `externalTrafficPolicy: Cluster` on an Azure load balancer, kube-proxy rewrites the source address and every visitor would look like the same address. `nginx-lb` therefore sets `externalTrafficPolicy: Local` so the real client address arrives (that is a change to the Service in `k8s/02-target-app.yaml`; check it with the curl above after the first few visits). `X-Forwarded-For` is not trusted because a client can set it. Behind a CDN or another proxy this would show that proxy's address.
+- Only `/` is counted. A visitor who opens a deep link such as `/product/3` directly is not a page load of `/`; a bot that sends a browser user agent and `Accept: text/html` is counted.
+- Not tested on Azure yet: the cluster was stopped when this was written. It was checked against a real nginx, the Go tests and the dashboard build (see the pull request).
+
 ## What to say, what to show
 
 1. **Idle, before the replay.** "One pod is the warm floor. The upper bound on the chart can jump even though almost nothing is arriving. That is dropout noise. Desired replicas stays at 1. The log line would say `rule=idle-guard`."
