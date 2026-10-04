@@ -7,11 +7,27 @@
       2. Register Container Service, Container Registry, Network, and Compute providers
       3. Preflight VM quota and whether the size exists in the region
       4. Create the resource group
-      5. Create an Azure Container Registry, build, and push the four app images
+      5. Create an Azure Container Registry, build the five app images with
+         the local Docker engine (target-app, orchestrator, dashboard,
+         predictor, storefront) and push them (az acr login + docker push)
       6. Create AKS (or reuse it) and attach that registry
-      7. Apply k8s/ with images rewritten to <acr>.azurecr.io/<name>:latest
+      7. Apply k8s/ with images rewritten to <acr>.azurecr.io/<name>:latest.
+         k8s/ includes the NexusGear storefront (08-storefront.yaml) and the
+         nginx-lb config that routes browser page loads to it.
       8. Print the LoadBalancer address (one public IP: dashboard on port 80,
-         storefront on port 8090)
+         storefront on port 8090). The success banner is printed only when
+         every rollout finished and the address exists.
+
+    Docker must be running on the machine that runs this script: ACR Tasks
+    (az acr build) is not available in indiasouthcentral.
+
+    The cluster already exists on a re-run: the quota preflight is skipped
+    then, and no az aks update --auto-upgrade-channel is issued (az aks create
+    already sets it to none, and re-running it prompts y/n).
+
+    Cost control without deleting: az aks stop / az aks start (see
+    docs/DEMO_AKS.md). Stopping releases the VMs but the registry, the
+    cluster object, and the public IP address keep existing.
 
     Azure for Students on this subscription allows only these regions:
     indiasouthcentral, centralindia, eastasia, koreacentral, malaysiawest.
@@ -152,6 +168,14 @@ Write-Host "[1/8] Checking Azure CLI login..."
 az account show --output table
 Assert-Exit "az account show"
 
+$ErrorActionPreference = "Continue"
+docker info *> $null
+$dockerOk = ($LASTEXITCODE -eq 0)
+$ErrorActionPreference = "Stop"
+if (-not $dockerOk) {
+    throw "Docker is not running. Start Docker Desktop: images are built locally because ACR Tasks is not available in $Location."
+}
+
 Write-Host ""
 Write-Host "[2/8] Registering resource providers (no-op if already Registered)..."
 Register-OneProvider -Namespace "Microsoft.Compute"
@@ -246,6 +270,9 @@ Build-Image -Name "target-app" -Context "services/target-app"
 Build-Image -Name "orchestrator" -Context "services/orchestrator"
 Build-Image -Name "dashboard" -Context "services/dashboard"
 Build-Image -Name "predictor" -Context "services/load-predictor"
+# NexusGear storefront: a static nginx image (see services/ecommerce/Dockerfile)
+# that nginx-lb serves to browsers. k8s/08-storefront.yaml references it.
+Build-Image -Name "storefront" -Context "services/ecommerce"
 
 Write-Host ""
 Write-Host "[6/8] Ensuring AKS cluster $ClusterName (attached to $AcrName)..."
@@ -306,6 +333,9 @@ images:
     newTag: latest
   - name: capstone/dashboard
     newName: $LoginServer/dashboard
+    newTag: latest
+  - name: capstone/storefront
+    newName: $LoginServer/storefront
     newTag: latest
 patches:
   - target:
@@ -368,6 +398,21 @@ patches:
             containers:
               - name: dashboard
                 imagePullPolicy: Always
+  - target:
+      kind: Deployment
+      name: storefront
+    patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: storefront
+        namespace: capstone
+      spec:
+        template:
+          spec:
+            containers:
+              - name: storefront
+                imagePullPolicy: Always
 "@
 Set-Content -Path (Join-Path $overlay "kustomization.yaml") -Value $kustomize -Encoding Ascii
 try {
@@ -380,12 +425,22 @@ try {
 }
 
 Write-Host ""
-Write-Host "[8/8] Waiting for the nginx-lb LoadBalancer address (up to 3 minutes)..."
+Write-Host "[8/8] Waiting for the rollouts and the nginx-lb LoadBalancer address (up to 3 minutes each)..."
 Write-Host "The dashboard is ClusterIP. It is served on this same IP, port 80."
-kubectl -n capstone rollout status deployment/nginx-lb --timeout=180s
-if ($LASTEXITCODE -ne 0) { Write-Host "nginx-lb rollout still in progress" }
-kubectl -n capstone rollout status deployment/dashboard --timeout=180s
-if ($LASTEXITCODE -ne 0) { Write-Host "dashboard rollout still in progress" }
+$rolloutsOk = $true
+foreach ($d in @("nginx-lb", "storefront", "dashboard", "orchestrator", "target-app")) {
+    kubectl -n capstone rollout status deployment/$d --timeout=180s
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "WARNING: deployment/$d is not ready yet" -ForegroundColor Yellow
+        $rolloutsOk = $false
+    }
+}
+# The predictor loads a large model and is slow; it is reported but does not
+# hold back the address.
+kubectl -n capstone rollout status deployment/predictor --timeout=60s
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "NOTE: predictor is still starting (model load can take several minutes)"
+}
 
 $websiteIp = ""
 $elapsed = 0
@@ -401,10 +456,16 @@ if (-not $websiteIp) { $websiteIp = "Pending" }
 
 Write-Host ""
 Write-Host "=========================================================="
-Write-Host " Capstone stack applied to AKS"
+if ($rolloutsOk -and $websiteIp -ne "Pending") {
+    Write-Host " Capstone stack applied to AKS and rollouts are complete"
+} else {
+    Write-Host " Capstone stack APPLIED to AKS, but it is NOT fully ready yet" -ForegroundColor Yellow
+    Write-Host " (a rollout is unfinished or the address is still Pending)."
+    Write-Host " Check: kubectl -n capstone get pods ; kubectl -n capstone get svc nginx-lb"
+}
 Write-Host "=========================================================="
 Write-Host ""
-Write-Host "  Target app (nginx):   http://${websiteIp}:8090"
+Write-Host "  Storefront (browser): http://${websiteIp}:8090"
 Write-Host "  Autoscaler dashboard: http://${websiteIp}"
 Write-Host "  Registry:             $LoginServer"
 Write-Host ""
