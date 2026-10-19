@@ -2,7 +2,9 @@
 
 Each row of the CSV is one demo second and an RPS target. This process sends
 its share of that target during the second, then moves on, and repeats the
-file --loops times. It does not try to catch up if the app falls behind, so
+file --loops times. --start-offset N skips the first N rows of the first pass
+only (default 0, the whole file); later loops start at row 0. Rows are never
+sped up, so one row is still one second, as the forecaster was trained. It does not try to catch up if the app falls behind, so
 the shape stays the one the forecaster was trained on.
 
 One Python process opening a new TCP connection per request tops out around
@@ -14,6 +16,7 @@ the full target and this shard's share.
 Stdlib only, so the Job can use python:3.12-slim.
 
     python deploy/nasa_replay.py --host http://127.0.0.1:8090/ --loops 3
+    python deploy/nasa_replay.py --host http://127.0.0.1:8090/ --loops 1 --start-offset 226
     REPLAY_SHARDS=4 JOB_COMPLETION_INDEX=0 python deploy/nasa_replay.py --host http://nginx-lb:8090/
 """
 
@@ -43,11 +46,19 @@ def load_rps(path):
     return values
 
 
-def schedule(rps, loops):
+def schedule(rps, loops, start_offset=0):
+    """Yield one RPS target per second.
+
+    start_offset skips that many rows of the first pass only. It drops the
+    quiet start of the morning; it does not change the time compression.
+    """
     if loops < 1:
         raise ValueError("loops must be >= 1")
-    for _ in range(loops):
-        for value in rps:
+    if start_offset < 0 or start_offset >= len(rps):
+        raise ValueError("start_offset %s out of range for %d rows" % (start_offset, len(rps)))
+    for loop in range(loops):
+        first = start_offset if loop == 0 else 0
+        for value in rps[first:]:
             yield value
 
 
@@ -174,7 +185,7 @@ class _Pool:
             thread.join(timeout=self.timeout + 1)
 
 
-def replay(url, rps_values, loops, workers, timeout, log_every, shards=1, index=0):
+def replay(url, rps_values, loops, workers, timeout, log_every, shards=1, index=0, start_offset=0):
     """Issue this shard's share of the schedule.
 
     Returns (attempted, ok, completed).
@@ -188,7 +199,7 @@ def replay(url, rps_values, loops, workers, timeout, log_every, shards=1, index=
     window_steps = 0
     _, window_completed = pool.counts()
     try:
-        for step, target in enumerate(schedule(rps_values, loops)):
+        for step, target in enumerate(schedule(rps_values, loops, start_offset)):
             tick = time.perf_counter()
             share = shard_count(target, shards, index)
             deadline = tick + 1.0
@@ -206,10 +217,12 @@ def replay(url, rps_values, loops, workers, timeout, log_every, shards=1, index=
                 achieved = (completed - window_completed) / span if span > 0 else 0.0
                 # achieved_rps is this shard. Compare it to mean_shard_target_rps.
                 # Sum achieved_rps across shards to compare with mean_target_rps.
+                # row is the CSV row (demo second of the morning) being played.
                 print(
-                    "t=%ds target_rps=%.0f shard=%d/%d shard_target_rps=%d achieved_rps=%.0f mean_target_rps=%.0f mean_shard_target_rps=%.0f ok=%d"
+                    "t=%ds row=%d target_rps=%.0f shard=%d/%d shard_target_rps=%d achieved_rps=%.0f mean_target_rps=%.0f mean_shard_target_rps=%.0f ok=%d"
                     % (
                         step,
+                        (start_offset + step) % len(rps_values),
                         target,
                         index,
                         shards,
@@ -240,6 +253,12 @@ def main():
     parser.add_argument("--workers", type=int, default=32)
     parser.add_argument("--timeout", type=float, default=2.0)
     parser.add_argument("--log-every", type=int, default=30)
+    parser.add_argument(
+        "--start-offset",
+        type=int,
+        default=0,
+        help="skip this many CSV rows (seconds) on the first pass only; 0 plays the whole file",
+    )
     parser.add_argument("--shards", type=int, default=_env_int("REPLAY_SHARDS", 1))
     parser.add_argument("--index", type=int, default=_env_int("JOB_COMPLETION_INDEX", 0))
     args = parser.parse_args()
@@ -247,12 +266,17 @@ def main():
         print("shards must be >= 1", file=sys.stderr)
         sys.exit(2)
     series = load_rps(args.csv)
+    if args.start_offset < 0 or args.start_offset >= len(series):
+        print("start-offset must be between 0 and %d" % (len(series) - 1), file=sys.stderr)
+        sys.exit(2)
     peak = max(series)
     print(
-        "replaying %d seconds x %d loops against %s shard=%d/%d peak_target_rps=%.0f shard_peak_rps=%d"
+        "replaying %d seconds x %d loops from row %d (%d seconds total) against %s shard=%d/%d peak_target_rps=%.0f shard_peak_rps=%d"
         % (
             len(series),
             args.loops,
+            args.start_offset,
+            len(series) * args.loops - args.start_offset,
             args.host,
             args.index,
             args.shards,
@@ -271,6 +295,7 @@ def main():
         args.log_every,
         args.shards,
         args.index,
+        args.start_offset,
     )
     elapsed = time.perf_counter() - started
     achieved = completed / elapsed if elapsed > 0 else 0.0
