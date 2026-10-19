@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Prove the dashboard nginx allowlist: GET /api/orchestrator/api/target/status
-# is proxied, any other orchestrator path is 404, and a non-GET on the
-# status URL is 403. Also runs nginx -t on the shipped config.
+# and GET .../api/target/visitors are proxied, any other orchestrator path
+# (including the in-cluster POST .../api/target/visit) is 404, and a non-GET
+# on either allowed URL is 403. Also runs nginx -t on the shipped config.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -115,11 +116,26 @@ post_scale="$(curl -s -o /dev/null -w "%{http_code}" -X POST "http://127.0.0.1:$
 get_scale="$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:${NGINX_PORT}/api/orchestrator/scale")"
 get_health="$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:${NGINX_PORT}/api/orchestrator/health")"
 
+visitors_body="$(curl -s "http://127.0.0.1:${NGINX_PORT}/api/orchestrator/api/target/visitors")"
+visitors_code="$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:${NGINX_PORT}/api/orchestrator/api/target/visitors")"
+post_visitors="$(curl -s -o /dev/null -w "%{http_code}" -X POST "http://127.0.0.1:${NGINX_PORT}/api/orchestrator/api/target/visitors")"
+put_visitors="$(curl -s -o /dev/null -w "%{http_code}" -X PUT "http://127.0.0.1:${NGINX_PORT}/api/orchestrator/api/target/visitors")"
+get_visit="$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:${NGINX_PORT}/api/orchestrator/api/target/visit")"
+post_visit="$(curl -s -o /dev/null -w "%{http_code}" -X POST "http://127.0.0.1:${NGINX_PORT}/api/orchestrator/api/target/visit")"
+get_visitors_sub="$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:${NGINX_PORT}/api/orchestrator/api/target/visitors/x")"
+
 test "$status_code" = "200"
 test "$status_body" = "GET /api/target/status"
 test "$post_status" = "403"
 test "$post_scale" = "404"
 test "$get_scale" = "404"
 test "$get_health" = "404"
+test "$visitors_code" = "200"
+test "$visitors_body" = "GET /api/target/visitors"
+test "$post_visitors" = "403"
+test "$put_visitors" = "403"
+test "$get_visit" = "404"
+test "$post_visit" = "404"
+test "$get_visitors_sub" = "404"
 
-echo "nginx allowlist ok: GET status 200, POST status 403, other orchestrator paths 404"
+echo "nginx allowlist ok: GET status and visitors 200, POST/PUT on them 403, other orchestrator paths (incl. /visit) 404"

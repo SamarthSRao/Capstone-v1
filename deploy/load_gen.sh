@@ -100,14 +100,14 @@ if [ -n "$URL" ]; then
   echo "Light load for 20s against $target"
   end=$((SECONDS + 20))
   while [ "$SECONDS" -lt "$end" ]; do
-    curl -s -o /dev/null --max-time 5 "$target" || true
+    curl -s -o /dev/null -H "X-Load-Test: 1" --max-time 5 "$target" || true
   done
   echo "Spike for 70s (8 parallel requests)"
   end=$((SECONDS + 70))
   while [ "$SECONDS" -lt "$end" ]; do
     i=0
     while [ "$i" -lt 8 ]; do
-      curl -s -o /dev/null --max-time 5 "$target" &
+      curl -s -o /dev/null -H "X-Load-Test: 1" --max-time 5 "$target" &
       i=$((i + 1))
     done
     wait || true
@@ -115,7 +115,7 @@ if [ -n "$URL" ]; then
   echo "Calm for 30s"
   end=$((SECONDS + 30))
   while [ "$SECONDS" -lt "$end" ]; do
-    curl -s -o /dev/null --max-time 5 "$target" || true
+    curl -s -o /dev/null -H "X-Load-Test: 1" --max-time 5 "$target" || true
   done
   echo "Done. In another terminal: kubectl get pods -n $NAMESPACE -l app=target-app -w"
   exit 0
