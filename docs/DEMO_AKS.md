@@ -233,6 +233,13 @@ About 10 minutes, looped 3 times (30 minutes). The target reaches about 681 RPS 
 .\deploy\load_gen.ps1 -Replay
 ```
 
+**Short live demo.** `k8s/07b-fast-demo-replay-job.yaml` (Job and ConfigMap `fast-demo-replay`) is the same player and CSV, still one row per second, played once from row 226. Rows 226-249 are about 90 RPS, which fills the orchestrator's 24-sample window; the morning starts climbing at row 250 and live RPS first passes 200 at row 333, about 107 seconds after the Job starts. The first scale-up should come about a minute in, the peak (about 694 RPS) at about 5½ minutes, and traffic stops after 374 seconds. Scale-down then removes one pod per 100 seconds. Delete it with `kubectl delete -f k8s/07b-fast-demo-replay-job.yaml` before running it again. Both manifests come from `python3 deploy/render_nasa_job.py` (`FAST_START_OFFSET` there).
+
+```bash
+kubectl apply -f k8s/07b-fast-demo-replay-job.yaml
+kubectl logs -n capstone -l app=fast-demo-replay -f --prefix
+```
+
 That starts an indexed Job, default **4** pods (`REPLAY_PARALLELISM`, or `--parallelism` / `-ReplayParallelism`). Each pod keeps HTTP connections open and sends `round(target) / N` of the rate (the remainder goes to the lower indexes). Requests are 50m CPU and 64Mi memory per pod, so four of them schedule on a 6 GB kind node and on a 2 vCPU AKS node. Limits are 400m / 192Mi. Set `REPLAY_PARALLELISM=2` if the node is already full.
 
 Each pod logs `target_rps`, `shard_target_rps`, and `achieved_rps` every 30 seconds, and a `summary` line at the end with `achieved_rps` and `offered_rps`. `kubectl logs` is prefixed with the pod name. One process with a new connection per request saturated around 180-260 RPS, which hid the 600 RPS peak. Four keep-alive shards are what clears 800 **offered**.
