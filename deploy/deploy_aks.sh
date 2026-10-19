@@ -6,11 +6,25 @@
 #   2. Register Microsoft.ContainerService / ContainerRegistry / Network / Compute
 #   3. Preflight VM quota and whether the size is offered in the region
 #   4. Create the resource group
-#   5. Create an Azure Container Registry, build and push the four app images
+#   5. Create an Azure Container Registry, build the five app images with the
+#      local Docker engine (target-app, orchestrator, dashboard, predictor,
+#      storefront) and push them (az acr login + docker build + docker push)
 #   6. Create AKS (or reuse it) and attach that registry
-#   7. Apply k8s/ with the images rewritten to <acr>.azurecr.io/<name>:latest
+#   7. Apply k8s/ with the images rewritten to <acr>.azurecr.io/<name>:latest.
+#      k8s/ includes the NexusGear storefront (08-storefront.yaml) and the
+#      nginx-lb config that routes browser page loads to it.
 #   8. Print the LoadBalancer address (one public IP: dashboard on :80,
-#      storefront on :8090)
+#      storefront on :8090). The success banner is printed only when every
+#      rollout finished and the address exists.
+#
+# Docker must be running on the machine that runs this script. ACR Tasks
+# (az acr build) is not available in indiasouthcentral.
+#
+# On a re-run the cluster already exists: the quota preflight is skipped (its
+# nodes already use the quota) and no az aks update --auto-upgrade-channel is
+# issued (az aks create already sets it to none, and re-running it prompts).
+#
+# Pause without deleting: az aks stop / az aks start (see docs/DEMO_AKS.md).
 #
 # Azure for Students on this subscription allows only:
 #   indiasouthcentral, centralindia, eastasia, koreacentral, malaysiawest
@@ -22,10 +36,12 @@
 # alongside the rest of the stack. The default is Standard_B2ms (2 vCPU,
 # 8 GiB, same BS family, so two nodes are still 4 vCPU).
 #
-# The cluster is a fixed 2 nodes. Cluster autoscaler is off, auto-upgrade
-# is none, and the node pool max surge is 0 with max unavailable 1. AKS
-# rejects maxSurge=0 unless maxUnavailable is greater than 0. A surge node
-# would ask for 6 vCPU of BS family and the create or upgrade would be denied.
+# The cluster is a fixed 2 nodes. Cluster autoscaler is off and auto-upgrade
+# is none. Max surge 0 cannot be set: the only pool is a System pool, AKS
+# rejects max unavailable above 0 on System pools, and surge 0 needs it. The
+# default 10% surge only matters during an upgrade, which never runs. Do NOT
+# run az aks upgrade on this cluster: the surge node would be a third VM
+# (6 vCPU of BS family) and the 4 vCPU quota would deny it.
 #
 #   ./deploy/deploy_aks.sh
 #   ./deploy/deploy_aks.sh my-rg centralindia my-aks Standard_B2ms
@@ -57,7 +73,7 @@ echo "=========================================================="
 echo "Resource group: $RESOURCE_GROUP"
 echo "Location:       $LOCATION"
 echo "Cluster:        $CLUSTER_NAME"
-echo "Node size:      $NODE_SIZE  (fixed count $NODE_COUNT, max surge 0, max unavailable 1, no autoscaler)"
+echo "Node size:      $NODE_SIZE  (fixed count $NODE_COUNT, no autoscaler, auto-upgrade none)"
 case "$LOCATION" in
   indiasouthcentral|centralindia|eastasia|koreacentral|malaysiawest) ;;
   *)
@@ -75,6 +91,10 @@ esac
 echo
 echo "[1/8] Checking Azure CLI login..."
 az account show --output table
+if ! docker info >/dev/null 2>&1; then
+  echo "ERROR: Docker is not running. Images are built locally because ACR Tasks is not available in $LOCATION."
+  exit 1
+fi
 
 echo
 echo "[2/8] Registering resource providers (no-op if already Registered)..."
@@ -174,7 +194,11 @@ print("No surge node is requested. A third node would be %d more vCPU and exceed
 PY
   rm -f "$sku_file" "$usage_file"
 }
-preflight_quota
+if az aks show --resource-group "$RESOURCE_GROUP" --name "$CLUSTER_NAME" >/dev/null 2>&1; then
+  echo "Cluster $CLUSTER_NAME already exists; skipping the quota preflight (its nodes already use the quota)."
+else
+  preflight_quota
+fi
 
 echo
 echo "[4/8] Ensuring resource group $RESOURCE_GROUP in $LOCATION..."
@@ -230,17 +254,25 @@ fi
 LOGIN_SERVER="$(az acr show --name "$ACR_NAME" --query loginServer -o tsv)"
 echo "Registry: $LOGIN_SERVER"
 
-# az acr build uploads the context and pushes :latest. No local docker required.
+# ACR Tasks (az acr build) is not offered in indiasouthcentral
+# (NoRegisteredProviderFound for registries/listBuildSourceUploadUrl), so build
+# with the local Docker engine and push. az acr login uses a short-lived
+# token, not an interactive login.
+az acr login --name "$ACR_NAME"
 build_image() {
   local name="$1"
   local context="$2"
   echo "---- building ${LOGIN_SERVER}/${name}:latest from ${context}"
-  az acr build --registry "$ACR_NAME" --image "${name}:latest" "$context"
+  docker build -t "${LOGIN_SERVER}/${name}:latest" "$context"
+  docker push "${LOGIN_SERVER}/${name}:latest"
 }
 build_image target-app services/target-app
 build_image orchestrator services/orchestrator
 build_image dashboard services/dashboard
 build_image predictor services/load-predictor
+# NexusGear storefront: a static nginx image (see services/ecommerce/Dockerfile)
+# that nginx-lb serves to browsers. k8s/08-storefront.yaml references it.
+build_image storefront services/ecommerce
 
 echo
 echo "[6/8] Ensuring AKS cluster $CLUSTER_NAME (attached to $ACR_NAME)..."
@@ -264,22 +296,17 @@ else
     --generate-ssh-keys \
     --output table
 fi
-# A surge node during an upgrade would be a third VM and would exceed the
-# 4 vCPU BS-family quota. max-surge 0 disables that extra node. AKS requires
-# max-unavailable > 0 when max-surge is 0. Auto-upgrade stays off.
-pool="$(az aks nodepool list --resource-group "$RESOURCE_GROUP" --cluster-name "$CLUSTER_NAME" --query '[0].name' -o tsv)"
-az aks nodepool update \
-  --resource-group "$RESOURCE_GROUP" \
-  --cluster-name "$CLUSTER_NAME" \
-  --name "$pool" \
-  --max-surge 0 \
-  --max-unavailable 1 \
-  --output table
-az aks update \
-  --resource-group "$RESOURCE_GROUP" \
-  --name "$CLUSTER_NAME" \
-  --auto-upgrade-channel none \
-  --output table
+# No node pool or auto-upgrade changes here:
+# - max-surge 0 is not possible: the only pool is a System pool, and AKS
+#   rejects max-unavailable > 0 on System pools (InvalidParameter), while
+#   surge 0 needs max-unavailable > 0. The default is max-surge 10% (1 node)
+#   and it only applies during an upgrade. Auto-upgrade is none, so no upgrade
+#   and no surge node happens unless someone runs one. Do not run
+#   az aks upgrade on this cluster: the surge node would exceed the 4 vCPU
+#   BS-family quota.
+# - auto-upgrade-channel none is already set by az aks create. Re-running
+#   az aks update --auto-upgrade-channel none prompts y/n (NoTTYException), so
+#   it is not repeated.
 
 echo
 echo "[7/8] Configuring kubectl and applying manifests..."
@@ -308,6 +335,9 @@ images:
     newTag: latest
   - name: capstone/dashboard
     newName: ${LOGIN_SERVER}/dashboard
+    newTag: latest
+  - name: capstone/storefront
+    newName: ${LOGIN_SERVER}/storefront
     newTag: latest
 patches:
   - target:
@@ -370,15 +400,39 @@ patches:
             containers:
               - name: dashboard
                 imagePullPolicy: Always
+  - target:
+      kind: Deployment
+      name: storefront
+    patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: storefront
+        namespace: capstone
+      spec:
+        template:
+          spec:
+            containers:
+              - name: storefront
+                imagePullPolicy: Always
 EOF
 kubectl apply -k "$OVERLAY"
 rm -rf "$OVERLAY"
 
 echo
-echo "[8/8] Waiting for the nginx-lb LoadBalancer address (up to 3 minutes)..."
+echo "[8/8] Waiting for the rollouts and the nginx-lb LoadBalancer address (up to 3 minutes each)..."
 echo "The dashboard is ClusterIP. It is served on this same IP, port 80."
-kubectl -n capstone rollout status deployment/nginx-lb --timeout=180s || true
-kubectl -n capstone rollout status deployment/dashboard --timeout=180s || true
+ROLLOUTS_OK=1
+for d in nginx-lb storefront dashboard orchestrator target-app; do
+  if ! kubectl -n capstone rollout status "deployment/$d" --timeout=180s; then
+    echo "WARNING: deployment/$d is not ready yet"
+    ROLLOUTS_OK=0
+  fi
+done
+# The predictor loads a large model and is slow; it is reported but does not
+# hold back the address.
+kubectl -n capstone rollout status deployment/predictor --timeout=60s \
+  || echo "NOTE: predictor is still starting (model load can take several minutes)"
 kubectl wait --namespace capstone --for=jsonpath='{.status.loadBalancer.ingress[0].ip}' service/nginx-lb --timeout=180s || true
 
 WEBSITE_IP="$(kubectl get svc nginx-lb -n capstone -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)"
@@ -386,10 +440,16 @@ if [ -z "$WEBSITE_IP" ]; then WEBSITE_IP="Pending"; fi
 
 echo
 echo "=========================================================="
-echo " Capstone stack applied to AKS"
+if [ "$ROLLOUTS_OK" = "1" ] && [ "$WEBSITE_IP" != "Pending" ]; then
+  echo " Capstone stack applied to AKS and rollouts are complete"
+else
+  echo " Capstone stack APPLIED to AKS, but it is NOT fully ready yet"
+  echo " (a rollout is unfinished or the address is still Pending)."
+  echo " Check: kubectl -n capstone get pods ; kubectl -n capstone get svc nginx-lb"
+fi
 echo "=========================================================="
 echo
-echo "  Target app (nginx):   http://${WEBSITE_IP}:8090"
+echo "  Storefront (browser): http://${WEBSITE_IP}:8090"
 echo "  Autoscaler dashboard: http://${WEBSITE_IP}"
 echo "  Registry:             ${LOGIN_SERVER}"
 echo
